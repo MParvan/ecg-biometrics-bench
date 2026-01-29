@@ -1,6 +1,6 @@
 # Core
 numpy
-pandas
+pandas==2.2.1
 scipy
 scikit-learn
 torch
@@ -24,4 +24,5 @@ seaborn      # For the Confusion Matrix and T-SNE plots
 
 # Tools
 patool
+
 requests
