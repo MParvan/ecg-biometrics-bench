@@ -36,7 +36,7 @@ if parent_dir not in sys.path:
     sys.path.append(parent_dir)
 
 # Import Project Modules
-from load_dataset import load_ecgid_dataset
+from load_dataset import load_ptb_dataset
 from run import *
 from models import DeepECG, ResNet1D
 
@@ -44,7 +44,7 @@ from models import DeepECG, ResNet1D
 # 2. CONFIGURATION
 # =============================================================================
 CONFIG = {
-    "DATASET": "ECG-ID",
+    "DATASET": "PTB",
     "EPOCHS": 2,
     "BATCH_SIZE": 512,
     "NUM_BEATS": 3,
@@ -56,13 +56,13 @@ CONFIG = {
 }
 
 # Output Directories
-RESULTS_DIR = os.path.join(parent_dir, "results", "ecgid_final")
+RESULTS_DIR = os.path.join(parent_dir, "results", "ptb_final")
 FIGURES_DIR = os.path.join(RESULTS_DIR, "figures")
 os.makedirs(RESULTS_DIR, exist_ok=True)
 os.makedirs(FIGURES_DIR, exist_ok=True)
 
 # Log File
-LOG_FILE = os.path.join(RESULTS_DIR, "ecgid_results_log.txt")
+LOG_FILE = os.path.join(RESULTS_DIR, "ptb_results_log.txt")
 
 # Set Seeds
 torch.manual_seed(CONFIG["SEED"])
@@ -105,7 +105,7 @@ def set_plot_filename(filename_suffix):
     """Sets the path where the NEXT plt.show() call will save the image."""
     global CURRENT_PLOT_PATH
     if CONFIG["VISUALIZE"]:
-        CURRENT_PLOT_PATH = os.path.join(FIGURES_DIR, f"ecgid_{filename_suffix}.png")
+        CURRENT_PLOT_PATH = os.path.join(FIGURES_DIR, f"ptb_{filename_suffix}.png")
     else:
         CURRENT_PLOT_PATH = None
 
@@ -116,8 +116,7 @@ def run_random_split_phase():
     log_section("PHASE 1: RANDOM SPLIT BASELINES")
 
     # Load All Data
-    # 'short_term' is just a placeholder; load_all_sessions loads everything
-    loader = load_ecgid_dataset(num_beats=CONFIG["NUM_BEATS"], enrollment_mode='short_term', cleanup_zip=False)
+    loader = load_ptb_dataset(num_beats=CONFIG["NUM_BEATS"], enrollment_mode='short_term', cleanup_zip=False)
     x_all, y_all = loader.load_all_sessions()
     shapes = {"All_Data": x_all.shape}
 
@@ -164,7 +163,7 @@ def run_regime_phase(regime_name, mode_str, file_suffix):
     log_section(f"PHASE 2: {regime_name}")
 
     # 1. Load Data
-    loader = load_ecgid_dataset(num_beats=CONFIG["NUM_BEATS"], enrollment_mode=mode_str, cleanup_zip=False)
+    loader = load_ptb_dataset(num_beats=CONFIG["NUM_BEATS"], enrollment_mode=mode_str, cleanup_zip=False)
     x_enr, y_enr = loader.load_session("Session_1")
     x_prb, y_prb = loader.load_session("Session_2")
 
@@ -204,24 +203,17 @@ if __name__ == "__main__":
 
         # --- Regime A: Short-Term ---
         run_regime_phase(
-            regime_name="Regime A: Short-Term (Rec1 vs Rest)",
-            mode_str="short_term",
-            file_suffix="regimeA_short"
+            "Regime A: Short-Term", "short_term", "regA_short-term"
         )
 
         # --- Regime B: Long-Term ---
         run_regime_phase(
-            regime_name="Regime B: Long-Term (Day1 vs Future)",
-            mode_str="long_term",
-            file_suffix="regimeB_long"
+            "Regime B: Long-Term", "long_term", "regB_long-term"
         )
 
         # --- Regime C: VLT ---
-        # NOTE: Using 'maximal' because the loader expects this keyword for First vs Last record
         run_regime_phase(
-            regime_name="Regime C: VLT (First vs Last)",
-            mode_str="maximal", 
-            file_suffix="regimeC_vlt"
+            "Regime C: Maximal/VLT", "maximal", "regC_vlt"
         )
 
         print("\n" + "="*60)
