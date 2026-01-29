@@ -1,0 +1,27 @@
+# Core
+numpy
+pandas
+scipy
+scikit-learn
+torch
+torchvision
+torchaudio
+pyyaml
+tqdm
+ipykernel
+
+# Signal Processing & Augmentation
+neurokit2
+wfdb
+librosa      # For Mel-spectrogram
+pyts         # For Gramian Angular Fields (GAF) / Recurrence Plots
+stockwell    # Optional: For S-Transform
+tftb         # Optional: For Wigner-Ville
+
+# Visualization
+matplotlib
+seaborn      # For the Confusion Matrix and T-SNE plots
+
+# Tools
+patool
+requests

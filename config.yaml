@@ -1,0 +1,113 @@
+project:
+  data_root: "./datasets"
+  seed: 42
+
+datasets:
+  ecgid:
+    root_dir: "ecgid"
+    zip_name: "ECGID_Dataset.zip"
+    url: "https://physionet.org/content/ecgiddb/get-zip/1.0.0/"
+    sample_length: 20000
+    fs: 500
+    signal_type: "filtered"        # Options: "filtered", "noisy", "both"
+    preprocessing:
+      pre_s: 0.2
+      post_s: 0.4
+      bandpass: true
+      lowcut: 0.5
+      highcut: 40.0
+      normalize: true
+
+  ptb:
+    root_dir: "ptb"
+    zip_name: "ptb_Dataset.zip"
+    url: "https://physionet.org/content/ptbdb/get-zip/1.0.0/"
+    sample_length: null            # Varies
+    fs: 1000
+    preprocessing:
+      pre_s: 0.2
+      post_s: 0.4
+      bandpass: true
+      lowcut: 0.5
+      highcut: 40.0
+      normalize: true
+
+  mitbih:
+    root_dir: "mitbih"
+    zip_name: "mitbih_Dataset.zip"
+    url: "https://physionet.org/content/mitdb/get-zip/1.0.0/"
+    sample_length: 650000
+    fs: 360
+    preprocessing:
+      pre_s: 0.2
+      post_s: 0.4
+      bandpass: true
+      lowcut: 0.5
+      highcut: 40.0
+      normalize: true
+
+  nsrdb:
+    root_dir: "nsrdb"
+    zip_name: "nsrdb_Dataset.zip"
+    url: "https://physionet.org/content/nsrdb/get-zip/1.0.0/"
+    sample_length: null            # Varies (24h)
+    fs: 128
+    preprocessing:
+      pre_s: 0.2
+      post_s: 0.4
+      bandpass: true
+      lowcut: 0.5
+      highcut: 40.0
+      normalize: true
+
+  ptbxl:
+    root_dir: "ptbxl"
+    zip_name: "ptbxl_Dataset.zip"
+    url: "https://physionet.org/content/ptb-xl/get-zip/1.0.3/"
+    sample_length: 5000
+    fs: 500
+    preprocessing:
+      pre_s: 0.2
+      post_s: 0.4
+      bandpass: true
+      lowcut: 0.5
+      highcut: 40.0
+      normalize: true
+
+  heartprint:
+    root_dir: "heartprint"
+    zip_name: "Heartprint_Dataset.zip"
+    url: "https://figshare.com/ndownloader/articles/20105354/versions/3"
+    sample_length: 3747            # Exact length per file
+    fs: 250
+    sessions: ["Session-1", "Session-2", "Session-3L", "Session-3R"]
+    preprocessing:
+      pre_s: 0.2
+      post_s: 0.4
+      bandpass: true
+      lowcut: 0.5
+      highcut: 40.0
+      normalize: true
+
+  cybhi:
+    root_dir: "cybhi"
+    zip_name: "cybhi_Dataset.zip"
+    url: "https://zenodo.org/records/2381823/files/CYBHi.zip"
+    sample_length: null
+    fs: 1000
+    ecg_column: 3
+    preprocessing:
+      pre_s: 0.2
+      post_s: 0.4
+      bandpass: true
+      lowcut: 0.5
+      highcut: 40.0
+      normalize: true
+
+training_defaults:
+  batch_size: 64
+  epochs: 30
+  lr: 1e-3
+  val_split: 0.2
+  crossvalidation: false
+  n_folds: 5
