@@ -24,5 +24,4 @@ seaborn      # For the Confusion Matrix and T-SNE plots
 
 # Tools
 patool
-
 requests

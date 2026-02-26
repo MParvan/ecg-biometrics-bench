@@ -136,34 +136,40 @@ def _download_and_extract(url: str, zip_path: Path, extract_to: Path, dataset_na
 # =============================================================================
 class load_ecgid_dataset():
     """
-    Robust Loader for ECG-ID Database.
-    
-    This class handles downloading, parsing (via WFDB), and splitting the ECG-ID dataset
-    according to strict biometric evaluation protocols.
-    
-    Attributes:
-        enrollment_mode (str): Defines the biometric evaluation regime.
-            - 'short_term': (Day 1 Stability)
-                Enroll = First recording of the first day.
-                Probe  = All subsequent recordings on the same day.
-                *Tests immediate re-authentication capabilities.*
-            
-            - 'long_term':  (Template Aging)
-                Enroll = All recordings from the first day.
-                Probe  = All recordings from all future days.
-                *Tests robustness to physiological changes over days/months.*
-            
-            - 'maximal':    (Very Long-Term)
-                Enroll = The absolute first recording.
-                Probe  = The absolute last recording available.
-                *Tests the limits of the system over the maximum available time gap.*
-                
-        signal_type (str): 
-            - 'filtered': Loads 'rec_1.dat' (Pre-filtered by original authors).
-            - 'noisy': Loads 'rec_1n.dat' (Original raw signal with noise).
+    Robust Loader for the ECG-ID Database.
+    Handles automatic downloading, parsing via WFDB, and filtering.
+
+    This dataset consists of 310 recordings from 90 subjects. Recordings vary 
+    in number per subject (from 2 to 20) and are taken over different days.
+
+    Args:
+        num_beats_to_merge (int): Number of consecutive beats to fuse into a single sample. 
+            Default is 1 (no fusion).
+        beat_merge_method (str): Strategy for fusing beats if `num_beats_to_merge` > 1.
+            Options: 
+                - 'average': Averages the morphology of N beats.
+                - 'concat': Flattens N beats into a single continuous vector.
+        data_split_mode (str): Evaluation regime mapping to strictly partition records.
+            Options:
+                - 'all-available': Loads every record (used for random beat-level splitting).
+                - 'single-session': Loads ONLY the 1st record of each subject.
+                - 'single-cross-session': 1st record = Train/Enroll, 2nd record = Test/Probe.
+                - 'single-shot-short-term': Day 1's 1st record = Enroll, rest of Day 1 = Probe.
+                - 'leave-last-out-short-term': Day 1's last record = Probe, rest of Day 1 = Enroll.
+                - 'single-shot-long-term': All Day 1 records = Enroll, all future days = Probe.
+                - 'leave-last-out-long-term': Last recording day = Probe, all past days = Enroll.
+        signal_type (str): Which WFDB channel to extract.
+            Options:
+                - 'raw': Extracts the noisy/unfiltered channel (idx 0).
+                - 'filtered': Extracts the hardware-filtered channel (idx 1).
+        cleanup_zip (bool): If True, deletes the downloaded zip file after extraction.
+        **preprocessing_params: kwargs passed directly to the Preprocessing class.
+            Common options: mode='beat'|'blind', bandpass=True, normalize=True, window_len=5.0
     """
-    def __init__(self, num_beats=1, merge_strategy="average", enrollment_mode="long_term", 
-                 signal_type=None, preprocessing_params=None, cleanup_zip=False):
+    def __init__(self, num_beats_to_merge=1, beat_merge_method="average", 
+                 data_split_mode="all-available", signal_type="raw", 
+                 cleanup_zip=False, **preprocessing_params):
+        
         self.preprocessor = Preprocessing()
         self.cfg = CONFIG["datasets"]["ecgid"]
         project_dir = Path(__file__).resolve().parent
@@ -172,29 +178,25 @@ class load_ecgid_dataset():
         self.zip_path = self.data_root / self.cfg["zip_name"]
         self.url = self.cfg["url"]
         
-        self.signal_type = signal_type if signal_type else self.cfg.get("signal_type", "filtered")
+        self.signal_type = "noisy" if signal_type == "raw" else "filtered"
         self.prep_params = preprocessing_params if preprocessing_params else self.cfg.get("preprocessing", {})
-        
-        self.num_beats = num_beats
-        self.merge_strategy = merge_strategy
+        self.num_beats = num_beats_to_merge
+        self.merge_strategy = beat_merge_method
         self.cleanup_zip = cleanup_zip
         
-        # Validate biometric regimes
-        valid_modes = ["short_term", "long_term", "maximal"]
-        if enrollment_mode not in valid_modes:
-            # Backward compatibility mapping
-            if enrollment_mode == "first_date": enrollment_mode = "long_term"
-            elif enrollment_mode == "first_vs_last": enrollment_mode = "maximal"
-            elif enrollment_mode == "first_record": enrollment_mode = "short_term"
-            else: raise ValueError(f"Invalid mode: {enrollment_mode}. Use {valid_modes}")
-        self.enrollment_mode = enrollment_mode
+        valid_modes = [
+            "all-available", "single-session", "single-cross-session", 
+            "single-shot-short-term", "leave-last-out-short-term", 
+            "single-shot-long-term", "leave-last-out-long-term"
+        ]
+        if data_split_mode not in valid_modes:
+            raise ValueError(f"Invalid mode: {data_split_mode}. Use {valid_modes}")
+        self.data_split_mode = data_split_mode
 
     def download(self):
-        """Downloads and extracts the dataset if not already present."""
         _download_and_extract(self.url, self.zip_path, self.dataset_root, "ECG-ID", cleanup=self.cleanup_zip)
 
     def _extract_rec_number(self, filename):
-        """Helper to extract '1' from 'rec_1.dat' for sorting."""
         match = re.search(r'rec_(\d+)', filename)
         return int(match.group(1)) if match else 9999
 
@@ -213,13 +215,7 @@ class load_ecgid_dataset():
             hea_files = sorted(subject_dir.glob("*.hea"))
             
             for hea_path in hea_files:
-                # Filter specific signal versions (clean vs noisy)
-                is_noisy = "n.hea" in hea_path.name
-                if self.signal_type == "filtered" and is_noisy: continue
-                if self.signal_type == "noisy" and not is_noisy: continue
-                
                 try:
-                    # Read header to get sampling rate and date
                     record = wfdb.rdrecord(str(hea_path.with_suffix("")))
                     rec_date = record.base_date
                     
@@ -233,25 +229,26 @@ class load_ecgid_dataset():
                                 except: pass
                     if rec_date is None: rec_date = datetime.date.min
 
+                    channel_idx = 0 if self.signal_type == "raw" else 1
+                    
+                    # Safety check just in case a file has only 1 channel
+                    if record.p_signal.shape[1] <= channel_idx:
+                        channel_idx = 0
+
                     recs.append({
-                        'signal': record.p_signal[:, 0], # Lead I
+                        'signal': record.p_signal[:, channel_idx], 
                         'date': rec_date,
                         'fs': record.fs,
                         'filename': hea_path.name
                     })
                 except Exception as e: pass
 
-            # Sort chronologically to enable correct Short/Long term splitting
             recs.sort(key=lambda x: (x['date'], self._extract_rec_number(x['filename'])))
             recordings[sid] = recs
             
         return recordings
 
     def _process_signal(self, sig, fs):
-        """
-        Applies filtering, segmentation (beat vs blind), and normalization.
-        Handles multi-beat merging (stacking or averaging) if configured.
-        """
         beats = self.preprocessor.preprocess_ecg(
             ecg=sig, fs=fs, 
             mode=self.prep_params.get("mode", "beat"),
@@ -276,98 +273,122 @@ class load_ecgid_dataset():
                 processed_samples.append(group.flatten())
         return np.array(processed_samples)
 
-    def load_all_sessions(self):
+    def load_all_data(self):
         """
-        Loads the entire dataset without splitting. 
-        Used primarily for random-split experiments.
+        Loads dataset for tasks that handle train/test splitting downstream.
+        Applies to 'all-available' and 'single-session'.
         """
+        if self.data_split_mode not in ["all-available", "single-session"]:
+            print(f"[WARN] Calling load_all_data() but mode is '{self.data_split_mode}'.")
+            
         data = self.load_raw_data()
         x_list, y_list = [], []
+        
         for sid, recs in tqdm(data.items(), desc="Processing signals"):
-            for rec in recs:
+            if not recs: continue
+            
+            target_recs = recs if self.data_split_mode == "all-available" else [recs[0]]
+            
+            for rec in target_recs:
                 segments = self._process_signal(rec['signal'], rec['fs'])
                 if len(segments) > 0:
                     x_list.append(segments)
                     y_list.extend([sid] * len(segments))
+                    
         if x_list: return np.vstack(x_list), np.array(y_list)
         return np.empty((0, 0)), np.empty((0,))
 
     def load_session(self, session_name):
         """
-        Loads 'Session_1' (Enrollment) or 'Session_2' (Probe) based on the 
-        configured enrollment_mode (Short-Term, Long-Term, or Maximal).
+        Loads the partitioned data strictly based on temporal/record boundaries.
+        Applies to cross-session and short/long-term tasks.
         """
+        session_name = session_name.lower()
+        if session_name in ["enrol", "train"]:
+            is_enrollment = True
+            log_name = "Train/Enrollment"
+        elif session_name in ["probe", "test"]:
+            is_enrollment = False
+            log_name = "Test/Probe"
+        else:
+            raise ValueError("session_name must be 'enrol', 'train', 'probe', or 'test'.")
+            
         data = self.load_raw_data()
         x_list, y_list = [], []
-        is_enrollment = (session_name == "Session_1")
         
-        for sid, recs in tqdm(data.items(), desc=f"Processing {session_name}"):
+        kept_subjects, dropped_subjects = 0, 0
+
+        for sid, recs in tqdm(data.items(), desc=f"Processing {log_name}"):
             if not recs: continue
+            
             target_recs = []
+            single_record_split = False
+            
+            unique_dates = sorted(list(set(r['date'] for r in recs)))
+            day1_date = unique_dates[0]
+            day1_recs = [r for r in recs if r['date'] == day1_date]
 
-            # --- MODE 1: SHORT-TERM (Intra-Day) ---
-            # Objective: Test stability within a single session/day.
-            # Split: Record 1 of Day 1 (Enroll) vs Rest of Day 1 (Probe).
-            if self.enrollment_mode == "short_term":
-                first_date = recs[0]['date']
-                # Isolate only the recordings from the very first day
-                day1_recs = [r for r in recs if r['date'] == first_date]
-                
-                if len(day1_recs) < 2: 
-                    # EDGE CASE: Subject has only 1 recording on Day 1.
-                    # Fallback: Split that single recording into First Half (Enroll) vs Last Half (Probe).
-                    if len(day1_recs) == 1:
-                        target_recs = day1_recs
-                        # Note: The splitting logic happens in the 'EXTRACTION' loop below.
-                    else: 
-                        continue # No valid data for this subject
+            # --- TASK 3: SINGLE CROSS-SESSION ---
+            if self.data_split_mode == "single-cross-session":
+                kept_subjects += 1
+                if len(recs) == 1:
+                    target_recs = [recs[0]]
+                    single_record_split = True
                 else:
-                    if is_enrollment: target_recs = [day1_recs[0]]
-                    else: target_recs = day1_recs[1:]
+                    target_recs = [recs[0]] if is_enrollment else [recs[1]]
 
-            # --- MODE 2: LONG-TERM (Inter-Day) ---
-            # Objective: Test robustness to template aging (days/weeks/months).
-            # Split: All Day 1 records (Enroll) vs All Future records (Probe).
-            elif self.enrollment_mode == "long_term":
-                first_date = recs[0]['date']
-                dates = sorted(list(set(r['date'] for r in recs)))
-                
-                # Requires at least 2 distinct dates
-                if len(dates) < 2: continue 
-                
-                if is_enrollment: 
-                    target_recs = [r for r in recs if r['date'] == first_date]
+            # --- TASK 4: SINGLE-SHOT SHORT-TERM ---
+            elif self.data_split_mode == "single-shot-short-term":
+                kept_subjects += 1
+                if len(day1_recs) == 1:
+                    target_recs = [day1_recs[0]]
+                    single_record_split = True
                 else:
-                    target_recs = [r for r in recs if r['date'] > first_date]
+                    target_recs = [day1_recs[0]] if is_enrollment else day1_recs[1:]
 
-            # --- MODE 3: MAXIMAL (First vs Last - STRICT VLT) ---
-            # Objective: Test the maximum possible time gap (Extreme Aging).
-            # Constraint: Must be CROSS-DAY. Skips subjects with only 1 day of data.
-            elif self.enrollment_mode == "maximal":
-                if len(recs) < 2: continue
-                
-                # Ensure it is strictly cross-day
-                if recs[0]['date'] == recs[-1]['date']:
-                    continue # Skip this subject (Short-term context)
+            # --- TASK 5: LEAVE-LAST-OUT SHORT-TERM ---
+            elif self.data_split_mode == "leave-last-out-short-term":
+                kept_subjects += 1
+                if len(day1_recs) == 1:
+                    target_recs = [day1_recs[0]]
+                    single_record_split = True
+                else:
+                    target_recs = day1_recs[:-1] if is_enrollment else [day1_recs[-1]]
 
-                if is_enrollment: target_recs = [recs[0]]
-                else: target_recs = [recs[-1]]
+            # --- TASK 6: SINGLE-SHOT LONG-TERM ---
+            elif self.data_split_mode == "single-shot-long-term":
+                if len(unique_dates) < 2: 
+                    dropped_subjects += 1
+                    continue
+                kept_subjects += 1
+                target_recs = day1_recs if is_enrollment else [r for r in recs if r['date'] > day1_date]
 
-            # --- EXTRACTION & SIGNAL PROCESSING ---
+            # --- TASK 7: LEAVE-LAST-OUT LONG-TERM ---
+            elif self.data_split_mode == "leave-last-out-long-term":
+                if len(unique_dates) < 2:
+                    dropped_subjects += 1
+                    continue
+                kept_subjects += 1
+                last_date = unique_dates[-1]
+                target_recs = [r for r in recs if r['date'] < last_date] if is_enrollment else [r for r in recs if r['date'] == last_date]
+
+            # --- EXTRACTION & SPLITTING ---
             for rec in target_recs:
                 segments = self._process_signal(rec['signal'], rec['fs'])
                 
-                # EDGE CASE LOGIC: Single-Record Intra-Split
-                # This only triggers if we are in Short-Term mode AND forced to use a single file.
-                if self.enrollment_mode == "short_term" and len(target_recs) == 1 and len(recs) == 1:
-                     if len(segments) > 1:
-                        mid = len(segments) // 2
-                        if is_enrollment: segments = segments[:mid] # First 50%
-                        else: segments = segments[mid:]             # Last 50%
+                if single_record_split and len(segments) > 1:
+                    mid = len(segments) // 2
+                    if is_enrollment: segments = segments[:mid]
+                    else: segments = segments[mid:]
                 
                 if len(segments) > 0:
                     x_list.append(segments)
                     y_list.extend([sid] * len(segments))
+
+        # Dynamic summary print for all structured tasks during enrollment
+        if self.data_split_mode not in ["all-available", "single-session"] and is_enrollment:
+            mode_title = self.data_split_mode.replace('-', ' ').title()
+            print(f"\n[INFO] {mode_title} Summary: Kept {kept_subjects} subjects. Dropped {dropped_subjects} subjects.")
 
         if x_list: return np.vstack(x_list), np.array(y_list)
         return np.empty((0, 0)), np.empty((0,))
@@ -377,28 +398,55 @@ class load_ecgid_dataset():
 # =============================================================================
 class load_heartprint_dataset():
     """
-    Flexible Loader for HeartPrint Dataset.
+    Dynamic Loader for the HeartPrint Dataset.
     
-    Structure:
-        - Session 1 (S1): Baseline/Rest.
-        - Session 2 (S2): Rest (Time gap from S1).
-        - Session 3R (S3R): Reading Condition (State Change).
-        - Session 3L (S3L): Long Interval (Maximal Time Gap).
-    
-    Biometric Regimes (enrollment_mode):
-        - 'standard' (Long-Term): 
-             Enroll = S1. Probe = S2.
-        - 'reverse' (Long-Term):
-             Enroll = S2. Probe = S1.
-        - 'state_robustness' (Reading Task):
-             Enroll = S1. Probe = S3R (Reading).
-             *Tests robustness to mental task/state changes.*
-        - 'vlt' (Very Long-Term):
-             Enroll = S1. Probe = S3L (Long Interval).
-             *Tests robustness to maximal template aging.*
+    HeartPrint is highly structured around distinct physiological and temporal sessions.
+    This loader enforces strict mathematical intersection—a subject is only kept if they 
+    possess valid data in ALL requested target sessions.
+
+    Session Tags Available for Mapping:
+      - 'session1'  (Baseline / Rest)
+      - 'session2'  (Rest / Short-Term follow up)
+      - 'session3r' (Reading Task / Cognitive State Change)
+      - 'session3l' (Very Long-Term / Maximal Time Gap)
+
+    Args:
+        data_split_mode (str): The routing logic for data extraction.
+            Options:
+                - 'single-session': Extracts the exact sessions defined in `session_for_single_session_evaluation` 
+                                    and pools them for downstream random-splitting.
+                - 'cross-session': Maps data strictly to Train/Enroll/Probe groups based on the session arguments below.
+        session_for_single_session_evaluation (str or list): Target session(s) to load if mode is 'single-session'.
+            Example: 'session1' or ['session1', 'session2']
+        train_sessions (str or list): Session(s) to load when requesting representation learning data. Can be None.
+            Example: 'session1'
+        enroll_sessions (str or list): Session(s) to load when requesting Gallery enrollment data. Can be None.
+            Example: 'session1'
+        probe_sessions (str or list): Session(s) to load when requesting Test query data. Can be None.
+            Example: 'session3l'
+        num_beats_to_merge (int): Number of consecutive beats to fuse into a single sample.
+        beat_merge_method (str): Strategy for fusing beats. Options: ['average', 'concat']
+        cleanup_zip (bool): If True, deletes the downloaded zip file after extraction.
+        **preprocessing_params: kwargs passed directly to the Preprocessing class.
     """
-    def __init__(self, num_beats=1, merge_strategy="average", enrollment_mode="standard", 
-                 preprocessing_params=None, cleanup_zip=False):
+    def __init__(self, data_split_mode="cross-session", 
+                 session_for_single_session_evaluation=["session1"],
+                 train_sessions=["session1"], 
+                 enroll_sessions=["session1"],
+                 probe_sessions=["session2"], 
+                 num_beats_to_merge=1, beat_merge_method="average", 
+                 cleanup_zip=False, **preprocessing_params):
+       
+        # --- KWARGS GUARD ---
+        allowed_prep_kwargs = ["mode", "window_len", "stride", "pre_s", "post_s", "bandpass", "lowcut", "highcut", "normalize"]
+        for k in preprocessing_params.keys():
+            if k not in allowed_prep_kwargs:
+                raise ValueError(
+                    f"\n[ERROR] Unrecognized parameter: '{k}'.\n"
+                    f"Did you misspell a class argument? (e.g., using 'enrol_sessions' instead of 'enroll_sessions')\n"
+                    f"Allowed preprocessing kwargs: {allowed_prep_kwargs}"
+                )
+
         self.preprocessor = Preprocessing()
         self.cfg = CONFIG["datasets"]["heartprint"]
         project_dir = Path(__file__).resolve().parent
@@ -409,20 +457,44 @@ class load_heartprint_dataset():
         
         self.sample_len = self.cfg.get("sample_length", 3747)
         self.prep_params = preprocessing_params if preprocessing_params else self.cfg.get("preprocessing", {})
-        self.num_beats = num_beats
-        self.merge_strategy = merge_strategy
+        self.num_beats = num_beats_to_merge
+        self.merge_strategy = beat_merge_method
         self.cleanup_zip = cleanup_zip
         
-        valid_modes = ["standard", "reverse", "state_robustness", "vlt"]
-        if enrollment_mode not in valid_modes:
-             raise ValueError(f"Invalid HeartPrint mode: {enrollment_mode}. Use {valid_modes}")
-        self.enrollment_mode = enrollment_mode
+        valid_modes = ["single-session", "cross-session"]
+        if data_split_mode not in valid_modes:
+            raise ValueError(f"Invalid mode: {data_split_mode}. Use {valid_modes}")
+        self.data_split_mode = data_split_mode
+        
+        # Safely convert strings to lists and handle None
+        to_list = lambda x: [x] if isinstance(x, str) else (x if x else [])
+        
+        self.session_for_single_session_evaluation = to_list(session_for_single_session_evaluation)
+        self.train_sessions = to_list(train_sessions)
+        self.enroll_sessions = to_list(enroll_sessions)
+        self.probe_sessions = to_list(probe_sessions)
+        
+        # Enforce exact naming to match folder architectures
+        self._normalize_sessions(self.session_for_single_session_evaluation)
+        self._normalize_sessions(self.train_sessions)
+        self._normalize_sessions(self.enroll_sessions)
+        self._normalize_sessions(self.probe_sessions)
+        
+        self.required_cross_sessions = list(set(self.train_sessions + self.enroll_sessions + self.probe_sessions))
+        
+        if self.data_split_mode == "single-session" and not self.session_for_single_session_evaluation:
+            raise ValueError("You must provide `session_for_single_session_evaluation`.")
+        if self.data_split_mode == "cross-session" and not self.required_cross_sessions:
+            raise ValueError("You must provide at least one valid train, enroll, or probe session.")
+
+    def _normalize_sessions(self, session_list):
+        """Standardizes session strings to match directory keys natively."""
+        for i in range(len(session_list)):
+            s = session_list[i].lower().replace("-", "").replace("_", "").replace(" ", "")
+            session_list[i] = s
 
     def download(self):
-        """
-        Attempts robust download via Figshare API. 
-        """
-        # 1. Check if data already exists
+        """Attempts robust download via Figshare API."""
         if self.dataset_root.exists():
             for root, dirs, files in os.walk(self.dataset_root):
                 for d in dirs:
@@ -432,7 +504,6 @@ class load_heartprint_dataset():
         print(f"[INFO] Attempting to download HeartPrint...")
         
         try:
-            # 2. Download Phase
             if not self.zip_path.exists():
                 match = re.search(r'articles/(\d+)/versions/(\d+)', self.url)
                 if match:
@@ -449,75 +520,72 @@ class load_heartprint_dataset():
                 with requests.get(dl_url, stream=True) as r:
                     r.raise_for_status()
                     if size == 0: size = int(r.headers.get('content-length', 0))
-                    # Added tqdm here as requested
                     with open(self.zip_path, "wb") as f, tqdm(desc="Downloading", total=size, unit='iB', unit_scale=True) as bar:
                         for chunk in r.iter_content(8192): f.write(chunk); bar.update(len(chunk))
 
-            # 3. Extraction Phase
             print(f"[INFO] Attempting extraction...")
             with tempfile.TemporaryDirectory() as temp_dir:
-                try:
-                    patoolib.extract_archive(str(self.zip_path), outdir=temp_dir)
+                try: patoolib.extract_archive(str(self.zip_path), outdir=temp_dir)
                 except Exception:
                     with zipfile.ZipFile(self.zip_path, "r") as zf: zf.extractall(temp_dir)
-                
-                for item in os.listdir(temp_dir):
-                    shutil.move(os.path.join(temp_dir, item), self.dataset_root)
-            
+                for item in os.listdir(temp_dir): shutil.move(os.path.join(temp_dir, item), self.dataset_root)
             if self.cleanup_zip: os.remove(self.zip_path)
 
         except Exception as e:
             print(f"[WARN] Automated download failed: {e}")
             print("Please download manually and extract to:", self.dataset_root)
 
-    def load_raw_data(self, target_folder_keyword):
+    def load_raw_data(self):
         """
-        Recursively searches for folder matching keyword (e.g., 'session3r').
+        Scans the HeartPrint directory and maps valid text files to their explicit Session and Subject ID.
         """
         if not self.dataset_root.exists() or not any(self.dataset_root.iterdir()):
             self.download()
-        
-        recordings = {}
-        # Normalize: "Session-3R" -> "session3r"
-        target_clean = target_folder_keyword.lower().replace("-", "").replace("_", "").replace(" ", "")
-        found_path = None
-        
-        if self.dataset_root.exists():
-            for root, dirs, files in os.walk(self.dataset_root):
-                for d in dirs:
-                    d_norm = d.lower().replace("-", "").replace("_", "").replace(" ", "")
-                    # Strict check for 3L vs 3R
-                    if target_clean in d_norm:
-                        # Prevent "session3" from matching "session3r" incorrectly if ambiguous
-                        if "3" in target_clean and "r" in target_clean and "r" not in d_norm: continue
-                        if "3" in target_clean and "l" in target_clean and "l" not in d_norm: continue
-                        
-                        found_path = Path(root) / d
-                        break
-                if found_path: break
-        
-        if not found_path:
-            # Fallback for some unzipped structures
-            return {}
 
-        for subj_dir in tqdm(sorted(os.listdir(found_path)), desc=f"Loading {target_folder_keyword}"):
-            full_subj_path = found_path / subj_dir
-            if not full_subj_path.is_dir(): continue
-            
-            sid = subj_dir
-            if sid not in recordings: recordings[sid] = []
-            
-            for f in sorted(glob.glob(os.path.join(full_subj_path, "*"))): 
-                if not os.path.isfile(f) or f.endswith(".rar") or f.endswith(".zip"): continue
-                with open(f, 'r') as fp:
+        print("\n[INFO] Scanning directories and pooling HeartPrint files...")
+        session_dirs = {}
+        
+        # 1. Identify the core session folders safely
+        for root, dirs, files in os.walk(self.dataset_root):
+            for d in dirs:
+                d_norm = d.lower().replace("-", "").replace("_", "").replace(" ", "")
+                if "session1" in d_norm: session_dirs["session1"] = Path(root) / d
+                elif "session2" in d_norm: session_dirs["session2"] = Path(root) / d
+                elif "session3r" in d_norm or ("session3" in d_norm and "r" in d_norm): session_dirs["session3r"] = Path(root) / d
+                elif "session3l" in d_norm or ("session3" in d_norm and "l" in d_norm): session_dirs["session3l"] = Path(root) / d
+
+        recordings = {}
+        
+        # 2. Extract records, ensuring we skip hidden macOS files
+        for session_tag, sess_path in session_dirs.items():
+            for sid in tqdm(os.listdir(sess_path), desc=f"Loading {session_tag.upper()} raw files"):
+                subj_path = sess_path / sid
+                if not subj_path.is_dir(): continue
+                
+                if sid not in recordings: recordings[sid] = {}
+                if session_tag not in recordings[sid]: recordings[sid][session_tag] = []
+                
+                for f in os.listdir(subj_path):
+                    if not f.endswith(".txt") or f.startswith("._"): continue
+                    
+                    fpath = subj_path / f
                     try:
-                        lines = [l.strip() for l in fp.readlines()]
-                        vals = [float(l) for l in lines if l][:self.sample_len]
-                        if len(vals) > 0: recordings[sid].append(np.array(vals))
-                    except ValueError: pass
+                        # High-Speed parsing: Bypasses headers and stops at the sample length
+                        df = pd.read_csv(fpath, comment='#', delim_whitespace=True, header=None, nrows=self.sample_len, on_bad_lines='skip')
+                        if not df.empty:
+                            sig = df.iloc[:, 0].dropna().values.astype(float)
+                            sig = sig - np.mean(sig) # Zero-mean baseline
+                            recordings[sid][session_tag].append({'signal': sig, 'fs': 250})
+                    except Exception as e:
+                        print(f"\n[WARN] Failed to read {f}: {e}")
+                        
         return recordings
 
     def _process_signal(self, sig, fs=250):
+        """Applies filters, segmentation, and multi-beat merging."""
+        if np.isnan(sig).any() or len(sig) < fs or np.std(sig) < 1e-5: 
+            return np.empty((0, 0))
+
         beats = self.preprocessor.preprocess_ecg(
             sig, fs=fs, 
             mode=self.prep_params.get("mode", "beat"),
@@ -534,71 +602,79 @@ class load_heartprint_dataset():
         processed_samples = []
         for i in range(0, len(beats) - self.num_beats + 1):
             group = beats[i : i + self.num_beats]
-            if self.merge_strategy == "average":
-                processed_samples.append(np.mean(group, axis=0))
-            elif self.merge_strategy == "concat":
-                processed_samples.append(group.flatten())
+            if self.merge_strategy == "average": processed_samples.append(np.mean(group, axis=0))
+            elif self.merge_strategy == "concat": processed_samples.append(group.flatten())
         return np.array(processed_samples)
 
-    def load_all_sessions(self):
-        """Loads S1 and S2 for random split."""
-        data_s1 = self.load_raw_data("session1")
-        data_s2 = self.load_raw_data("session2")
-        
-        for k, v in data_s2.items():
-            if k in data_s1: data_s1[k].extend(v)
-            else: data_s1[k] = v
-            
-        x_list, y_list = [], []
-        # Added tqdm here
-        for sid, recs in tqdm(data_s1.items(), desc="Processing all sessions"):
-            for sig in recs:
-                segments = self._process_signal(sig)
-                if len(segments) > 0:
-                    x_list.append(segments)
-                    y_list.extend([sid] * len(segments))
-                    
-        if x_list: return np.vstack(x_list), np.array(y_list)
-        return np.empty((0, 0)), np.empty((0,))
+    def load_all_data(self):
+        """Safely routes generic all-data requests to the single-session logic."""
+        if self.data_split_mode != "single-session":
+            print(f"[WARN] Calling load_all_data() but mode is '{self.data_split_mode}'.")
+        return self.load_session("train")
 
     def load_session(self, session_name):
         """
-        Mappings:
-        - standard: S1 -> S2
-        - reverse: S2 -> S1
-        - state_robustness: S1 -> S3R
-        - vlt: S1 -> S3L
+        Extracts requested sessions.
+        In 'cross-session' mode, enforces strict mathematical intersection, ensuring a 
+        subject is present across ALL specified train, enroll, and probe configurations.
         """
-        target_folders = []
+        session_name = session_name.lower()
+        target_sessions = []
+        is_primary_pass = False
         
-        if self.enrollment_mode == "standard":
-            if session_name == "Session_1": target_folders = ["session1"]
-            elif session_name == "Session_2": target_folders = ["session2"]
+        if self.data_split_mode == "single-session":
+            if session_name in ["probe", "test"]:
+                raise ValueError("Cannot load 'test' in single-session mode. Split upstream.")
+            target_sessions = self.session_for_single_session_evaluation
+            log_name = f"Single-Session Target(s): {target_sessions}"
+            is_primary_pass = True
+            
+        elif self.data_split_mode == "cross-session":
+            if session_name in ["train"]:
+                target_sessions = self.train_sessions
+                is_primary_pass = True
+            elif session_name in ["enrol", "enrollment"]:
+                target_sessions = self.enroll_sessions
+                is_primary_pass = True if not self.train_sessions else False
+            elif session_name in ["probe", "test"]:
+                target_sessions = self.probe_sessions
+            else:
+                raise ValueError("session_name must be 'train', 'enrol', or 'test'.")
+            log_name = f"Cross-Session ({session_name.title()}): {target_sessions}"
 
-        elif self.enrollment_mode == "reverse":
-            if session_name == "Session_1": target_folders = ["session2"]
-            elif session_name == "Session_2": target_folders = ["session1"]
-
-        elif self.enrollment_mode == "state_robustness":
-            if session_name == "Session_1": target_folders = ["session1"]
-            elif session_name == "Session_2": target_folders = ["session3r"] # Reading
-        
-        elif self.enrollment_mode == "vlt":
-            if session_name == "Session_1": target_folders = ["session1"]
-            elif session_name == "Session_2": target_folders = ["session3l"] # Long Interval
-        
+        if not target_sessions:
+            return np.empty((0, 0)), np.empty((0,))
+            
+        data = self.load_raw_data()
         x_list, y_list = [], []
         
-        for folder in target_folders:
-            data_dict = self.load_raw_data(folder)
-            # Added tqdm here
-            for sid, recs in tqdm(data_dict.items(), desc=f"Processing {folder} signals"):
-                for sig in recs:
-                    segments = self._process_signal(sig)
-                    if len(segments) > 0:
-                        x_list.append(segments)
-                        y_list.extend([sid] * len(segments))
-                        
+        kept_subjects, dropped_subjects = 0, 0
+
+        for sid, tagged_sessions in tqdm(data.items(), desc=f"Processing {log_name}"):
+            
+            # --- STRICT INTERSECTION LOGIC ---
+            if self.data_split_mode == "single-session":
+                is_valid = all(s in tagged_sessions for s in target_sessions)
+            elif self.data_split_mode == "cross-session":
+                # Strict: Subject MUST have data in ALL requested global sets
+                is_valid = all(s in tagged_sessions for s in self.required_cross_sessions)
+
+            if is_valid:
+                kept_subjects += 1
+                for s in target_sessions:
+                    # HeartPrint frequently has 2 to 6 files per session. This naturally pools them!
+                    for signal_dict in tagged_sessions[s]:
+                        segments = self._process_signal(signal_dict['signal'], signal_dict['fs'])
+                        if len(segments) > 0:
+                            x_list.append(segments)
+                            y_list.extend([sid] * len(segments))
+            else:
+                dropped_subjects += 1
+
+        if is_primary_pass:
+            print(f"\n[INFO] HeartPrint Evaluation Summary ({self.data_split_mode.title()}):")
+            print(f"       Kept {kept_subjects} mathematically matched subjects. Dropped {dropped_subjects} subjects due to missing session data.")
+
         if x_list: return np.vstack(x_list), np.array(y_list)
         return np.empty((0, 0)), np.empty((0,))
 
@@ -607,58 +683,36 @@ class load_heartprint_dataset():
 # =============================================================================
 class load_ptb_dataset():
     """
-    Robust Loader for PTB Diagnostic ECG Database.
-    
-    This class manages the loading and splitting of the PTB database, which contains 
-    varying numbers of records per patient (from 1 to >20) collected over months.
-    
-    Attributes:
-        enrollment_mode (str): Defines the biometric evaluation regime.
-            - 'short_term': (Day 1 Stability)
-                Enroll = First recording of the first day.
-                Probe  = All subsequent recordings on the same day.
-                *Tests immediate re-authentication stability.*
-            
-            - 'long_term':  (Template Aging)
-                Enroll = All recordings from the first day.
-                Probe  = All recordings from all future days.
-                *Tests robustness to physiological changes/disease progression over time.*
-            
-            - 'maximal':    (Very Long-Term)
-                Enroll = The absolute first recording.
-                Probe  = The absolute last recording available.
-                *Tests the limits of the system over the maximum available time gap.*
-        
-        filter_subset (str): 
-            - 'all': Uses all subjects.
-            - 'multi_rec_only': Drops subjects with < 2 recordings.
-            
-        only_healthy (bool):
-            - If True, filters dataset to include only Healthy Controls (HC).
+    Robust Loader for the PTB Diagnostic ECG Database.
+    Handles multi-lead parsing, clinical header filtering, and chronologically mapped biometric tasks.
+
+    This dataset contains 549 records from 290 subjects. Many subjects have 
+    severe clinical pathologies (e.g., Myocardial Infarction). 
+
+    Args:
+        leads (list of str): Target ECG leads to extract. 
+            Options: Any valid 12-lead string (e.g., ['i', 'v5', 'ii']) or 'all' for all 15 available channels.
+            Default: ['i']
+        data_split_mode (str): Evaluation regime mapping.
+            Options:
+                - 'all-available': Loads every record (used for random beat-level splitting).
+                - 'single-session': Loads ONLY the 1st record of each subject.
+                - 'single-cross-session': 1st record = Train/Enroll, 2nd record = Test/Probe.
+                - 'single-shot-short-term': Day 1's 1st record = Enroll, rest of Day 1 = Probe.
+                - 'leave-last-out-short-term': Day 1's last record = Probe, rest of Day 1 = Enroll.
+                - 'single-shot-long-term': All Day 1 records = Enroll, all future days = Probe.
+                - 'leave-last-out-long-term': Last recording day = Probe, all past days = Enroll.
+        only_healthy (bool): If True, strictly drops subjects with clinical pathologies, 
+                             keeping only the ~52 healthy control volunteers.
+        num_beats_to_merge (int): Number of consecutive beats to fuse into a single sample.
+        beat_merge_method (str): Strategy for fusing beats. Options: ['average', 'concat']
+        cleanup_zip (bool): If True, deletes the downloaded zip file after extraction.
+        **preprocessing_params: kwargs passed directly to the Preprocessing class.
     """
-    def __init__(self, leads=['ii'], filter_subset="all", enrollment_mode="long_term",
-                 only_healthy=False, num_beats=1, merge_strategy="average", preprocessing_params=None, cleanup_zip=False):
-        """
-        Args:
-            leads (list): Target leads to load (e.g., ['ii', 'v5']).
-            
-            filter_subset (str):
-                - 'all': Uses all available subjects.
-                - 'multi_rec_only': Restricts dataset to subjects with at least 2 recordings.
-                  (Required for strict Long-Term and Maximal evaluation).
-            
-            enrollment_mode (str):
-                - 'short_term': Intra-day split (Record 1 vs Rest of Day 1).
-                - 'long_term': Inter-day split (Day 1 vs Future Days).
-                - 'maximal': First vs Last recording (Maximal temporal gap).
-            
-            only_healthy (bool): If True, filters out Pathological subjects (Myocardial Infarction, etc.)
-                                 and keeps only Healthy Controls.
-                                 
-            num_beats (int): Number of beats to stack/average for the input template.
-            preprocessing_params (dict): Configuration for the signal processing pipeline.
-            cleanup_zip (bool): Remove .zip file after extraction to save space.
-        """
+    def __init__(self, leads=['i'], data_split_mode="all-available",
+                 only_healthy=False, num_beats_to_merge=1, beat_merge_method="average", 
+                 cleanup_zip=False, **preprocessing_params):
+       
         self.preprocessor = Preprocessing()
         self.cfg = CONFIG["datasets"]["ptb"]
         project_dir = Path(__file__).resolve().parent
@@ -670,19 +724,18 @@ class load_ptb_dataset():
         self.prep_params = preprocessing_params if preprocessing_params else self.cfg.get("preprocessing", {})
         self.target_leads = [l.lower() for l in leads] if isinstance(leads, list) else leads
         self.only_healthy = only_healthy
-        self.num_beats = num_beats
-        self.merge_strategy = merge_strategy
+        self.num_beats = num_beats_to_merge
+        self.merge_strategy = beat_merge_method
         self.cleanup_zip = cleanup_zip
-        self.filter_subset = filter_subset
         
-        valid_modes = ["short_term", "long_term", "maximal"]
-        if enrollment_mode not in valid_modes:
-            # Backward compatibility
-            if enrollment_mode == "first_date": enrollment_mode = "long_term"
-            elif enrollment_mode == "first_vs_last": enrollment_mode = "maximal"
-            elif enrollment_mode == "first_record": enrollment_mode = "short_term"
-            else: raise ValueError(f"Invalid mode: {enrollment_mode}. Use {valid_modes}")
-        self.enrollment_mode = enrollment_mode
+        valid_modes = [
+            "all-available", "single-session", "single-cross-session", 
+            "single-shot-short-term", "leave-last-out-short-term", 
+            "single-shot-long-term", "leave-last-out-long-term"
+        ]
+        if data_split_mode not in valid_modes:
+            raise ValueError(f"Invalid mode: {data_split_mode}. Use {valid_modes}")
+        self.data_split_mode = data_split_mode
 
     def download(self):
         """Downloads and extracts the dataset if not already present."""
@@ -711,7 +764,7 @@ class load_ptb_dataset():
         return None
 
     def _get_lead_indices(self, available_leads):
-        """Maps requested lead names (e.g., 'ii', 'v5') to channel indices."""
+        """Maps requested lead names (e.g., 'i', 'v5') to channel indices."""
         avail_norm = [l.lower().replace("ecg", "").strip() for l in available_leads]
         if self.target_leads == 'all': return list(range(len(available_leads)))
         indices = []
@@ -724,13 +777,12 @@ class load_ptb_dataset():
     def load_raw_data(self):
         """
         Loads all WFDB records, parses metadata, and sorts chronologically.
-        Returns: { 'patient_id': [list of recording dicts sorted by date] }
+        Injects synthetic dates for records missing timestamps to preserve them for evaluation.
         """
         if not self.dataset_root.exists() or not any(self.dataset_root.iterdir()):
             self.download()
         
         recordings = {}
-        # Find all .hea files recursively
         files = list(self.dataset_root.rglob("*.hea"))
         
         # Group files by patient folder (e.g., patient001)
@@ -740,11 +792,13 @@ class load_ptb_dataset():
             if pid not in patient_groups: patient_groups[pid] = []
             patient_groups[pid].append(f)
 
+        # Base date for synthetic injection
+        dummy_date = datetime.date(2099, 1, 1)
+
         for sid, p_files in tqdm(sorted(patient_groups.items()), desc="Loading PTB raw files"):
             recs = []
             p_files = sorted(p_files) 
 
-            # Optional: Filter for Healthy Controls
             if self.only_healthy:
                 try:
                     first_header = wfdb.rdheader(str(p_files[0].with_suffix("")))
@@ -761,23 +815,24 @@ class load_ptb_dataset():
                     
                     dt = rec_header.base_date
                     if dt is None: dt = self._parse_date_from_comments(rec_header.comments)
-                    if dt is None: dt = datetime.date.min
-                    full_dt = datetime.datetime.combine(dt, datetime.time.min)
                     
+                    # Assign a synthetic sequential date if none is found
+                    if dt is None:
+                        dt = dummy_date
+                        dummy_date += datetime.timedelta(days=1)
+                        
+                    full_dt = datetime.datetime.combine(dt, datetime.time.min)
                     recs.append({"signal": data, "fs": rec_header.fs, "date": full_dt, "filename": hea.name})
-                except Exception as e: pass
+                except Exception: pass
             
             if recs:
-                # Sort chronologically to enable Short/Long term splitting
                 recs.sort(key=lambda x: (x["date"], x["filename"]))
                 recordings[sid] = recs
         
-        if self.filter_subset == "multi_rec_only":
-            recordings = {k: v for k, v in recordings.items() if len(v) >= 2}
         return recordings
 
     def _process_signal(self, sig, fs):
-        """Applies filters, segmentation, and normalization."""
+        """Applies filters, segmentation, and multi-beat merging."""
         n_channels = sig.shape[1]
         processed_channels = []
         for c in range(n_channels):
@@ -813,102 +868,113 @@ class load_ptb_dataset():
                 merged_samples.append(merged)
         return np.array(merged_samples)
 
-    def load_all_sessions(self):
-        """Loads all data without splitting (for Random Split tasks)."""
-        data = self.load_raw_data()
-        x_list, y_list = [], []
-        for sid, recs in tqdm(data.items(), desc="Processing signals"):
-            for rec in recs:
-                segments = self._process_signal(rec['signal'], rec['fs'])
-                if len(segments) > 0:
-                    x_list.append(segments)
-                    y_list.extend([sid] * len(segments))
-        if x_list: return np.vstack(x_list), np.array(y_list)
-        return np.empty((0, 0)), np.empty((0,))
-
-    def load_session(self, session_name, part="all"):
+    def load_all_data(self):
         """
-        Loads Session 1 (Enrollment) or Session 2 (Probe) based on enrollment_mode.
+        Loads dataset for tasks that handle train/test splitting downstream.
+        Applies to 'all-available' and 'single-session'.
         """
+        if self.data_split_mode not in ["all-available", "single-session"]:
+            print(f"[WARN] Calling load_all_data() but mode is '{self.data_split_mode}'.")
+            
         data = self.load_raw_data()
         x_list, y_list = [], []
         
-        is_enrollment = (session_name == "Session_1" or part == "enrollment")
-        is_probe = (session_name == "Session_2" or part == "probe")
-        is_all = (part == "all")
+        for sid, recs in tqdm(data.items(), desc="Processing signals"):
+            if not recs: continue
+            
+            target_recs = recs if self.data_split_mode == "all-available" else [recs[0]]
+            
+            for rec in target_recs:
+                segments = self._process_signal(rec['signal'], rec['fs'])
+                if len(segments) > 0:
+                    x_list.append(segments)
+                    y_list.extend([sid] * len(segments))
+                    
+        if x_list: return np.vstack(x_list), np.array(y_list)
+        return np.empty((0, 0)), np.empty((0,))
 
-        for sid, recs in tqdm(data.items(), desc=f"Processing {session_name}"):
+    def load_session(self, session_name):
+        """
+        Loads the partitioned data strictly based on temporal/record boundaries.
+        Applies to cross-session and short/long-term tasks.
+        """
+        session_name = session_name.lower()
+        if session_name in ["enrol", "train"]:
+            is_enrollment = True
+            log_name = "Train/Enrollment"
+        elif session_name in ["probe", "test"]:
+            is_enrollment = False
+            log_name = "Test/Probe"
+        else:
+            raise ValueError("session_name must be 'enrol', 'train', 'probe', or 'test'.")
+            
+        data = self.load_raw_data()
+        x_list, y_list = [], []
+        
+        kept_subjects, dropped_subjects = 0, 0
+
+        for sid, recs in tqdm(data.items(), desc=f"Processing {log_name}"):
             if not recs: continue
             
             target_recs = []
-            do_split_signal = False # Flag for single-record intra-split
+            
+            unique_dates = sorted(list(set(r['date'] for r in recs)))
+            day1_date = unique_dates[0]
+            day1_recs = [r for r in recs if r['date'] == day1_date]
 
-            # Sort again just to be safe
-            recs.sort(key=lambda x: (x["date"], x["filename"]))
-
-            # -----------------------------------------------------------
-            # MODE 1: SHORT-TERM (Intra-Day)
-            # -----------------------------------------------------------
-            # Objective: Test stability within Day 1.
-            if self.enrollment_mode == "short_term":
-                first_date = recs[0]['date']
-                day1_recs = [r for r in recs if r['date'] == first_date]
-                
-                if len(day1_recs) > 1:
-                    # Multi-Record Day 1: Rec 1 vs Rest
-                    if is_enrollment: target_recs = [day1_recs[0]]
-                    elif is_probe: target_recs = day1_recs[1:]
-                elif len(day1_recs) == 1:
-                    # Single-Record Day 1: Split the file 50/50
-                    target_recs = day1_recs
-                    if not is_all: do_split_signal = True
-                else:
+            # --- TASK 3: SINGLE CROSS-SESSION ---
+            if self.data_split_mode == "single-cross-session":
+                if len(recs) < 2: 
+                    dropped_subjects += 1
                     continue
+                kept_subjects += 1
+                target_recs = [recs[0]] if is_enrollment else [recs[1]]
 
-            # -----------------------------------------------------------
-            # MODE 2: LONG-TERM (Inter-Day)
-            # -----------------------------------------------------------
-            # Objective: Test template aging (Day 1 vs Future).
-            elif self.enrollment_mode == "long_term":
-                dates = sorted(list(set(r['date'] for r in recs)))
-                if len(dates) < 2: 
-                    continue # Skip subjects with only 1 day of data
-                
-                first_d = dates[0]
-                if is_enrollment:
-                    target_recs = [r for r in recs if r['date'] == first_d]
-                elif is_probe:
-                    target_recs = [r for r in recs if r['date'] > first_d]
-
-            # -----------------------------------------------------------
-            # MODE 3: MAXIMAL (First vs Last)
-            # -----------------------------------------------------------
-            # Objective: Test maximum time gap (Strictly Cross-Day).
-            elif self.enrollment_mode == "maximal":
-                if len(recs) < 2: continue 
-                
-                # Ensure First and Last are different days
-                if recs[0]['date'] == recs[-1]['date']:
+            # --- TASK 4: SINGLE-SHOT SHORT-TERM ---
+            elif self.data_split_mode == "single-shot-short-term":
+                if len(day1_recs) < 2: 
+                    dropped_subjects += 1
                     continue
+                kept_subjects += 1
+                target_recs = [day1_recs[0]] if is_enrollment else day1_recs[1:]
 
-                if is_enrollment: target_recs = [recs[0]]
-                elif is_probe: target_recs = [recs[-1]]
+            # --- TASK 5: LEAVE-LAST-OUT SHORT-TERM ---
+            elif self.data_split_mode == "leave-last-out-short-term":
+                if len(day1_recs) < 2: 
+                    dropped_subjects += 1
+                    continue
+                kept_subjects += 1
+                target_recs = day1_recs[:-1] if is_enrollment else [day1_recs[-1]]
 
-            # -----------------------------------------------------------
-            # Extract Segments
-            # -----------------------------------------------------------
+            # --- TASK 6: SINGLE-SHOT LONG-TERM ---
+            elif self.data_split_mode == "single-shot-long-term":
+                if len(unique_dates) < 2: 
+                    dropped_subjects += 1
+                    continue
+                kept_subjects += 1
+                target_recs = day1_recs if is_enrollment else [r for r in recs if r['date'] > day1_date]
+
+            # --- TASK 7: LEAVE-LAST-OUT LONG-TERM ---
+            elif self.data_split_mode == "leave-last-out-long-term":
+                if len(unique_dates) < 2:
+                    dropped_subjects += 1
+                    continue
+                kept_subjects += 1
+                last_date = unique_dates[-1]
+                target_recs = [r for r in recs if r['date'] < last_date] if is_enrollment else [r for r in recs if r['date'] == last_date]
+
+            # --- EXTRACTION & SIGNAL PROCESSING ---
             for rec in target_recs:
                 segments = self._process_signal(rec['signal'], rec['fs'])
-                
-                # Handle single-record intra-split logic (first half vs second half)
-                if do_split_signal and len(segments) > 0:
-                    mid = len(segments) // 2
-                    if is_enrollment: segments = segments[:mid]
-                    elif is_probe: segments = segments[mid:]
                 
                 if len(segments) > 0:
                     x_list.append(segments)
                     y_list.extend([sid] * len(segments))
+
+        # Dynamic summary print for all structured tasks during enrollment
+        if self.data_split_mode not in ["all-available", "single-session"] and is_enrollment:
+            mode_title = self.data_split_mode.replace('-', ' ').title()
+            print(f"\n[INFO] {mode_title} Summary: Kept {kept_subjects} subjects. Dropped {dropped_subjects} subjects.")
 
         if x_list: return np.vstack(x_list), np.array(y_list)
         return np.empty((0, 0)), np.empty((0,))
@@ -918,14 +984,51 @@ class load_ptb_dataset():
 # # =============================================================================
 class load_cybhi_dataset():
     """
-    Loader for CYBHi (Check Your Biosignals Here) Dataset.
+    Dynamic Loader for the CYBHi Dataset.
     
-    Subsets:
-    1. 'short-term' (CI-A1-A2): ~3 days gap. Filenames like '20110718-LGM.txt'
-    2. 'long-term' (A0): ~3 months gap. Filenames like '20120106-AA.txt'
+    CYBHi is designed to test biometric stability across intense physical/mental 
+    interventions (Short-Term) and across a 3-month aging gap (Long-Term).
+
+    Session Tags Available for Mapping:
+      - 'short-term_CI' (Baseline Rest)
+      - 'short-term_A1' (Intervention 1 - e.g., Physical Exercise)
+      - 'short-term_A2' (Intervention 2 - e.g., Mental Stress)
+      - 'long-term_S1'  (Month 0 Baseline)
+      - 'long-term_S2'  (Month 3 Follow-up)
+
+    Args:
+        data_split_mode (str): The routing logic for data extraction.
+            Options:
+                - 'single-session': Extracts the exact sessions defined in `session_for_single_session_evaluation` 
+                                    and pools them for downstream random-splitting.
+                - 'cross-session': Maps data strictly to Train/Enroll/Probe groups based on the session arguments below.
+        session_for_single_session_evaluation (str or list): Target session(s) to load if mode is 'single-session'.
+            Example: 'long-term_S1'
+        train_sessions (str or list): Session(s) to load for representation learning.
+            Example: 'long-term_S1'
+        enroll_sessions (str or list): Session(s) to load for Gallery enrollment.
+            Example: 'long-term_S1'
+        probe_sessions (str or list): Session(s) to load for Test queries.
+            Example: 'long-term_S2'
+        num_beats_to_merge (int): Number of consecutive beats to fuse into a single sample.
+        beat_merge_method (str): Strategy for fusing beats. Options: ['average', 'concat']
+        cleanup_zip (bool): If True, deletes the downloaded zip file after extraction.
+        **preprocessing_params: kwargs passed directly to the Preprocessing class.
     """
-    def __init__(self, num_beats=1, merge_strategy="average", subset="long-term", 
-                 enrollment_mode="standard", preprocessing_params=None, cleanup_zip=False):
+    def __init__(self, data_split_mode="cross-session", 
+                 session_for_single_session_evaluation=["long-term_S1"],
+                 train_sessions=["long-term_S1"], 
+                 enroll_sessions=["long-term_S1"],
+                 probe_sessions=["long-term_S2"], 
+                 num_beats_to_merge=1, beat_merge_method="average", 
+                 cleanup_zip=False, **preprocessing_params):
+        
+        # --- KWARGS GUARD ---
+        allowed_prep_kwargs = ["mode", "window_len", "stride", "pre_s", "post_s", "bandpass", "lowcut", "highcut", "normalize"]
+        for k in preprocessing_params.keys():
+            if k not in allowed_prep_kwargs:
+                raise ValueError(f"\n[ERROR] Unrecognized parameter: '{k}'. Did you misspell an argument?")
+
         self.preprocessor = Preprocessing()
         self.cfg = CONFIG["datasets"]["cybhi"]
         project_dir = Path(__file__).resolve().parent
@@ -935,123 +1038,142 @@ class load_cybhi_dataset():
         self.url = self.cfg["url"]
         
         self.prep_params = preprocessing_params if preprocessing_params else self.cfg.get("preprocessing", {})
-        self.subset = subset.lower()
-        self.enrollment_mode = enrollment_mode
-        self.num_beats = num_beats
-        self.merge_strategy = merge_strategy
+        self.num_beats = num_beats_to_merge
+        self.merge_strategy = beat_merge_method
         self.cleanup_zip = cleanup_zip
         
-        if self.subset not in ["short-term", "long-term"]:
-            raise ValueError(f"Invalid CYBHi subset: {self.subset}. Use 'short-term' or 'long-term'.")
+        valid_modes = ["single-session", "cross-session"]
+        if data_split_mode not in valid_modes:
+            raise ValueError(f"Invalid mode: {data_split_mode}.")
+        self.data_split_mode = data_split_mode
+        
+        # Format variables to lists gracefully
+        to_list = lambda x: [x] if isinstance(x, str) else (x if x else [])
+        
+        self.session_for_single_session_evaluation = to_list(session_for_single_session_evaluation)
+        self.train_sessions = to_list(train_sessions)
+        self.enroll_sessions = to_list(enroll_sessions)
+        self.probe_sessions = to_list(probe_sessions)
+        
+        self.required_cross_sessions = list(set(self.train_sessions + self.enroll_sessions + self.probe_sessions))
+        
+        if self.data_split_mode == "single-session" and not self.session_for_single_session_evaluation:
+            raise ValueError("You must provide `session_for_single_session_evaluation`.")
+        if self.data_split_mode == "cross-session" and not self.required_cross_sessions:
+            raise ValueError("You must provide at least one valid train, enroll, or probe session.")
 
     def download(self):
         _download_and_extract(self.url, self.zip_path, self.dataset_root, "CYBHi", cleanup=self.cleanup_zip)
 
-    def _parse_filename(self, filename):
+    def _parse_file_info(self, filename):
         """
-        Robust Regex parser for CYBHi filenames.
-        Handles:
-        - '20120106-AA.txt'  (Long-Term Standard)
-        - '20110718-LGM.txt' (Short-Term Standard)
-        - '20110718-ST-LGM.txt' (Variant)
-        - '2012-01-06-AA.txt' (Hyphenated Date Variant)
+        Parses strictly based on CYBHi format seen in screenshots: 
+        [Date] - [SID] - [Session/Intervention] - [Sensor/Extra]
         """
-        # Strategy 1: Look for 8-digit date followed by ID
-        # Matches "20120106" -> sep -> "AA"
-        match = re.search(r"(\d{8})[-_]+(?:ST[-_]+)?([A-Za-z]+)", filename)
+        clean = filename.replace('.txt', '').replace('._', '')
+        parts = clean.split('-')
         
-        if match:
-            date_str, sid = match.groups()
-            try:
-                rec_date = datetime.datetime.strptime(date_str, "%Y%m%d").date()
-                return rec_date, sid
-            except: pass # Fallback if date is invalid
-
-        # Strategy 2: Fallback for hyphenated dates (YYYY-MM-DD)
-        # Matches "2012-01-06" -> sep -> "AA"
-        match_hyphen = re.search(r"(\d{4}-\d{2}-\d{2})[-_]+(?:ST[-_]+)?([A-Za-z]+)", filename)
-        if match_hyphen:
-            date_str, sid = match_hyphen.groups()
-            try:
-                rec_date = datetime.datetime.strptime(date_str, "%Y-%m-%d").date()
-                return rec_date, sid
-            except: pass
-
-        # Strategy 3: Manual split fallback (Last resort)
-        # Assumes ID is the LAST alphanumeric part
-        clean = filename.replace(".txt", "")
-        parts = re.split(r"[-_]", clean)
-        sid = parts[-1] if parts else "unknown"
-        # Try to find date in parts
         rec_date = datetime.date.min
-        for p in parts:
-            if len(p) == 8 and p.isdigit():
-                try: rec_date = datetime.datetime.strptime(p, "%Y%m%d").date()
-                except: pass
+        sid = "UNKNOWN"
+        session_code = "UNKNOWN"
         
-        return rec_date, sid
+        if len(parts) >= 3:
+            # 1. Date (e.g., 20110715)
+            if len(parts[0]) == 8 and parts[0].isdigit():
+                try: 
+                    rec_date = datetime.datetime.strptime(parts[0], "%Y%m%d").date()
+                except ValueError: 
+                    pass
+            
+            # 2. Subject ID (e.g., MLS)
+            sid = parts[1].upper()
+            
+            # 3. Session Code (e.g., A1, CI, A0)
+            session_code = parts[2].upper()
+            
+        return rec_date, sid, session_code
+
+    def _read_signal(self, fpath):
+        """Bulletproof Pandas reader using the fast C engine and native comment skipping."""
+        try:
+            # comment='#' prevents silent crashes on header info
+            df = pd.read_csv(fpath, comment='#', delim_whitespace=True, header=None, on_bad_lines='skip')
+            
+            col_idx = self.cfg.get("ecg_column", 2)
+            if col_idx >= df.shape[1]: col_idx = 0
+            
+            sig = df.iloc[:, col_idx].dropna().values.astype(float)
+            sig = sig - np.mean(sig) # Zero-mean baseline
+            return sig
+        except Exception as e:
+            print(f"\n[ERR] Failed to read {fpath.name}: {e}")
+            return None
 
     def load_raw_data(self):
         if not self.dataset_root.exists() or not any(self.dataset_root.iterdir()):
             self.download()
 
-        target_dir = None
-        possible_names = [self.subset]
-        if self.subset == "long-term": possible_names.append("data_A0")
-        if self.subset == "short-term": possible_names.append("data_CI_A1_A2")
+        print("\n[INFO] Scanning directories and pooling CYBHi files...")
+        st_pool = {} # Short-Term
+        lt_pool = {} # Long-Term
 
-        for name in possible_names:
-            matches = list(self.dataset_root.rglob(name))
-            if matches: 
-                target_dir = matches[0]
-                break
-        
-        if not target_dir:
-            keyword = "A0" if self.subset == "long-term" else "CI"
-            for root, dirs, files in os.walk(self.dataset_root):
-                for d in dirs:
-                    if keyword in d:
-                        target_dir = Path(root) / d
-                        break
-        
-        if not target_dir or not target_dir.exists():
-            print(f"[ERR] Could not find folder for subset '{self.subset}' in {self.dataset_root}")
-            return {}
+        # 1. Distribute files to proper pools based on exact folder names
+        for root, _, files in os.walk(self.dataset_root):
+            path_str = str(root).lower()
+            is_st = "short-term" in path_str or "ci" in path_str
+            is_lt = "long-term" in path_str or "a0" in path_str
 
-        files = list(target_dir.glob("*.txt"))
+            if not is_st and not is_lt: continue
+
+            for f in files:
+                # IMPORTANT: Skip macOS hidden metadata files that crash the reader
+                if not f.endswith(".txt") or f.startswith("._"): 
+                    continue
+                    
+                fpath = Path(root) / f
+                rec_date, sid, session_code = self._parse_file_info(f)
+                
+                if sid == "UNKNOWN": continue
+                
+                if is_st:
+                    if sid not in st_pool: st_pool[sid] = []
+                    st_pool[sid].append({"path": fpath, "date": rec_date, "code": session_code})
+                elif is_lt:
+                    if sid not in lt_pool: lt_pool[sid] = []
+                    lt_pool[sid].append({"path": fpath, "date": rec_date, "code": session_code})
+
         recordings = {}
-        
-        for fpath in tqdm(files, desc=f"Loading CYBHi ({self.subset})"):
-            try:
-                rec_date, sid = self._parse_filename(fpath.name)
-                
-                # Header skipping
-                start_line = 0
-                with open(fpath, 'r', encoding='utf-8', errors='ignore') as fp:
-                    for i, line in enumerate(fp):
-                        if "# EndOfHeader" in line: start_line = i + 1; break
-                
-                df = pd.read_csv(fpath, skiprows=start_line, sep=r"\s+", header=None, engine='python')
-                
-                # Column selection
-                if df.shape[1] == 1: 
-                    sig = df.iloc[:, 0].values.astype(float)
-                else:
-                    target_col = self.cfg.get("ecg_column", 2) 
-                    if target_col >= df.shape[1]: target_col = 0 
-                    sig = df.iloc[:, target_col].values.astype(float)
 
-                sig = sig - np.mean(sig)
+        # 2. Load Short-Term signals directly using explicit intervention tags
+        for sid, recs in tqdm(st_pool.items(), desc="Loading short-term raw files"):
+            if sid not in recordings: recordings[sid] = {}
+            for rec in recs:
+                tag = f"short-term_{rec['code']}" # Outputs: short-term_CI, short-term_A1, short-term_A2
+                if tag not in recordings[sid]: recordings[sid][tag] = []
                 
-                if sid not in recordings: recordings[sid] = []
-                recordings[sid].append({'signal': sig, 'date': rec_date, 'fs': 1000, 'filename': fpath.name})
-            except Exception as e: pass
-        
-        for sid in recordings: recordings[sid].sort(key=lambda x: x['date'])
+                sig = self._read_signal(rec['path'])
+                if sig is not None:
+                    recordings[sid][tag].append({'signal': sig, 'fs': 1000})
+
+        # 3. Load Long-Term signals by date sequence (Month 0 vs Month 3)
+        for sid, recs in tqdm(lt_pool.items(), desc="Loading long-term raw files"):
+            if sid not in recordings: recordings[sid] = {}
+            recs.sort(key=lambda x: x["date"])
+            unique_dates = sorted(list(set([r['date'] for r in recs])))
+            
+            for rec in recs:
+                # 1st Date = S1. 2nd Date = S2.
+                date_idx = unique_dates.index(rec['date']) + 1
+                tag = f"long-term_S{date_idx}" # Outputs: long-term_S1, long-term_S2
+                if tag not in recordings[sid]: recordings[sid][tag] = []
+                
+                sig = self._read_signal(rec['path'])
+                if sig is not None:
+                    recordings[sid][tag].append({'signal': sig, 'fs': 1000})
+
         return recordings
 
     def _process_signal(self, sig, fs=1000):
-        # Sanity Checks
         if np.isnan(sig).any() or len(sig) < fs or np.std(sig) < 1e-5: 
             return np.empty((0, 0))
 
@@ -1075,56 +1197,68 @@ class load_cybhi_dataset():
             elif self.merge_strategy == "concat": processed_samples.append(group.flatten())
         return np.array(processed_samples)
 
-    def load_all_sessions(self):
-        data = self.load_raw_data()
-        x_list, y_list = [], []
-        for sid, recs in tqdm(data.items(), desc="Processing signals"):
-            for rec in recs:
-                segments = self._process_signal(rec['signal'], rec['fs'])
-                if len(segments) > 0:
-                    x_list.append(segments)
-                    y_list.extend([sid] * len(segments))
-        if x_list: return np.vstack(x_list), np.array(y_list)
-        return np.empty((0, 0)), np.empty((0,))
+    def load_all_data(self):
+        if self.data_split_mode != "single-session":
+            print(f"[WARN] Calling load_all_data() but mode is '{self.data_split_mode}'.")
+        return self.load_session("train")
 
-    def load_session(self, session_name, part="all"):
+    def load_session(self, session_name):
+        session_name = session_name.lower()
+        target_sessions = []
+        is_primary_pass = False
+        
+        if self.data_split_mode == "single-session":
+            if session_name in ["probe", "test"]:
+                raise ValueError("Cannot load 'test' in single-session mode. Split upstream.")
+            target_sessions = self.session_for_single_session_evaluation
+            log_name = f"Single-Session Target(s): {target_sessions}"
+            is_primary_pass = True
+            
+        elif self.data_split_mode == "cross-session":
+            if session_name in ["train"]:
+                target_sessions = self.train_sessions
+                is_primary_pass = True
+            elif session_name in ["enrol", "enrollment"]:
+                target_sessions = self.enroll_sessions
+                is_primary_pass = True if not self.train_sessions else False
+            elif session_name in ["probe", "test"]:
+                target_sessions = self.probe_sessions
+            else:
+                raise ValueError("session_name must be 'train', 'enrol', or 'test'.")
+            log_name = f"Cross-Session ({session_name.title()}): {target_sessions}"
+
+        if not target_sessions:
+            return np.empty((0, 0)), np.empty((0,))
+            
         data = self.load_raw_data()
         x_list, y_list = [], []
-        is_enrollment = (session_name == "Session_1" or part == "enrollment")
-        is_probe = (session_name == "Session_2" or part == "probe")
-        is_all = (part == "all")
         
-        for sid, recs in tqdm(data.items(), desc=f"Processing {session_name}"):
-            if not recs: continue
+        kept_subjects, dropped_subjects = 0, 0
+
+        for sid, tagged_sessions in tqdm(data.items(), desc=f"Processing {log_name}"):
             
-            dates = sorted(list(set([r['date'] for r in recs])))
-            
-            if len(dates) > 1:
-                first_date = dates[0]
-                recs_s1 = [r for r in recs if r['date'] == first_date]
-                recs_s2 = [r for r in recs if r['date'] > first_date]
+            if self.data_split_mode == "single-session":
+                is_valid = all(s in tagged_sessions for s in target_sessions)
+            elif self.data_split_mode == "cross-session":
+                # Strict: Subject MUST have data in ALL requested global sets
+                is_valid = all(s in tagged_sessions for s in self.required_cross_sessions)
+
+            if is_valid:
+                kept_subjects += 1
+                for s in target_sessions:
+                    # CYBHi has multiple sensors per session (e.g. 8B and 85). We pool them both!
+                    for signal_dict in tagged_sessions[s]:
+                        segments = self._process_signal(signal_dict['signal'], signal_dict['fs'])
+                        if len(segments) > 0:
+                            x_list.append(segments)
+                            y_list.extend([sid] * len(segments))
             else:
-                recs_s1 = [recs[0]]
-                recs_s2 = [recs[0]] 
-            
-            target_recs = []
-            if is_enrollment: target_recs = recs_s1
-            elif is_probe: target_recs = recs_s2
-            elif is_all: target_recs = recs
-            
-            for rec in target_recs:
-                segments = self._process_signal(rec['signal'], rec['fs'])
-                
-                # Intra-Session Split logic
-                if len(dates) == 1 and len(segments) > 0:
-                    mid = len(segments) // 2
-                    if is_enrollment: segments = segments[:mid]
-                    elif is_probe: segments = segments[mid:]
-                
-                if len(segments) > 0:
-                    x_list.append(segments)
-                    y_list.extend([sid] * len(segments))
-        
+                dropped_subjects += 1
+
+        if is_primary_pass:
+            print(f"\n[INFO] CYBHi Evaluation Summary ({self.data_split_mode.title()}):")
+            print(f"       Kept {kept_subjects} matched subjects. Dropped {dropped_subjects} subjects.")
+
         if x_list: return np.vstack(x_list), np.array(y_list)
         return np.empty((0, 0)), np.empty((0,))
 
@@ -1133,28 +1267,38 @@ class load_cybhi_dataset():
 # =============================================================================
 class load_mitbih_dataset():
     """
-    Robust Loader for MIT-BIH Arrhythmia Database.
+    Robust Loader for the MIT-BIH Arrhythmia Database.
     
-    Characteristics:
-    - 48 continuous recordings (~30 minutes each).
-    - Sample rate: 360 Hz.
-    
-    Splitting Logic (Range-Based):
-    - Uses percentage ranges (0.0 to 1.0) to define Enrollment and Probe sessions.
-    - Default: 
-        Enroll = First 50% (0.0 - 0.5)
-        Probe  = Last 50%  (0.5 - 1.0)
-    - Custom Regimes (e.g., Maximal Interval) can be defined by passing specific ranges 
-      in __init__ (e.g., first 2 mins vs last 2 mins).
+    This dataset consists of 48 continuous ~30-minute recordings from 47 subjects.
+    Because there are no distinct "sessions" per subject, biometric evaluation 
+    requires slicing the continuous timeline into discrete minute-based chunks.
+
+    Args:
+        leads (list of str): Target leads to extract.
+            Options: Usually ['MLII'] or ['V1']. Pass 'all' for both available leads.
+            Default: ['MLII']
+        data_split_mode (str): Evaluation regime mapping.
+            Options:
+                - 'all-available': Loads the entire 30-minute continuous signal.
+                - 'single-segment': Extracts a continuous chunk based on `single_segment_range`.
+                - 'custom-split': Manually maps exact minute ranges to Train/Enroll/Probe regimes.
+        single_segment_range (tuple): Used only if mode='single-segment'. Defines (start_min, end_min).
+            Example: (0, 5) extracts the first 5 minutes.
+        train_parts (list of tuples): Minute ranges for training data if mode='custom-split'.
+            Example: [(0, 5), (10, 15)]
+        enrol_parts (list of tuples): Minute ranges for template enrollment if mode='custom-split'.
+        test_parts (list of tuples): Minute ranges for test probes if mode='custom-split'.
+            Example: [(25, 30)] extracts the last 5 minutes of the tape.
+        num_beats_to_merge (int): Number of consecutive beats to fuse.
+        beat_merge_method (str): Strategy for fusing beats. Options: ['average', 'concat']
+        cleanup_zip (bool): If True, deletes the downloaded zip file after extraction.
+        **preprocessing_params: kwargs passed directly to the Preprocessing class.
     """
-    def __init__(self, leads=['MLII'], num_beats=1, merge_strategy="average", 
-                 enrollment_range=(0.0, 0.5), probe_range=(0.5, 1.0),
-                 preprocessing_params=None, cleanup_zip=False):
-        """
-        Args:
-            enrollment_range (tuple): (start_pct, end_pct) for Session 1.
-            probe_range (tuple): (start_pct, end_pct) for Session 2.
-        """
+    def __init__(self, leads=['MLII'], data_split_mode="all-available", 
+                 single_segment_range=(0, 5), train_parts=None, enrol_parts=None, 
+                 test_parts=None, num_beats_to_merge=1, beat_merge_method="average", 
+                 cleanup_zip=False, **preprocessing_params):
+        
         self.preprocessor = Preprocessing()
         self.cfg = CONFIG["datasets"]["mitbih"]
         project_dir = Path(__file__).resolve().parent
@@ -1165,21 +1309,36 @@ class load_mitbih_dataset():
         
         self.prep_params = preprocessing_params if preprocessing_params else self.cfg.get("preprocessing", {})
         self.target_leads = [l.lower() for l in leads] if isinstance(leads, list) else leads
-        self.num_beats = num_beats
-        self.merge_strategy = merge_strategy
+        self.num_beats = num_beats_to_merge
+        self.merge_strategy = beat_merge_method
         self.cleanup_zip = cleanup_zip
         
-        # User defined ranges (0.0 to 1.0)
-        self.enrollment_range = enrollment_range
-        self.probe_range = probe_range
+        valid_modes = ["all-available", "single-segment", "custom-split"]
+        if data_split_mode not in valid_modes:
+            raise ValueError(f"Invalid mode: {data_split_mode}. Use {valid_modes}")
+        self.data_split_mode = data_split_mode
+        
+        # Segment mappings (in minutes)
+        self.single_segment_range = single_segment_range
+        self.train_parts = train_parts
+        self.enrol_parts = enrol_parts
+        self.test_parts = test_parts
+        
+        # Strict validation for custom-split
+        if self.data_split_mode == "custom-split":
+            if not self.train_parts or not self.test_parts:
+                raise ValueError(
+                    "For 'custom-split' mode, `train_parts` and `test_parts` cannot be None. "
+                    "Please provide minute ranges. Example: train_parts=[(0, 5)], test_parts=[(25, 30)]"
+                )
 
     def download(self):
         """Downloads and extracts the dataset if missing."""
         _download_and_extract(self.url, self.zip_path, self.dataset_root, "MIT-BIH", cleanup=self.cleanup_zip)
 
     def _get_lead_indices(self, available_leads):
-        """Finds indices for requested leads (e.g., 'MLII')."""
-        avail_norm = [l.lower() for l in available_leads]
+        """Maps requested lead names (e.g., 'MLII') to channel indices."""
+        avail_norm = [l.lower().strip() for l in available_leads]
         if self.target_leads == 'all': return list(range(len(available_leads)))
         indices = []
         for req in self.target_leads:
@@ -1192,12 +1351,12 @@ class load_mitbih_dataset():
 
     def load_raw_data(self):
         """
-        Loads all raw files into memory.
-        Note: MIT-BIH files are small (~30 mins), so we load the full signal once 
-        and slice it later in memory. This reduces disk I/O overhead.
+        Loads all raw files into memory. 
+        Files are kept continuous. Slicing occurs via index manipulation based on fs.
         """
         if not self.dataset_root.exists() or not any(self.dataset_root.iterdir()):
             self.download()
+            
         recordings = {}
         files = list(self.dataset_root.rglob("*.hea"))
         
@@ -1208,16 +1367,14 @@ class load_mitbih_dataset():
                 lead_indices = self._get_lead_indices(rec_header.sig_name)
                 if not lead_indices: continue
                 
-                # Load full file
                 data, _ = wfdb.rdsamp(str(hea.with_suffix("")), channels=lead_indices)
-                
-                if sid not in recordings: recordings[sid] = []
-                recordings[sid].append({"signal": data, "fs": rec_header.fs, "filename": hea.name})
-            except Exception as e: pass
+                recordings[sid] = {"signal": data, "fs": rec_header.fs, "filename": hea.name}
+            except Exception: pass
+            
         return recordings
 
     def _process_signal(self, sig, fs):
-        """Standard Preprocessing Pipeline (Filter -> Segment -> Normalize)."""
+        """Applies filters, segmentation, and multi-beat merging."""
         n_channels = sig.shape[1]
         processed_channels = []
         for c in range(n_channels):
@@ -1252,88 +1409,146 @@ class load_mitbih_dataset():
                 merged_samples.append(merged)
         return np.array(merged_samples)
 
-    def load_all_sessions(self):
-        """Loads full data (0.0 to 1.0). Useful for Random Split benchmarks."""
+    def _slice_signal(self, raw_signal, fs, min_ranges):
+        """
+        Takes a continuous raw signal and extracts the requested minute boundaries.
+        Returns a concatenated raw array to pass to the preprocessor.
+        """
+        if not min_ranges: return np.empty((0, raw_signal.shape[1]))
+        
+        sliced_chunks = []
+        total_samples = raw_signal.shape[0]
+        
+        for (start_min, end_min) in min_ranges:
+            start_idx = int(start_min * 60 * fs)
+            end_idx = int(end_min * 60 * fs)
+            
+            # Boundary protections
+            start_idx = max(0, start_idx)
+            end_idx = min(total_samples, end_idx)
+            
+            if start_idx < end_idx:
+                sliced_chunks.append(raw_signal[start_idx:end_idx, :])
+                
+        if sliced_chunks:
+            return np.vstack(sliced_chunks)
+        return np.empty((0, raw_signal.shape[1]))
+
+    def load_all_data(self):
+        """
+        Handles dataset loading for downstream random-split tasks.
+        Applies to 'all-available' and 'single-segment'.
+        """
+        if self.data_split_mode not in ["all-available", "single-segment"]:
+            print(f"[WARN] Calling load_all_data() but mode is '{self.data_split_mode}'.")
+            
         data = self.load_raw_data()
         x_list, y_list = [], []
-        for sid, recs in tqdm(data.items(), desc="Processing signals"):
-            for rec in recs:
-                segments = self._process_signal(rec['signal'], rec['fs'])
-                if len(segments) > 0:
-                    x_list.append(segments)
-                    y_list.extend([sid] * len(segments))
+        
+        for sid, rec in tqdm(data.items(), desc="Processing signals"):
+            raw_sig = rec['signal']
+            fs = rec['fs']
+            
+            # Extract requested ranges before preprocessing
+            if self.data_split_mode == "single-segment":
+                target_signal = self._slice_signal(raw_sig, fs, [self.single_segment_range])
+            else: # all-available
+                target_signal = raw_sig
+                
+            if target_signal.shape[0] == 0: continue
+            
+            segments = self._process_signal(target_signal, fs)
+            if len(segments) > 0:
+                x_list.append(segments)
+                y_list.extend([sid] * len(segments))
+                
         if x_list: return np.vstack(x_list), np.array(y_list)
         return np.empty((0, 0)), np.empty((0,))
 
-    def load_session(self, session_name, part="all"):
+    def load_session(self, session_name):
         """
-        Loads and slices data based on the configured ranges.
+        Processes the customized minute-based ranges mapping to Train/Enrol/Test tasks.
+        """
+        if self.data_split_mode != "custom-split":
+            raise ValueError("load_session() is only valid when data_split_mode='custom-split'.")
+            
+        session_name = session_name.lower()
+        target_ranges = []
         
-        Logic:
-        1. Preprocess the entire signal.
-        2. Calculate start/end indices based on 'enrollment_range' or 'probe_range'.
-        3. Slice the list of segments.
-        """
+        # Route the correct minute ranges based on the requested session
+        if session_name in ["train"]:
+            target_ranges = self.train_parts
+        elif session_name in ["enrol", "enrollment"]:
+            if not self.enrol_parts: return np.empty((0, 0)), np.empty((0,))
+            target_ranges = self.enrol_parts
+        elif session_name in ["test", "probe"]:
+            target_ranges = self.test_parts
+        else:
+            raise ValueError("session_name must be 'train', 'enrol', or 'test'.")
+
         data = self.load_raw_data()
         x_list, y_list = [], []
         
-        # Determine which range to use
-        target_range = (0.0, 1.0)
-        if session_name == "Session_1" or part == "enrollment": 
-            target_range = self.enrollment_range
-        elif session_name == "Session_2" or part == "probe": 
-            target_range = self.probe_range
+        kept_subjects = 0
 
-        for sid, recs in tqdm(data.items(), desc=f"Processing {session_name}"):
-            if not recs: continue
-            for rec in recs:
-                segments = self._process_signal(rec['signal'], rec['fs'])
-                if len(segments) == 0: continue
-                
-                # --- Slicing Logic ---
-                N = len(segments)
-                start_idx = int(N * target_range[0])
-                end_idx = int(N * target_range[1])
-                
-                # Sanity Check Indices
-                start_idx = max(0, start_idx)
-                end_idx = min(N, end_idx)
-                
-                if start_idx >= end_idx: continue
+        for sid, rec in tqdm(data.items(), desc=f"Processing {session_name}"):
+            raw_sig = rec['signal']
+            fs = rec['fs']
+            
+            # Slice the raw signal based on the assigned minutes
+            target_signal = self._slice_signal(raw_sig, fs, target_ranges)
+            if target_signal.shape[0] == 0: continue
+            
+            segments = self._process_signal(target_signal, fs)
+            
+            if len(segments) > 0:
+                kept_subjects += 1
+                x_list.append(segments)
+                y_list.extend([sid] * len(segments))
 
-                final_segments = segments[start_idx:end_idx]
-                
-                if len(final_segments) > 0:
-                    x_list.append(final_segments)
-                    y_list.extend([sid] * len(final_segments))
-        
+        if session_name == "train":
+            print(f"\n[INFO] Custom Split Summary: Extracted data for {kept_subjects} subjects.")
+
         if x_list: return np.vstack(x_list), np.array(y_list)
         return np.empty((0, 0)), np.empty((0,))
-
 
 # =============================================================================
 # 6. MIT-BIH NSRDB (Normal Sinus Rhythm)
 # =============================================================================
 class load_nsrdb_dataset():
     """
-    Loader for MIT-BIH Normal Sinus Rhythm Database (NSRDB).
+    Highly Optimized Loader for the MIT-BIH Normal Sinus Rhythm Database (NSRDB).
     
-    Characteristics:
-    - 18 long-term recordings (~24 hours continuous).
-    - Sample rate: 128 Hz.
-    
-    Optimization (Disk I/O):
-    - Unlike MIT-BIH, NSRDB files are huge.
-    - This loader calculates the specific sample indices needed for the requested range
-      and ONLY reads that slice from disk using `wfdb.rdsamp`.
-      
-    Default Ranges:
-    - Enroll: First Hour (0.0 - 0.0417)
-    - Probe:  Last Hour  (0.9583 - 1.0)
+    This dataset consists of 18 extremely long-term Holter recordings (~24 hours continuous).
+    To prevent memory overflow, this loader calculates exact byte boundaries and 
+    reads ONLY the requested minute slices directly from the disk.
+
+    Args:
+        leads (list of str): Target leads to extract. 
+            Options: Usually ['ECG1'] or ['ECG2'].
+            Default: ['ECG1']
+        data_split_mode (str): Evaluation regime mapping.
+            Options:
+                - 'all-available': Loads the ENTIRE 24-hour signal (Warning: High Memory/RAM usage).
+                - 'single-segment': Extracts a continuous chunk based on `single_segment_range`.
+                - 'custom-split': Manually maps exact minute ranges to Train/Enroll/Probe regimes.
+        single_segment_range (tuple): Used only if mode='single-segment'. Defines (start_min, end_min).
+            Example: (0, 60) extracts the first hour.
+        train_parts (list of tuples): Minute ranges for training data if mode='custom-split'.
+            Example: [(0, 120)] extracts the first 2 hours.
+        enrol_parts (list of tuples): Minute ranges for template enrollment if mode='custom-split'.
+        test_parts (list of tuples): Minute ranges for test probes if mode='custom-split'.
+            Example: [(1380, 1440)] extracts the final hour of the 24-hour tape.
+        num_beats_to_merge (int): Number of consecutive beats to fuse.
+        beat_merge_method (str): Strategy for fusing beats. Options: ['average', 'concat']
+        cleanup_zip (bool): If True, deletes the downloaded zip file after extraction.
+        **preprocessing_params: kwargs passed directly to the Preprocessing class.
     """
-    def __init__(self, leads=['ECG1'], num_beats=1, merge_strategy="average", 
-                 enrollment_range=(0.0, 0.0417), probe_range=(0.9583, 1.0), 
-                 preprocessing_params=None, cleanup_zip=False):
+    def __init__(self, leads=['ECG1'], data_split_mode="all-available", 
+                 single_segment_range=(0, 60), train_parts=None, enrol_parts=None, 
+                 test_parts=None, num_beats_to_merge=1, beat_merge_method="average", 
+                 cleanup_zip=False, **preprocessing_params):
+       
         self.preprocessor = Preprocessing()
         self.cfg = CONFIG["datasets"]["nsrdb"]
         project_dir = Path(__file__).resolve().parent
@@ -1344,13 +1559,28 @@ class load_nsrdb_dataset():
         
         self.prep_params = preprocessing_params if preprocessing_params else self.cfg.get("preprocessing", {})
         self.target_leads = [l.lower() for l in leads] if isinstance(leads, list) else leads
-        self.num_beats = num_beats
-        self.merge_strategy = merge_strategy
+        self.num_beats = num_beats_to_merge
+        self.merge_strategy = beat_merge_method
         self.cleanup_zip = cleanup_zip
         
-        # User defined ranges (0.0 to 1.0)
-        self.enrollment_range = enrollment_range
-        self.probe_range = probe_range
+        valid_modes = ["all-available", "single-segment", "custom-split"]
+        if data_split_mode not in valid_modes:
+            raise ValueError(f"Invalid mode: {data_split_mode}. Use {valid_modes}")
+        self.data_split_mode = data_split_mode
+        
+        # Segment mappings (in minutes)
+        self.single_segment_range = single_segment_range
+        self.train_parts = train_parts
+        self.enrol_parts = enrol_parts
+        self.test_parts = test_parts
+        
+        # Strict validation for custom-split
+        if self.data_split_mode == "custom-split":
+            if not self.train_parts or not self.test_parts:
+                raise ValueError(
+                    "For 'custom-split' mode, `train_parts` and `test_parts` cannot be None. "
+                    "Please provide minute ranges. Example: train_parts=[(0, 60)], test_parts=[(1380, 1440)]"
+                )
 
     def download(self):
         """Downloads and extracts dataset."""
@@ -1358,7 +1588,7 @@ class load_nsrdb_dataset():
 
     def _get_lead_indices(self, available_leads):
         """Finds channel indices."""
-        avail_norm = [l.lower() for l in available_leads]
+        avail_norm = [l.lower().strip() for l in available_leads]
         if self.target_leads == 'all': return list(range(len(available_leads)))
         indices = []
         for req in self.target_leads:
@@ -1366,46 +1596,58 @@ class load_nsrdb_dataset():
             if req in avail_norm: indices.append(avail_norm.index(req))
             else:
                 for i, avail in enumerate(avail_norm):
-                    if req in avail: indices.append(i); break
+                    if req in avail or avail in req: indices.append(i); break
         return indices
 
-    def load_raw_data(self, start_ratio=0.0, end_ratio=1.0):
+    def load_raw_data_slices(self, min_ranges=None):
         """
-        Loads ONLY the specified time slice from disk to save memory.
-        Calculates 'sampfrom' and 'sampto' based on total file duration.
+        Core I/O Optimizer: Reads ONLY the specified minute chunks from disk.
+        If min_ranges is None, it loads the entire 24h file.
         """
         if not self.dataset_root.exists() or not any(self.dataset_root.iterdir()):
             self.download()
+            
         recordings = {}
         files = list(self.dataset_root.rglob("*.hea"))
         
-        for hea in tqdm(files, desc="Loading NSRDB raw files"):
+        for hea in tqdm(files, desc="Loading NSRDB specific slices"):
             sid = hea.stem
             try:
-                # 1. Read Header first (Lightweight) to get total length
+                # 1. Read lightweight header to get total length and sampling rate
                 rec_header = wfdb.rdheader(str(hea.with_suffix("")))
                 total_samples = rec_header.sig_len
+                fs = rec_header.fs
+                
                 lead_indices = self._get_lead_indices(rec_header.sig_name)
                 if not lead_indices: continue
 
-                # 2. Calculate specific sample indices based on requested ratios
-                sampfrom = int(total_samples * start_ratio)
-                sampto = int(total_samples * end_ratio)
-                
-                # Validations
-                if sampto > total_samples: sampto = total_samples
-                if sampto <= sampfrom: continue 
-                
-                # 3. Load EFFICIENT slice directly from disk
-                data, _ = wfdb.rdsamp(str(hea.with_suffix("")), channels=lead_indices, sampfrom=sampfrom, sampto=sampto)
-                
-                if sid not in recordings: recordings[sid] = []
-                recordings[sid].append({"signal": data, "fs": rec_header.fs, "filename": hea.name})
-            except Exception as e: pass
+                # If no ranges specified, load the entire massive file
+                if min_ranges is None:
+                    data, _ = wfdb.rdsamp(str(hea.with_suffix("")), channels=lead_indices)
+                    if sid not in recordings: recordings[sid] = []
+                    recordings[sid].append({"signal": data, "fs": fs, "filename": hea.name})
+                    continue
+
+                # 2. Iterate through requested chunks and pull them efficiently from disk
+                for (start_min, end_min) in min_ranges:
+                    sampfrom = int(start_min * 60 * fs)
+                    sampto = int(end_min * 60 * fs)
+                    
+                    # Boundary protection
+                    sampfrom = max(0, min(sampfrom, total_samples))
+                    sampto = max(0, min(sampto, total_samples))
+                    
+                    if sampfrom < sampto:
+                        data, _ = wfdb.rdsamp(str(hea.with_suffix("")), channels=lead_indices, sampfrom=sampfrom, sampto=sampto)
+                        if sid not in recordings: recordings[sid] = []
+                        recordings[sid].append({"signal": data, "fs": fs, "filename": hea.name})
+                        
+            except Exception: pass
+            
         return recordings
 
     def _process_signal(self, sig, fs):
-        """Standard Preprocessing."""
+        """Applies filters, segmentation, and multi-beat merging."""
         n_channels = sig.shape[1]
         processed_channels = []
         for c in range(n_channels):
@@ -1440,39 +1682,23 @@ class load_nsrdb_dataset():
                 merged_samples.append(merged)
         return np.array(merged_samples)
 
-    def load_all_sessions(self):
-        """Loads FULL 24h files (Warning: High Memory Usage)."""
-        data = self.load_raw_data(start_ratio=0.0, end_ratio=1.0)
+    def load_all_data(self):
+        """
+        Handles dataset loading for 'all-available' and 'single-segment'.
+        """
+        if self.data_split_mode not in ["all-available", "single-segment"]:
+            print(f"[WARN] Calling load_all_data() but mode is '{self.data_split_mode}'.")
+            
+        # Determine ranges
+        target_ranges = None
+        if self.data_split_mode == "single-segment":
+            target_ranges = [self.single_segment_range]
+            
+        # The optimizer perfectly fetches only what we need from disk
+        data = self.load_raw_data_slices(min_ranges=target_ranges)
+        
         x_list, y_list = [], []
         for sid, recs in tqdm(data.items(), desc="Processing signals"):
-            for rec in recs:
-                segments = self._process_signal(rec['signal'], rec['fs'])
-                if len(segments) > 0:
-                    x_list.append(segments)
-                    y_list.extend([sid] * len(segments))
-        if x_list: return np.vstack(x_list), np.array(y_list)
-        return np.empty((0, 0)), np.empty((0,))
-
-    def load_session(self, session_name, part="all"):
-        """
-        Loads optimized slice based on configured ranges.
-        Does NOT load the whole file; only the needed slice.
-        """
-        x_list, y_list = [], []
-        
-        # Determine target range
-        target_range = (0.0, 1.0)
-        if session_name == "Session_1" or part == "enrollment": 
-            target_range = self.enrollment_range
-        elif session_name == "Session_2" or part == "probe": 
-            target_range = self.probe_range
-        
-        # KEY OPTIMIZATION: Pass the range to load_raw_data
-        # This ensures we only read the specific bytes from disk.
-        data = self.load_raw_data(start_ratio=target_range[0], end_ratio=target_range[1])
-        
-        for sid, recs in tqdm(data.items(), desc=f"Processing {session_name}"):
-            if not recs: continue
             for rec in recs:
                 segments = self._process_signal(rec['signal'], rec['fs'])
                 if len(segments) > 0:
@@ -1482,36 +1708,94 @@ class load_nsrdb_dataset():
         if x_list: return np.vstack(x_list), np.array(y_list)
         return np.empty((0, 0)), np.empty((0,))
 
+    def load_session(self, session_name):
+        """
+        Processes the customized minute-based ranges mapping to Train/Enrol/Test tasks.
+        """
+        if self.data_split_mode != "custom-split":
+            raise ValueError("load_session() is only valid when data_split_mode='custom-split'.")
+            
+        session_name = session_name.lower()
+        target_ranges = []
+        
+        # Route the correct minute ranges based on the requested session
+        if session_name in ["train"]:
+            target_ranges = self.train_parts
+        elif session_name in ["enrol", "enrollment"]:
+            if not self.enrol_parts: return np.empty((0, 0)), np.empty((0,))
+            target_ranges = self.enrol_parts
+        elif session_name in ["test", "probe"]:
+            target_ranges = self.test_parts
+        else:
+            raise ValueError("session_name must be 'train', 'enrol', or 'test'.")
+
+        # Fetch explicitly only the requested bytes from the massive 24h disk files
+        data = self.load_raw_data_slices(min_ranges=target_ranges)
+        
+        x_list, y_list = [], []
+        kept_subjects = 0
+
+        for sid, recs in tqdm(data.items(), desc=f"Processing {session_name}"):
+            if not recs: continue
+            
+            subject_has_data = False
+            for rec in recs:
+                segments = self._process_signal(rec['signal'], rec['fs'])
+                if len(segments) > 0:
+                    subject_has_data = True
+                    x_list.append(segments)
+                    y_list.extend([sid] * len(segments))
+                    
+            if subject_has_data:
+                kept_subjects += 1
+
+        if session_name == "train":
+            print(f"\n[INFO] Custom Split Summary: Extracted data for {kept_subjects} subjects.")
+
+        if x_list: return np.vstack(x_list), np.array(y_list)
+        return np.empty((0, 0)), np.empty((0,))
+
 # =============================================================================
 # 7. PTB-XL (Physikalisch-Technische Bundesanstalt XL)
 # =============================================================================
 class load_ptbxl_dataset():
     """
-    Robust Loader for PTB-XL Dataset.
+    Robust Loader for the PTB-XL Dataset.
     
-    Characteristics:
-    - ~21,800 records from ~18,800 patients.
-    - Duration: EXACTLY 10 seconds per record.
-    - Sample Rate: 500 Hz (High) or 100 Hz (Low).
-    
-    Biometric Regimes:
-    
-    1. Very Short-Term (Intra-Record):
-       - Target: ALL subjects.
-       - Constraint: Most subjects have only one 10s record.
-       - Method: Split the 10s file into two 5s halves.
-         * Enroll: 0-5 seconds.
-         * Probe:  5-10 seconds.
-         
-    2. Long-Term (Inter-Record):
-       - Target: Multi-Record subjects only.
-       - Method: 
-         * Enroll: The very first recording (Rec 1).
-         * Probe:  All subsequent recordings (Rec 2, 3...).
+    This is a massive clinical dataset (21k+ records). Every recording is exactly 10 seconds long.
+    To ensure robust feature extraction, records are never split internally. Subjects lacking 
+    the required number of discrete 10-second recordings for a given task are strictly dropped.
+
+    Args:
+        leads (list of str): Target leads to extract.
+            Options: Any valid 12-lead string (e.g., ['i', 'v5', 'avf']) or 'all' for all 12 channels.
+            Default: ['i']
+        resolution (str): The sampling rate database to load.
+            Options:
+                - 'high': 500 Hz (Recommended for biometric fidelity).
+                - 'low': 100 Hz.
+        only_healthy (bool): If True, strictly evaluates the 'scp_codes' of the subject's 
+                             baseline recording and drops any subject without a 'NORM' tag.
+        data_split_mode (str): Evaluation regime mapping to strictly partition the 10-second records.
+            Options:
+                - 'all-available': Loads every record (used for random beat-level splitting).
+                - 'single-session': Loads ONLY the 1st record of each subject.
+                - 'single-cross-session': 1st record = Train/Enroll, 2nd record = Test/Probe.
+                - 'single-shot-short-term': Day 1's 1st record = Enroll, rest of Day 1 = Probe.
+                - 'leave-last-out-short-term': Day 1's last record = Probe, rest of Day 1 = Enroll.
+                - 'single-shot-long-term': All Day 1 records = Enroll, all future days = Probe.
+                - 'leave-last-out-long-term': Last recording day = Probe, all past days = Enroll.
+        num_beats_to_merge (int): Number of consecutive beats to fuse into a single sample.
+        beat_merge_method (str): Strategy for fusing beats. Options: ['average', 'concat']
+        limit_records (int, optional): Hard limit on the number of patients to process (useful for fast debugging).
+        cleanup_zip (bool): If True, deletes the downloaded zip file after extraction.
+        **preprocessing_params: kwargs passed directly to the Preprocessing class.
     """
-    def __init__(self, leads=['II'], resolution='high', filter_subset="all", 
-                 num_beats=1, merge_strategy="average", limit_records=None, 
-                 preprocessing_params=None, cleanup_zip=False):
+    def __init__(self, leads=['i'], resolution='high', only_healthy=False, 
+                 data_split_mode="all-available", num_beats_to_merge=1, 
+                 beat_merge_method="average", limit_records=None, 
+                 cleanup_zip=False, **preprocessing_params):
+       
         self.preprocessor = Preprocessing()
         self.cfg = CONFIG["datasets"]["ptbxl"]
         project_dir = Path(__file__).resolve().parent
@@ -1523,17 +1807,28 @@ class load_ptbxl_dataset():
         self.prep_params = preprocessing_params if preprocessing_params else self.cfg.get("preprocessing", {})
         self.target_leads = [l.lower() for l in leads] if isinstance(leads, list) else leads
         self.resolution = resolution
-        self.filter_subset = filter_subset
-        self.num_beats = num_beats
-        self.merge_strategy = merge_strategy
+        self.only_healthy = only_healthy
+        self.num_beats = num_beats_to_merge
+        self.merge_strategy = beat_merge_method
         self.limit_records = limit_records
         self.cleanup_zip = cleanup_zip
+        
+        valid_modes = [
+            "all-available", "single-session", "single-cross-session", 
+            "single-shot-short-term", "leave-last-out-short-term", 
+            "single-shot-long-term", "leave-last-out-long-term"
+        ]
+        if data_split_mode not in valid_modes:
+            raise ValueError(f"Invalid mode: {data_split_mode}. Use {valid_modes}")
+        self.data_split_mode = data_split_mode
 
     def download(self):
+        """Downloads and extracts the dataset if not already present."""
         _download_and_extract(self.url, self.zip_path, self.dataset_root, "PTB-XL", cleanup=self.cleanup_zip)
 
     def _get_lead_indices(self, available_leads):
-        avail_norm = [l.lower() for l in available_leads]
+        """Maps requested lead names (e.g., 'i', 'v5') to channel indices."""
+        avail_norm = [l.lower().strip() for l in available_leads]
         if self.target_leads == 'all': return list(range(len(available_leads)))
         indices = []
         for req in self.target_leads:
@@ -1544,7 +1839,18 @@ class load_ptbxl_dataset():
                     if req == avail: indices.append(i); break
         return indices
 
+    def _is_healthy(self, scp_codes_str):
+        """
+        Checks if the 'NORM' (Normal ECG) superclass is present in the diagnostic codes.
+        PTB-XL stores these as stringified dictionaries (e.g., "{'NORM': 100.0, ...}").
+        """
+        return "NORM" in str(scp_codes_str)
+
     def load_raw_data(self):
+        """
+        Parses the official ptbxl_database.csv, loads WFDB records, and groups by patient.
+        Ensures strict chronological sorting using official metadata timestamps.
+        """
         if not self.dataset_root.exists() or not any(self.dataset_root.iterdir()):
             self.download()
         
@@ -1553,20 +1859,24 @@ class load_ptbxl_dataset():
         
         df = pd.read_csv(csv_path, index_col='ecg_id')
         df['patient_id'] = df['patient_id'].astype(int)
+        
         recordings = {}
         unique_patients = df['patient_id'].unique()
-        
         if self.limit_records: 
             unique_patients = unique_patients[:self.limit_records]
         
         fname_col = 'filename_hr' if self.resolution == 'high' else 'filename_lr'
 
         for pid in tqdm(unique_patients, desc="Loading PTB-XL raw files"):
-            # Sort chronologically is CRITICAL for Long-Term regime
+            # Sort chronologically using precise metadata timestamps
             patient_recs = df[df['patient_id'] == pid].sort_values(by='recording_date')
             
-            # Filter: If we only want multi-record subjects globally
-            if self.filter_subset == "multi_rec_only" and len(patient_recs) < 2: continue
+            # --- Healthy Control Check ---
+            # We evaluate the baseline (first) recording to determine subject eligibility
+            if self.only_healthy:
+                baseline_codes = patient_recs.iloc[0]['scp_codes']
+                if not self._is_healthy(baseline_codes):
+                    continue
 
             recs_list = []
             for ecg_id, row in patient_recs.iterrows():
@@ -1581,15 +1891,18 @@ class load_ptbxl_dataset():
                     if not lead_indices: continue
                     
                     data, _ = wfdb.rdsamp(str(full_path), channels=lead_indices)
-                    recs_list.append({"signal": data, "fs": rec_header.fs})
-                except Exception as e: pass
+                    
+                    # Store exact datetime for Day 1 splits
+                    rec_dt = pd.to_datetime(row['recording_date']).date()
+                    recs_list.append({"signal": data, "fs": rec_header.fs, "date": rec_dt})
+                except Exception: pass
             
             if recs_list: recordings[str(pid)] = recs_list
             
         return recordings
 
     def _process_signal(self, sig, fs):
-        """Standard Preprocessing."""
+        """Applies filters, segmentation, and multi-beat merging."""
         n_channels = sig.shape[1]
         processed_channels = []
         for c in range(n_channels):
@@ -1624,73 +1937,118 @@ class load_ptbxl_dataset():
                 merged_samples.append(merged)
         return np.array(merged_samples)
 
-    def load_all_sessions(self):
-        """Loads all data without splitting (for Random Split)."""
+    def load_all_data(self):
+        """
+        Loads dataset for tasks that handle train/test splitting downstream.
+        Applies to 'all-available' and 'single-session'.
+        """
+        if self.data_split_mode not in ["all-available", "single-session"]:
+            print(f"[WARN] Calling load_all_data() but mode is '{self.data_split_mode}'.")
+            
         data = self.load_raw_data()
         x_list, y_list = [], []
+        
         for sid, recs in tqdm(data.items(), desc="Processing signals"):
-            for rec in recs:
+            if not recs: continue
+            
+            target_recs = recs if self.data_split_mode == "all-available" else [recs[0]]
+            
+            for rec in target_recs:
                 segments = self._process_signal(rec['signal'], rec['fs'])
                 if len(segments) > 0:
                     x_list.append(segments)
                     y_list.extend([sid] * len(segments))
+                    
         if x_list: return np.vstack(x_list), np.array(y_list)
         return np.empty((0, 0)), np.empty((0,))
 
-    def load_session(self, session_name, split_mode="short_term"):
+    def load_session(self, session_name):
         """
-        Loads data based on the regime.
-        
-        Args:
-            split_mode (str):
-             - 'short_term': Intra-Record Split (5s vs 5s).
-               Used for Row 1 (All Subjects).
-               Splits the 10s recording into First Half (0-5s) and Second Half (5-10s).
-               
-             - 'long_term': Inter-Record Split.
-               Used for Row 2 (Multi-Record Subjects).
-               Enroll = Rec 1. Probe = Rec 2+.
+        Loads the partitioned data strictly based on temporal/record boundaries.
+        No intra-record splitting is permitted to preserve complete 10s windows.
         """
+        session_name = session_name.lower()
+        if session_name in ["enrol", "train"]:
+            is_enrollment = True
+            log_name = "Train/Enrollment"
+        elif session_name in ["probe", "test"]:
+            is_enrollment = False
+            log_name = "Test/Probe"
+        else:
+            raise ValueError("session_name must be 'enrol', 'train', 'probe', or 'test'.")
+            
         data = self.load_raw_data()
         x_list, y_list = [], []
-        is_enrollment = (session_name == "Session_1")
-        is_probe = (session_name == "Session_2")
+        
+        kept_subjects, dropped_subjects = 0, 0
 
-        for sid, recs in tqdm(data.items(), desc=f"Processing {session_name}"):
+        for sid, recs in tqdm(data.items(), desc=f"Processing {log_name}"):
             if not recs: continue
             
             target_recs = []
-            intra_split = False 
             
-            # --- LONG-TERM (Inter-Record) ---
-            if split_mode == "long_term":
-                # Must have multiple records to simulate aging
-                if len(recs) < 2: continue
-                
-                if is_enrollment: target_recs = [recs[0]]     # Earliest Record
-                elif is_probe: target_recs = recs[1:]         # All Later Records
-                
-                intra_split = False 
-            
-            # --- Very SHORT-TERM (Intra-Record 5s vs 5s) ---
-            elif split_mode == "short_term":
-                # We use ALL records (even if subject only has 1)
-                target_recs = recs
-                intra_split = True
+            unique_dates = sorted(list(set(r['date'] for r in recs)))
+            day1_date = unique_dates[0]
+            day1_recs = [r for r in recs if r['date'] == day1_date]
 
-            # --- PROCESS & SPLIT ---
+            # --- TASK 3: SINGLE CROSS-SESSION ---
+            # Objective: Test immediate cross-record variation (Rec 1 vs Rec 2).
+            if self.data_split_mode == "single-cross-session":
+                if len(recs) < 2: 
+                    dropped_subjects += 1
+                    continue
+                kept_subjects += 1
+                target_recs = [recs[0]] if is_enrollment else [recs[1]]
+
+            # --- TASK 4: SINGLE-SHOT SHORT-TERM ---
+            # Objective: Single-shot enrollment vs all subsequent intra-day probes.
+            elif self.data_split_mode == "single-shot-short-term":
+                if len(day1_recs) < 2: 
+                    dropped_subjects += 1
+                    continue
+                kept_subjects += 1
+                target_recs = [day1_recs[0]] if is_enrollment else day1_recs[1:]
+
+            # --- TASK 5: LEAVE-LAST-OUT SHORT-TERM ---
+            # Objective: Multi-shot enrollment vs a single final intra-day probe.
+            elif self.data_split_mode == "leave-last-out-short-term":
+                if len(day1_recs) < 2: 
+                    dropped_subjects += 1
+                    continue
+                kept_subjects += 1
+                target_recs = day1_recs[:-1] if is_enrollment else [day1_recs[-1]]
+
+            # --- TASK 6: SINGLE-SHOT LONG-TERM ---
+            # Objective: Day 1 template aging tested against all future days.
+            elif self.data_split_mode == "single-shot-long-term":
+                if len(unique_dates) < 2: 
+                    dropped_subjects += 1
+                    continue
+                kept_subjects += 1
+                target_recs = day1_recs if is_enrollment else [r for r in recs if r['date'] > day1_date]
+
+            # --- TASK 7: LEAVE-LAST-OUT LONG-TERM ---
+            # Objective: Historical longitudinal data enrolled vs final day probe.
+            elif self.data_split_mode == "leave-last-out-long-term":
+                if len(unique_dates) < 2:
+                    dropped_subjects += 1
+                    continue
+                kept_subjects += 1
+                last_date = unique_dates[-1]
+                target_recs = [r for r in recs if r['date'] < last_date] if is_enrollment else [r for r in recs if r['date'] == last_date]
+
+            # --- EXTRACTION & SIGNAL PROCESSING ---
             for rec in target_recs:
                 segments = self._process_signal(rec['signal'], rec['fs'])
-                
-                # Apply 5s vs 5s split logic
-                if intra_split and len(segments) > 0:
-                    mid = len(segments) // 2
-                    if is_enrollment: segments = segments[:mid]  # 0-5s
-                    elif is_probe: segments = segments[mid:]     # 5-10s
                 
                 if len(segments) > 0:
                     x_list.append(segments)
                     y_list.extend([sid] * len(segments))
+
+        # Dynamic summary print during the enrollment pass
+        if self.data_split_mode not in ["all-available", "single-session"] and is_enrollment:
+            mode_title = self.data_split_mode.replace('-', ' ').title()
+            print(f"\n[INFO] {mode_title} Summary: Kept {kept_subjects} subjects. Dropped {dropped_subjects} subjects.")
 
         if x_list: return np.vstack(x_list), np.array(y_list)
         return np.empty((0, 0)), np.empty((0,))

@@ -19,1610 +19,2534 @@
 import numpy as np
 import random
 import collections
+import copy
 from typing import Dict, Any, Optional, Tuple, List, Union
 
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import roc_curve, auc
-from sklearn.preprocessing import normalize
 from scipy.optimize import brentq
 from scipy.interpolate import interp1d
+
+from utils import (
+    _apply_score_fusion, _make_loader, _encode_labels, _get_device, _set_seed,
+    _apply_outlier_filter, _compute_sqi, _compute_score_matrix,
+    _get_embeddings, _create_templates, _generate_pairs, _apply_score_fusion,
+    _find_optimal_threshold, _evaluate_with_global_threshold,
+    _compute_metrics_identification, _compute_metrics_verification,
+    _run_training_loop, _train_epoch, _detect_channels
+)
 
 import torch
 import torch.nn as nn
 from torch.utils.data import TensorDataset, DataLoader
 
+import datetime
+from pathlib import Path
+
 from visualizations import Visualizer
 
 # =============================================================================
-# 1. UTILITIES & SETUP
+# AUTOMATED EXPERIMENT LOGGER
 # =============================================================================
-def _set_seed(seed: int = 42):
-    """Ensures reproducibility across Numpy, Random, and PyTorch."""
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available(): torch.cuda.manual_seed_all(seed)
-
-def _get_device(device: Optional[str] = None) -> str:
-    """Auto-selects CUDA if available, unless specified otherwise."""
-    if device is None or device == "auto":
-        return "cuda" if torch.cuda.is_available() else "cpu"
-    return device
-
-def _encode_labels(y: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+def _log_experiment_results(task_name, metrics_dict, data_stats, hyperparams, loader=None):
     """
-    Encodes string/arbitrary labels into 0..N-1 integers for CrossEntropyLoss.
-    Returns: (encoded_labels, original_classes)
+    Dynamically writes experiment configurations and results to a text file.
+    Intelligently extracts parameters directly from the dataset loader object.
+    Automatically categorizes and saves the logs into task-specific .txt files.
     """
-    classes, y_enc = np.unique(y, return_inverse=True)
-    return y_enc.astype(np.int64), classes
-
-def _detect_channels(x: np.ndarray) -> int:
-    """Auto-detects input channels (1 for univariate, 12 for standard ECG)."""
-    if x.ndim == 2: return 1
-    elif x.ndim == 3: return x.shape[1]
-    else: raise ValueError(f"Unexpected input shape: {x.shape}")
-
-def _make_loader(x, y, batch_size, shuffle=True, device='cpu'):
-    """Creates a PyTorch DataLoader."""
-    x_t = torch.from_numpy(x).float()
-    if x_t.ndim == 2: x_t = x_t.unsqueeze(1) # Add channel dim if missing
+    dataset_name = "unknown_dataset"
+    dataset_kwargs = {}
     
-    # If y is None (e.g., pure inference), create dummy labels
-    if y is not None: 
-        y_t = torch.from_numpy(y).long()
-        ds = TensorDataset(x_t, y_t)
-    else: 
-        ds = TensorDataset(x_t, torch.zeros(len(x_t)))
-        
-    return DataLoader(ds, batch_size=batch_size, shuffle=shuffle)
-
-# =============================================================================
-# 2. CORE TRAINING & INFERENCE LOOPS
-# =============================================================================
-def _train_epoch(model, loader, optimizer, criterion, device):
-    """Standard PyTorch training loop for one epoch."""
-    model.train()
-    total_loss = 0.0
-    for xb, yb in loader:
-        xb, yb = xb.to(device), yb.to(device)
-        optimizer.zero_grad()
-        logits = model(xb)
-        loss = criterion(logits, yb)
-        loss.backward()
-        optimizer.step()
-        total_loss += loss.item() * xb.size(0)
-    return total_loss / len(loader.dataset)
-
-def _get_embeddings(model, loader, device):
-    """
-    Extracts deep features (embeddings) from the penultimate layer.
-    Used for Verification tasks where we compare vector similarity.
-    """
-    model.eval()
-    embeddings, labels = [], []
-    with torch.no_grad():
-        for xb, yb in loader:
-            xb = xb.to(device)
-            emb = model(xb) # Forward pass (model.include_top=False)
-            embeddings.append(emb.cpu().numpy())
-            labels.append(yb.numpy())
-    return np.vstack(embeddings), np.concatenate(labels)
-
-# =============================================================================
-# 3. METRIC CALCULATION HELPERS
-# =============================================================================
-def _compute_metrics_verification(scores, labels_pair):
-    """
-    Calculates standard biometric verification metrics.
-    
-    Args:
-        scores: Similarity scores (Cosine Similarity, -1 to 1).
-        labels_pair: 1 for Genuine (Same ID), 0 for Imposter (Diff ID).
-        
-    Returns:
-        tuple: (EER, AUC, d_prime, TAR@0.1%FAR)
-    """
-    fpr, tpr, thresholds = roc_curve(labels_pair, scores)
-    roc_auc = auc(fpr, tpr)
-    
-    # 1. EER (Equal Error Rate): Where False Accept Rate = False Reject Rate
-    try:
-        eer = brentq(lambda x : 1. - x - interp1d(fpr, tpr)(x), 0., 1.)
-    except:
-        eer = 1.0 # Fail safe
-
-    # 2. d-prime (Decidability Index): Separation between Genuine/Imposter distributions
-    gen_scores = [s for s, l in zip(scores, labels_pair) if l == 1]
-    imp_scores = [s for s, l in zip(scores, labels_pair) if l == 0]
-    
-    if len(gen_scores) > 0 and len(imp_scores) > 0:
-        mu_gen, sigma_gen = np.mean(gen_scores), np.std(gen_scores)
-        mu_imp, sigma_imp = np.mean(imp_scores), np.std(imp_scores)
-        # Formula: |mu1 - mu2| / sqrt((var1 + var2)/2)
-        d_prime = abs(mu_gen - mu_imp) / np.sqrt(0.5 * (sigma_gen**2 + sigma_imp**2) + 1e-10)
-    else:
-        d_prime = 0.0
-
-    # 3. TAR @ FAR (Security Metric): Accuracy when False Accepts are locked at 0.1%
-    target_far = 0.001 # 0.1%
-    try:
-        tar_at_far = interp1d(fpr, tpr)(target_far)
-    except:
-        tar_at_far = 0.0
-
-    print(f"[RESULT] EER: {eer:.4f} | AUC: {roc_auc:.4f} | d': {d_prime:.4f} | TAR@0.1%FAR: {tar_at_far:.4f}")
-    return eer, roc_auc, d_prime, tar_at_far
-
-def _compute_metrics_identification(preds_probs, true_labels):
-    """
-    Calculates Rank-N Identification accuracy.
-    
-    Args:
-        preds_probs: Softmax probabilities (N_samples, N_classes).
-        true_labels: Ground truth integers (N_samples).
-        
-    Returns:
-        tuple: (Rank-1 Accuracy, Rank-5 Accuracy)
-    """
-    # Sort predictions by probability (descending)
-    # argsort sorts ascending, so we take reverse slices
-    top_k_preds = np.argsort(preds_probs, axis=1)[:, ::-1] 
-    
-    # Rank 1: Is the top prediction correct?
-    rank1 = np.mean(top_k_preds[:, 0] == true_labels)
-    
-    # Rank 5: Is the correct label in the top 5 predictions?
-    # Handle case where N_classes < 5
-    k = min(5, preds_probs.shape[1])
-    hits_rank5 = [1 if true_labels[i] in top_k_preds[i, :k] else 0 for i in range(len(true_labels))]
-    rank5 = np.mean(hits_rank5)
-    
-    print(f"[RESULT] Rank-1 Acc: {rank1:.4f} | Rank-5 Acc: {rank5:.4f}")
-    return rank1, rank5
-
-# =============================================================================
-# HELPER: PAIR GENERATION (Supports ALL, BALANCED, RANDOM)
-# =============================================================================
-def _generate_pairs(embeddings1, labels1, embeddings2=None, labels2=None, num_pairs=10000, sampling_mode="balanced"):
-    """
-    Generates similarity scores and ground truth labels for verification.
-    
-    MODES:
-      - 'balanced': Creates 50% Genuine and 50% Imposter pairs (Prevents bias).
-      - 'random': Picks pairs completely at random (May be heavily unbalanced).
-      - 'all': Computes the full Similarity Matrix (Every possible pair).
-      
-    Args:
-        embeddings1: Query set (Probe).
-        labels1: Query labels.
-        embeddings2: (Optional) Template set (Enrollment). If None, does Intra-session (emb1 vs emb1).
-    """
-    scores = []
-    labels_pair = []
-    
-    is_cross_session = (embeddings2 is not None)
-    
-    if not is_cross_session:
-        embeddings2 = embeddings1
-        labels2 = labels1
-
-    # --------------------------------------------------------
-    # MODE A: ALL PAIRS (Full Matrix)
-    # --------------------------------------------------------
-    if sampling_mode == "all":
-        print(f"[INFO] generating ALL pairs (Full Matrix evaluation)...")
-        # Compute Sim Matrix (N x M)
-        sim_matrix = np.dot(embeddings1, embeddings2.T)
-        
-        # Ground Truth Matrix (1 if same label, 0 if diff)
-        truth_matrix = (labels1[:, None] == labels2[None, :]).astype(int)
-        
-        if is_cross_session:
-            # Flatten everything (N * M pairs)
-            scores = sim_matrix.flatten()
-            labels_pair = truth_matrix.flatten()
-        else:
-            # Intra-session: We must remove self-comparisons (diagonal) and duplicates (lower triangle)
-            # Use upper triangle indices (k=1 excludes diagonal)
-            upper_tri = np.triu_indices(len(labels1), k=1)
-            scores = sim_matrix[upper_tri]
-            labels_pair = truth_matrix[upper_tri]
+    if loader is not None:
+        # 1. Extract Dataset Name from cfg dict
+        if hasattr(loader, 'cfg') and 'root_dir' in loader.cfg:
+            dataset_name = str(loader.cfg['root_dir']).lower()
             
-    # --------------------------------------------------------
-    # MODE B: BALANCED (Standard)
-    # --------------------------------------------------------
-    elif sampling_mode == "balanced":
-        # Group indices by subject
-        s1_idx = collections.defaultdict(list)
-        s2_idx = collections.defaultdict(list)
-        for i, l in enumerate(labels1): s1_idx[l].append(i)
-        for i, l in enumerate(labels2): s2_idx[l].append(i)
+        # 2. Extract Preprocessing Params (Merge defaults with user overrides)
+        default_prep = loader.cfg.get('preprocessing', {}) if hasattr(loader, 'cfg') else {}
+        user_prep = getattr(loader, 'prep_params', {})
         
-        # Intersection of subjects (needed for Genuine pairs)
-        common_subs = list(set(s1_idx.keys()) & set(s2_idx.keys()))
-        if len(common_subs) < 2: return [], []
+        # This guarantees user-defined params overwrite the defaults
+        dataset_kwargs.update(default_prep)
+        dataset_kwargs.update(user_prep) 
+        
+        # 3. Extract other useful loader attributes dynamically
+        # We ignore backend objects, large paths, and redundant dictionaries
+        ignore_keys = ['preprocessor', 'cfg', 'data_root', 'dataset_root', 
+                       'zip_path', 'url', 'prep_params', 'cleanup_zip']
+        
+        for k, v in vars(loader).items():
+            if k not in ignore_keys and not k.startswith('_'):
+                dataset_kwargs[k] = v
 
-        # Genuine Pairs
-        for _ in range(num_pairs // 2):
-            subj = np.random.choice(common_subs)
-            if is_cross_session:
-                idx1 = np.random.choice(s1_idx[subj])
-                idx2 = np.random.choice(s2_idx[subj])
-            else:
-                # Intra: Pick 2 different samples
-                if len(s1_idx[subj]) < 2: continue
-                idx1, idx2 = np.random.choice(s1_idx[subj], 2, replace=False)
+    # 4. Ensure Results Directory exists: ./results/dataset_name/
+    results_dir = Path("results") / dataset_name.replace(" ", "_")
+    results_dir.mkdir(parents=True, exist_ok=True)
+    
+    # 5. TARGET FILE: Dynamically name the file based on the Task Name
+    # (e.g., "Closed-Set Identification" -> "Closed-Set_Identification.txt")
+    safe_task_name = str(task_name).replace(" ", "_").replace("/", "_").replace("\\", "_")
+    log_file = results_dir / f"{safe_task_name}.txt"
+    
+    # 6. Format and Append
+    with open(log_file, "a", encoding="utf-8") as f:
+        f.write(f"\n{'='*70}\n")
+        f.write(f"EXPERIMENT TIME : {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"TASK            : {task_name}\n")
+        f.write(f"DATASET         : {dataset_name}\n")
+        f.write(f"{'-'*70}\n")
+        
+        f.write("[DATA STATISTICS]\n")
+        for k, v in data_stats.items():
+            f.write(f"  {k:<28}: {v}\n")
+        f.write(f"{'-'*70}\n")
+        
+        f.write("[MODEL HYPERPARAMETERS]\n")
+        for k, v in hyperparams.items():
+            f.write(f"  {k:<28}: {v}\n")
+            
+        if dataset_kwargs:
+            f.write(f"{'-'*70}\n")
+            f.write("[DATASET & PREPROCESSING SETTINGS]\n")
+            for k, v in dataset_kwargs.items():
+                f.write(f"  {k:<28}: {v}\n")
                 
-            scores.append(np.dot(embeddings1[idx1], embeddings2[idx2]))
-            labels_pair.append(1)
-
-        # Imposter Pairs
-        all_s1 = list(s1_idx.keys())
-        all_s2 = list(s2_idx.keys())
-        for _ in range(num_pairs // 2):
-            s_a = np.random.choice(all_s1)
-            # Pick s_b such that it is NOT s_a
-            possible_b = [s for s in all_s2 if s != s_a]
-            if not possible_b: continue
-            s_b = np.random.choice(possible_b)
-            
-            idx1 = np.random.choice(s1_idx[s_a])
-            idx2 = np.random.choice(s2_idx[s_b])
-            scores.append(np.dot(embeddings1[idx1], embeddings2[idx2]))
-            labels_pair.append(0)
-
-    # --------------------------------------------------------
-    # MODE C: RANDOM
-    # --------------------------------------------------------
-    elif sampling_mode == "random":
-        indices1 = np.arange(len(labels1))
-        indices2 = np.arange(len(labels2))
-        for _ in range(num_pairs):
-            i1 = np.random.choice(indices1)
-            i2 = np.random.choice(indices2)
-            
-            # If intra-session, ensure we don't compare self to self
-            if not is_cross_session and i1 == i2: continue
-            
-            scores.append(np.dot(embeddings1[i1], embeddings2[i2]))
-            labels_pair.append(1 if labels1[i1] == labels2[i2] else 0)
-            
-    return np.array(scores), np.array(labels_pair)
-
+        f.write(f"{'-'*70}\n")
+        f.write("[RESULTS]\n")
+        for k, v in metrics_dict.items():
+            if isinstance(v, float):
+                f.write(f"  {k:<28}: {v:.4f}\n")
+            else:
+                f.write(f"  {k:<28}: {v}\n")
+        f.write(f"{'='*70}\n")
+    
+    print(f"\n[INFO] Experiment settings and results successfully saved to: {log_file}")
 
 # =============================================================================
 # TASK 1: CLOSED-SET IDENTIFICATION
 # =============================================================================
-def run_closed_set_identification(x, y, model_class, epochs=30, batch_size=64, lr=1e-3, val_split=0.2, seed=42, device=None, visualize=False):
+def run_closed_set_identification(x, y, model_class, epochs=30, batch_size=64, 
+                                  lr=1e-3, test_split=0.2, val_split=0.0, seed=42, 
+                                  device=None, visualize=False, use_template=False, 
+                                  template_fusion_method='mean', template_size=None,
+                                  matching_method='cosine', outlier_filtering_on_train=False,
+                                  outlier_filtering_on_test=False, sqi_scores=None,
+                                  sqi_threshold=0.05, sqi_keep_pct=0.8, probe_fusion_size=1,
+                                  save_results_and_settings=False, loader=None, 
+                                  n_runs=1, _return_stats=False):
     """
-    Standard Classification Task.
-    Train on N subjects -> Test on same N subjects (different samples).
+    Standard Closed-Set Identification Pipeline (Intra-session).
+    Determines "Who is this person?" from a known pool of subjects seen during training.
+
+    Args:
+        x (np.ndarray): Input ECG signals or features.
+        y (np.ndarray): Subject class labels corresponding to x.
+        model_class (nn.Module): The PyTorch model architecture class to instantiate.
+        epochs (int): Maximum number of training epochs.
+        batch_size (int): Number of samples per training batch.
+        lr (float): Learning rate for the Adam optimizer.
+        test_split (float): Fraction of the data to hold out for testing (0.0 to 1.0).
+        val_split (float): Fraction of the training data to use for early stopping validation.
+        seed (int): Random seed for reproducibility across splits and weights.
+        device (str): Computation device ('cuda', 'cpu', or 'auto').
+        visualize (bool): If True, displays and optionally saves a Confusion Matrix.
+        use_template (bool): 
+            - False: Uses standard end-to-end Softmax classification.
+            - True: Strips the Softmax layer and uses the network as a feature extractor. 
+                    Matches Test probes against Train templates.
+        template_fusion_method (str): Logic used to create the subject templates.
+            Options: ['mean', 'median', 'trimmed_mean', 'representative', 'none']
+        template_size (int, optional): Number of beats used to form the template. None uses all available.
+        matching_method (str): Distance/Similarity metric for template matching.
+            Options: ['cosine', 'euclidean', 'manhattan', 'correlation']
+        outlier_filtering_on_train (bool): If True, filters noisy beats from the Training set.
+        outlier_filtering_on_test (bool): If True, filters noisy beats from the Test set.
+        sqi_scores (str or np.ndarray): SQI calculation method (e.g., 'kurtosis') or pre-computed array.
+        sqi_threshold (float): Absolute minimum SQI score required to keep a beat (0.0 to 1.0).
+        sqi_keep_pct (float): Top percentage of beats to keep per subject after filtering.
+        probe_fusion_size (int): Number of consecutive probe beats to average before making a decision.
+        save_results_and_settings (bool): If True, logs results and parameters to a text file.
+        loader (object): Dataset loader instance (used for extracting metadata for logging).
+        n_runs (int): Number of independent runs (with varying seeds) for statistical validation.
+        _return_stats (bool): Internal flag used to pass data back during multi-seed recursion.
+
+    Returns:
+        tuple: (Rank-1 Accuracy, Rank-5 Accuracy)
+               If n_runs > 1, returns tuples of (Mean, Std_Dev) for both metrics.
     """
+    data_stats = {}
+    hyperparams = {
+        'epochs': epochs, 'batch_size': batch_size, 'learning_rate': lr, 
+        'test_split': test_split, 'val_split': val_split, 'use_template': use_template,
+        'template_fusion_method': template_fusion_method, 'template_size': template_size,
+        'matching_method': matching_method, 'probe_fusion_size': probe_fusion_size,
+        'outlier_filter_train': outlier_filtering_on_train, 'outlier_filter_test': outlier_filtering_on_test
+    }
+
+    # 2. MULTI-RUN AGGREGATOR (Handles statistical validation)
+    if n_runs > 1:
+        # Capture current arguments to repeat the experiment
+        call_args = locals().copy()
+        
+        # CLEANUP: Crucial step. Remove internal variables from the dict so we don't 
+        # pass 'data_stats' or 'hyperparams' as arguments to the next call.
+        for k in ['data_stats', 'hyperparams', 'call_args']: 
+            call_args.pop(k, None)
+        
+        # Configure the sub-runs: 
+        # - Disable their internal logging (we log the aggregate instead)
+        # - Tell them to return their stats so we can capture them
+        call_args.update({'n_runs': 1, '_return_stats': True, 'save_results_and_settings': False})
+        base_seed = call_args.get('seed', 42)
+        results = []
+        
+        print(f"\n[INFO] Starting Multi-Seed Execution ({n_runs} runs) for Statistical Validation...")
+        for i in range(n_runs):
+            call_args['seed'] = base_seed + i
+            call_args['visualize'] = False # Prevent 5 pop-up windows
+            
+            print(f"\n{'='*40}\n RUN {i+1}/{n_runs} (Seed: {call_args['seed']})\n{'='*40}")
+            
+            # Recursive call to execute a single seed
+            res, d_stats, h_params = run_closed_set_identification(**call_args) 
+            
+            results.append(res)
+            # Preserve metadata from the last successful run for the final log file
+            data_stats = d_stats  
+            hyperparams = h_params 
+                
+        # Aggregate metrics across all runs
+        r1_vals = [r[0] for r in results]
+        r5_vals = [r[1] for r in results]
+        r1_mean, r1_std = np.mean(r1_vals), np.std(r1_vals)
+        r5_mean, r5_std = np.mean(r5_vals), np.std(r5_vals)
+        
+        print(f"\n[MULTI-RUN RESULTS | {n_runs} Runs]")
+        print(f"Rank-1 Acc: {r1_mean:.4f} ± {r1_std:.4f} | Rank-5 Acc: {r5_mean:.4f} ± {r5_std:.4f}")
+        
+        if save_results_and_settings:
+            # Update log metadata with run count and formatted mean/std strings
+            hyperparams['n_runs'] = n_runs
+            metrics_dict = {
+                "Rank-1 Accuracy": f"{r1_mean:.4f} ± {r1_std:.4f}", 
+                "Rank-5 Accuracy": f"{r5_mean:.4f} ± {r5_std:.4f}"
+            }
+            _log_experiment_results("Closed-Set Identification", metrics_dict, data_stats, hyperparams, loader)
+        
+        # Return the aggregated statistics
+        return (r1_mean, r1_std), (r5_mean, r5_std)
+
     _set_seed(seed); device = _get_device(device)
-    print(f"\n[TASK] Closed-Set Identification on {device}")
+    task_title = "Closed-Set Identification"
+    mode_str = f"Template ({template_fusion_method}, {matching_method})" if use_template else "Softmax"
+    print(f"\n[TASK] {task_title} | Mode: {mode_str} | Device: {device}")
+
+    # ====================================================
+    # 0. Capture Hyperparameters for Logger
+    # ====================================================
+    hyperparams = {
+        'epochs': epochs, 'batch_size': batch_size, 'learning_rate': lr, 
+        'test_split': test_split, 'val_split': val_split, 'use_template': use_template,
+        'template_fusion_method': template_fusion_method, 'template_size': template_size,
+        'matching_method': matching_method, 'probe_fusion_size': probe_fusion_size,
+        'outlier_filter_train': outlier_filtering_on_train, 'outlier_filter_test': outlier_filtering_on_test
+    }
+
+    # ====================================================
+    # 1. DYNAMIC SQI CALCULATION
+    # ====================================================
+    if outlier_filtering_on_train or outlier_filtering_on_test:
+        if sqi_scores is None:
+            print("[WARN] Filtering requested but sqi_scores is None. Skipping filtering entirely.")
+            # Explicitly turn off the flags so the rest of the pipeline safely ignores filtering
+            outlier_filtering_on_train = False
+            outlier_filtering_on_test = False
+        elif isinstance(sqi_scores, str):
+            print(f"[INFO] Calculating SQI using method: '{sqi_scores}'")
+            sqi_scores = np.array(_compute_sqi(x, method=sqi_scores))
+        elif isinstance(sqi_scores, (list, np.ndarray)):
+            sqi_scores = np.array(sqi_scores)
+        else:
+            raise TypeError("[ERROR] sqi_scores must be a string, array, or None.")
+    else:
+        sqi_scores = None
+
+    # ====================================================
+    # 2. PRE-SPLIT CLEANUP (Ensures stratify doesn't crash)
+    # ====================================================
+    unique_classes, counts = np.unique(y, return_counts=True)
+    valid_classes = unique_classes[counts >= 2] # Need at least 2 beats to split Train/Test
+    valid_mask = np.isin(y, valid_classes)
     
-    y_enc, classes = _encode_labels(y)
-    X_train, X_test, y_train, y_test = train_test_split(x, y_enc, test_size=val_split, stratify=y_enc, random_state=seed)
+    x, y = x[valid_mask], y[valid_mask]
+    if sqi_scores is not None: 
+        sqi_scores = sqi_scores[valid_mask]
+
+    # ====================================================
+    # 3. SPLIT DATA & SQI SCORES
+    # ====================================================
+    if sqi_scores is not None:
+        X_train, X_test, y_train, y_test, sqi_train, sqi_test = train_test_split(
+            x, y, sqi_scores, test_size=test_split, stratify=y, random_state=seed
+        )
+    else:
+        X_train, X_test, y_train, y_test = train_test_split(
+            x, y, test_size=test_split, stratify=y, random_state=seed
+        )
+        sqi_train, sqi_test = None, None
+
+    # ====================================================
+    # 4. APPLY FILTERS INDEPENDENTLY
+    # ====================================================
+    if outlier_filtering_on_train and sqi_train is not None:
+        print("\n[INFO] Filtering Train Set (Enrollment)...")
+        X_train, y_train = _apply_outlier_filter(
+            X_train, y_train, sqi_train, absolute_threshold=sqi_threshold, keep_percentage=sqi_keep_pct
+        )
+
+    if outlier_filtering_on_test and sqi_test is not None:
+        print("\n[INFO] Filtering Test Set (Probes)...")
+        X_test, y_test = _apply_outlier_filter(
+            X_test, y_test, sqi_test, absolute_threshold=sqi_threshold, keep_percentage=sqi_keep_pct
+        )
+
+    # ====================================================
+    # 5. CLASS SYNCHRONIZATION & ENCODING
+    # ====================================================
+    valid_train_classes = np.unique(y_train)
+    original_classes = np.unique(y) # 'y' holds the original classes before the split/filter
     
-    train_loader = _make_loader(X_train, y_train, batch_size, shuffle=True)
-    test_loader = _make_loader(X_test, y_test, batch_size, shuffle=False)
+    # Find classes that existed before filtering but are now completely gone
+    dropped_classes = np.setdiff1d(original_classes, valid_train_classes)
     
+    if len(dropped_classes) > 0:
+        print(f"[WARN] Aggressive filtering completely removed {len(dropped_classes)} subjects: {dropped_classes.tolist()}")
+    
+    # If the filter deleted a class entirely from Train, we MUST drop it from Test
+    test_mask = np.isin(y_test, valid_train_classes)
+    orphaned_test_beats = len(y_test) - np.sum(test_mask)
+    
+    if orphaned_test_beats > 0:
+        print(f"[WARN] Dropping {orphaned_test_beats} Test beats because their corresponding Train subjects were filtered out.")
+
+    X_test, y_test = X_test[test_mask], y_test[test_mask]
+
+    if len(valid_train_classes) < 2:
+        raise ValueError("[ERROR] Data filtering was too aggressive. Not enough subjects left to continue!")
+
+    # Encode labels safely based ONLY on surviving Train classes
+    y_train_enc, classes = _encode_labels(y_train)
+    label_map = {c: i for i, c in enumerate(classes)}
+    y_test_enc = np.array([label_map[l] for l in y_test])
+
+    # ====================================================
+    # 6. RESUME STANDARD PIPELINE
+    # ====================================================
+    if val_split > 0.0:
+        X_tr, X_val, y_tr, y_val = train_test_split(
+            X_train, y_train_enc, test_size=val_split, stratify=y_train_enc, random_state=seed
+        )
+        val_loader = _make_loader(X_val, y_val, batch_size, shuffle=False)
+        print(f"Data Split: Train={len(X_tr)}, Val={len(X_val)}, Test={len(X_test)}")
+    else:
+        X_tr, y_tr = X_train, y_train_enc
+        X_val, val_loader = None, None
+        print(f"Data Split: Train={len(X_tr)}, Val=0, Test={len(X_test)}")
+
+    train_loader = _make_loader(X_tr, y_tr, batch_size, shuffle=True)
+    test_loader = _make_loader(X_test, y_test_enc, batch_size, shuffle=False)
+ 
+    # 3. Train (Always start with Softmax training)
     model = model_class(in_channels=_detect_channels(x), num_classes=len(classes), include_top=True).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr); criterion = nn.CrossEntropyLoss()
     
-    # Train
-    for ep in range(epochs): 
-        loss = _train_epoch(model, train_loader, optimizer, criterion, device)
-        print(f"Epoch {ep+1}/{epochs} | Loss: {loss:.4f}")
+    model = _run_training_loop(model, train_loader, val_loader, optimizer, criterion, device, epochs, patience=10)
+
+    # 4. Evaluation Logic
+    if not use_template:
+        # --- PATH A: Standard Softmax ---
+        model.eval()
+        all_probs, all_trues = [], []
+        with torch.no_grad():
+            for xb, yb in test_loader:
+                xb = xb.to(device)
+                probs = torch.softmax(model(xb), dim=1)
+                all_probs.append(probs.cpu().numpy())
+                all_trues.append(yb.cpu().numpy())
+        final_scores = np.vstack(all_probs)
+        final_labels = np.concatenate(all_trues)
         
-    # Test
-    model.eval()
-    all_probs, all_trues = [], []
-    with torch.no_grad():
-        for xb, yb in test_loader:
-            xb = xb.to(device)
-            probs = torch.softmax(model(xb), dim=1) # Get probabilities
-            all_probs.append(probs.cpu().numpy())
-            all_trues.append(yb.cpu().numpy())
+    else:
+        # --- PATH B: Template Matching ---
+        print(f"[INFO] Building Templates using '{template_fusion_method}' (Beats: {template_size or 'All'})...")
+        
+        # Switch to Feature Extractor
+        model.include_top = False 
+        
+        # Extract Embeddings from TRAIN set (Enrollment)
+        train_extract_loader = _make_loader(X_train, y_train_enc, batch_size, shuffle=False)
+        train_emb, train_lab = _get_embeddings(model, train_extract_loader, device)
+        
+        # Create Templates
+        templates, temp_labels = _create_templates(
+            train_emb, train_lab, method=template_fusion_method, max_beats=template_size
+        )
+        
+        # Extract Embeddings from TEST set (Probe)
+        test_emb, test_lab = _get_embeddings(model, test_loader, device)
+        
+        # Matching
+        raw_scores = _compute_score_matrix(test_emb, templates, method=matching_method)
             
-    all_probs = np.vstack(all_probs)
-    all_trues = np.concatenate(all_trues)
-    
+        # Required if template_fusion_method='none' leaves multiple templates per subject
+        scores = np.full((len(test_emb), len(classes)), -np.inf)
+        for class_idx in range(len(classes)):
+            gallery_mask = (temp_labels == class_idx)
+            if np.any(gallery_mask):
+                scores[:, class_idx] = np.max(raw_scores[:, gallery_mask], axis=1)
+                
+        final_scores = scores
+        final_labels = test_lab
+        
+        # Restore model
+        model.include_top = True
+
+    # ====================================================
+    # 5. APPLY SCORE-LEVEL FUSION (If requested)
+    # ====================================================
+    final_scores, final_labels = _apply_score_fusion(
+        final_scores, final_labels, fusion_size=probe_fusion_size
+    )
+
     if visualize:
         viz = Visualizer()
-        preds = np.argmax(all_probs, axis=1)
-        viz.plot_confusion_matrix(all_trues, preds, normalize=True)
+        preds = np.argmax(final_scores, axis=1)
+        viz.plot_confusion_matrix(final_labels, preds, normalize=True)
 
-    return _compute_metrics_identification(all_probs, all_trues)
+    rank1, rank5 = _compute_metrics_identification(final_scores, final_labels)
+
+    # Update hyperparams dictionary dynamically
+    hyperparams['epochs'] = f"{epochs} (stopped at {model.actual_epochs})" if model.actual_epochs < epochs else epochs
+
+    if _return_stats: 
+        return (rank1, rank5), data_stats, hyperparams
+
+    if save_results_and_settings:
+        data_stats = {
+            "Total Subjects": len(classes),
+            "Train Samples": len(X_tr),
+            "Validation Samples": len(X_val) if X_val is not None else 0,
+            "Test (Probe) Samples": len(X_test),
+        }
+        _log_experiment_results(task_title, {"Rank-1 Accuracy": rank1, "Rank-5 Accuracy": rank5}, 
+                                data_stats, hyperparams, loader)
+
+    return _compute_metrics_identification(final_scores, final_labels)
 
 # =============================================================================
-# TASK 2: SUBJECT-DISJOINT IDENTIFICATION (OPEN SET / TEMPLATE MATCHING)
+# TASK 2: CLOSED-SET VERIFICATION
 # =============================================================================
-def run_subject_disjoint_identification(x, y, model_class, train_subject_ratio=0.7, enrollment_beats=5, epochs=30, batch_size=64, lr=1e-3, seed=42, device=None, visualize=False):
+def run_closed_set_verification(x, y, model_class, epochs=30, batch_size=64, lr=1e-3, test_split=0.2, val_split=0.0, 
+                                num_pairs=10000, sampling_mode="balanced", seed=42, device=None, visualize=False,
+                                use_template=False, template_fusion_method='mean', template_size=None, matching_method='cosine',
+                                outlier_filtering_on_train=False, outlier_filtering_on_test=False, sqi_scores=None,
+                                sqi_threshold=0.05, sqi_keep_pct=0.8, use_deployment_evaluation=False,
+                                save_results_and_settings=False, loader=None, n_runs=1, _return_stats=False):
     """
-    Identification on Unseen Subjects.
-    Since Softmax can't handle new classes, we use Template Matching (1-NN).
-    1. Train Feature Extractor on 'Train Subjects'.
-    2. Enroll 'Test Subjects' using 'enrollment_beats'.
-    3. Test remaining beats against Enrolled Templates.
+    Standard Closed-Set Verification Pipeline (Intra-session).
+    Determines "Is this person who they claim to be?" (1:1 matching) for subjects known to the model.
+
+    Args:
+        x (np.ndarray): Input ECG signals or features.
+        y (np.ndarray): Subject class labels corresponding to x.
+        model_class (nn.Module): The PyTorch model architecture class to instantiate.
+        epochs (int): Maximum number of training epochs.
+        batch_size (int): Number of samples per training batch.
+        lr (float): Learning rate for the Adam optimizer.
+        test_split (float): Fraction of the data to hold out for testing (0.0 to 1.0).
+        val_split (float): Fraction of the training data to use for early stopping.
+        num_pairs (int): Total number of Genuine and Impostor pairs to generate for evaluation.
+        sampling_mode (str): Logic used to pair beats together.
+            Options: ['balanced' (50/50 split), 'all_genuine', 'random']
+        seed (int): Random seed for reproducibility.
+        device (str): Computation device ('cuda', 'cpu', or 'auto').
+        visualize (bool): If True, generates t-SNE scatter plots of the test embeddings.
+        use_template (bool): 
+            - False: Evaluates raw feature space (Unseen test beats paired vs other Unseen test beats).
+            - True: Simulates real-world authentication (Test probes paired against Train templates).
+        template_fusion_method (str): Logic used to create the subject templates.
+            Options: ['mean', 'median', 'trimmed_mean', 'representative', 'none']
+        template_size (int, optional): Number of beats used to form the template. None uses all available.
+        matching_method (str): Distance/Similarity metric used to score the pairs.
+            Options: ['cosine', 'euclidean', 'manhattan', 'correlation']
+        outlier_filtering_on_train (bool): If True, filters noisy beats from the Training set.
+        outlier_filtering_on_test (bool): If True, filters noisy beats from the Test set.
+        sqi_scores (str or np.ndarray): SQI calculation method (e.g., 'kurtosis') or pre-computed array.
+        sqi_threshold (float): Absolute minimum SQI score required to keep a beat (0.0 to 1.0).
+        sqi_keep_pct (float): Top percentage of beats to keep per subject after filtering.
+        use_deployment_evaluation (bool): If True, calculates a Global Optimal Threshold on the Validation 
+                                          set first, and applies it to the Test set to simulate deployment.
+        save_results_and_settings (bool): If True, logs results and parameters to a text file.
+        loader (object): Dataset loader instance (used for extracting metadata for logging).
+        n_runs (int): Number of independent runs (with varying seeds) for statistical validation.
+        _return_stats (bool): Internal flag used to pass data back during multi-seed recursion.
+
+    Returns:
+        tuple: (EER, AUC, d-prime, TAR @ 0.1% FAR)
+               If n_runs > 1, returns tuples of (Mean, Std_Dev) for all four metrics.
     """
-    _set_seed(seed); device = _get_device(device)
-    print(f"\n[TASK] Subject-Disjoint ID (Template Matching) on {device}")
-    
-    subjects = np.unique(y)
-    train_subs, test_subs = train_test_split(subjects, train_size=train_subject_ratio, random_state=seed)
-    
-    # 1. Train Feature Extractor
-    mask_train = np.isin(y, train_subs)
-    X_train, y_train = x[mask_train], y[mask_train]
-    y_train_enc, _ = _encode_labels(y_train)
-    
-    train_loader = _make_loader(X_train, y_train_enc, batch_size, shuffle=True)
-    model = model_class(in_channels=_detect_channels(x), num_classes=len(train_subs), include_top=True).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr); criterion = nn.CrossEntropyLoss()
-    
-    for ep in range(epochs): 
-        loss = _train_epoch(model, train_loader, optimizer, criterion, device)
-        print(f"Epoch {ep+1}/{epochs} | Loss: {loss:.4f}")
-    
-    # 2. Template Matching
-    model.include_top = False # Embedding mode
-    mask_test = np.isin(y, test_subs)
-    X_test_all, y_test_all = x[mask_test], y[mask_test]
-    X_enroll, y_enroll, X_query, y_query = [], [], [], []
-    
-    for sub in test_subs:
-        sub_beats = X_test_all[y_test_all == sub]
-        if len(sub_beats) <= enrollment_beats: continue
-        X_enroll.append(sub_beats[:enrollment_beats]); y_enroll.extend([sub]*enrollment_beats)
-        X_query.append(sub_beats[enrollment_beats:]); y_query.extend([sub]*(len(sub_beats)-enrollment_beats))
+    # ====================================================
+    # 0. Capture Hyperparameters for Logger
+    # ====================================================
+    data_stats = {}
+    hyperparams = {
+        'epochs': epochs, 'batch_size': batch_size, 'learning_rate': lr, 
+        'test_split': test_split, 'val_split': val_split, 'num_pairs': num_pairs,
+        'sampling_mode': sampling_mode, 'use_template': use_template, 
+        'template_fusion_method': template_fusion_method, 'template_size': template_size,
+        'matching_method': matching_method,
+        'outlier_filter_train': outlier_filtering_on_train, 
+        'outlier_filter_test': outlier_filtering_on_test,
+        'use_deployment_eval': use_deployment_evaluation
+    }
+
+    # --- MULTI-RUN AGGREGATOR ---
+    if n_runs > 1:
+        call_args = locals().copy()
+        for k in ['data_stats', 'hyperparams', 'call_args']: call_args.pop(k, None)
+        call_args.update({'n_runs': 1, '_return_stats': True, 'save_results_and_settings': False})
+        base_seed = call_args.get('seed', 42)
+        results = []
         
-    enroll_loader = _make_loader(np.vstack(X_enroll), None, batch_size, shuffle=False)
-    query_loader = _make_loader(np.vstack(X_query), None, batch_size, shuffle=False)
-    emb_enroll, _ = _get_embeddings(model, enroll_loader, device)
-    emb_query, _ = _get_embeddings(model, query_loader, device)
-    
-    # Create Prototypes (Mean embedding of enrollment shots)
-    templates = []
-    template_ids = np.unique(y_enroll)
-    for sub in template_ids:
-        idxs = np.where(np.array(y_enroll) == sub)[0]
-        templates.append(np.mean(emb_enroll[idxs], axis=0))
-    templates = np.array(templates)
-    
-    # Cosine Similarity (1-NN)
-    # Sim Matrix: (N_query, N_templates)
-    sim_matrix = np.dot(normalize(emb_query), normalize(templates).T)
-    
-    # Rank-1 Preds
-    pred_indices = np.argmax(sim_matrix, axis=1)
-    preds = template_ids[pred_indices]
-    
-    acc = np.mean(preds == np.array(y_query))
-    print(f"[RESULT] Subject-Disjoint Rank-1 Acc: {acc:.4f}")
-    
-    if visualize:
-        viz = Visualizer()
-        # Visualize only a subset if confusion matrix is huge
-        if len(template_ids) < 50:
-            viz.plot_confusion_matrix(y_query, preds, normalize=True)
-            
-    return acc
+        print(f"\n[INFO] Starting Multi-Seed Execution ({n_runs} runs)...")
+        for i in range(n_runs):
+            call_args['seed'] = base_seed + i
+            call_args['visualize'] = False 
+            print(f"\n{'='*40}\n RUN {i+1}/{n_runs} (Seed: {call_args['seed']})\n{'='*40}")
+            res, d_stats, h_params = run_closed_set_verification(**call_args) 
+            results.append(res); data_stats = d_stats; hyperparams = h_params
+                
+        metrics_t = list(zip(*results))
+        means, stds = [np.mean(m) for m in metrics_t], [np.std(m) for m in metrics_t]
+        
+        if save_results_and_settings:
+            hyperparams['n_runs'] = n_runs
+            metrics_dict = {
+                "EER": f"{means[0]:.4f} ± {stds[0]:.4f}", "AUC": f"{means[1]:.4f} ± {stds[1]:.4f}", 
+                "d-prime": f"{means[2]:.4f} ± {stds[2]:.4f}", "TAR@0.1%FAR": f"{means[3]:.4f} ± {stds[3]:.4f}"
+            }
+            _log_experiment_results("Random-Split Verification", metrics_dict, data_stats, hyperparams, loader)
+        return tuple(zip(means, stds))
+    # ----------------------------
 
-# =============================================================================
-# TASK 3: VERIFICATION (RANDOM SPLIT)
-# =============================================================================
-def run_verification(x, y, model_class, train_split=0.7, epochs=30, batch_size=64, lr=1e-3, num_pairs=10000, sampling_mode="balanced", seed=42, device=None, visualize=False):
-    """
-    Standard Verification.
-    Train and Test sets contain the SAME subjects (Closed-Set), but different beats.
-    """
     _set_seed(seed); device = _get_device(device)
-    print(f"\n[TASK] Verification (Closed-Set) on {device}")
+    task_title = "Random-Split Verification"
+    mode_str = f"Template ({template_fusion_method}, size={template_size})" if use_template else "Cloud Pairs (Test Only)"
+    print(f"\n[TASK] {task_title} | Mode: {mode_str} | Match: {matching_method}")
+
+    # ====================================================
+    # 1. DYNAMIC SQI CALCULATION
+    # ====================================================
+    if outlier_filtering_on_train or outlier_filtering_on_test:
+        if sqi_scores is None:
+            print("[WARN] Filtering requested but sqi_scores is None. Skipping filtering entirely.")
+            outlier_filtering_on_train = False
+            outlier_filtering_on_test = False
+        elif isinstance(sqi_scores, str):
+            print(f"[INFO] Calculating SQI using method: '{sqi_scores}'")
+            sqi_scores = np.array(_compute_sqi(x, method=sqi_scores))
+        elif isinstance(sqi_scores, (list, np.ndarray)):
+            sqi_scores = np.array(sqi_scores)
+        else:
+            raise TypeError("[ERROR] sqi_scores must be a string, array, or None.")
+    else:
+        sqi_scores = None
+
+    # ====================================================
+    # 2. PRE-SPLIT CLEANUP (Ensures stratify doesn't crash)
+    # ====================================================
+    unique_classes, counts = np.unique(y, return_counts=True)
+    valid_classes = unique_classes[counts >= 2] # Need at least 2 beats to split Train/Test
+    valid_mask = np.isin(y, valid_classes)
     
-    y_enc, classes = _encode_labels(y)
-    X_train, X_test, y_train, y_test = train_test_split(x, y_enc, test_size=(1-train_split), stratify=y_enc, random_state=seed)
+    x, y = x[valid_mask], y[valid_mask]
+    if sqi_scores is not None: 
+        sqi_scores = sqi_scores[valid_mask]
+
+    # ====================================================
+    # 3. SPLIT DATA & SQI SCORES
+    # ====================================================
+    if sqi_scores is not None:
+        X_train, X_test, y_train, y_test, sqi_train, sqi_test = train_test_split(
+            x, y, sqi_scores, test_size=test_split, stratify=y, random_state=seed
+        )
+    else:
+        X_train, X_test, y_train, y_test = train_test_split(
+            x, y, test_size=test_split, stratify=y, random_state=seed
+        )
+        sqi_train, sqi_test = None, None
+
+    # ====================================================
+    # 4. APPLY FILTERS INDEPENDENTLY
+    # ====================================================
+    if outlier_filtering_on_train and sqi_train is not None:
+        print("\n[INFO] Filtering Train Set (Enrollment)...")
+        X_train, y_train = _apply_outlier_filter(
+            X_train, y_train, sqi_train, absolute_threshold=sqi_threshold, keep_percentage=sqi_keep_pct
+        )
+
+    if outlier_filtering_on_test and sqi_test is not None:
+        print("\n[INFO] Filtering Test Set (Probes)...")
+        X_test, y_test = _apply_outlier_filter(
+            X_test, y_test, sqi_test, absolute_threshold=sqi_threshold, keep_percentage=sqi_keep_pct
+        )
+
+    # ====================================================
+    # 5. CLASS SYNCHRONIZATION & ENCODING
+    # ====================================================
+    valid_train_classes = np.unique(y_train)
+    original_classes = np.unique(y)
     
-    train_loader = _make_loader(X_train, y_train, batch_size, shuffle=True)
+    dropped_classes = np.setdiff1d(original_classes, valid_train_classes)
+    if len(dropped_classes) > 0:
+        print(f"[WARN] Aggressive filtering completely removed {len(dropped_classes)} subjects: {dropped_classes.tolist()}")
+    
+    test_mask = np.isin(y_test, valid_train_classes)
+    orphaned_test_beats = len(y_test) - np.sum(test_mask)
+    if orphaned_test_beats > 0:
+        print(f"[WARN] Dropping {orphaned_test_beats} Test beats because their corresponding Train subjects were filtered out.")
+
+    X_test, y_test = X_test[test_mask], y_test[test_mask]
+
+    if len(valid_train_classes) < 2:
+        raise ValueError("[ERROR] Data filtering was too aggressive. Not enough subjects left to continue!")
+
+    y_train_enc, classes = _encode_labels(y_train)
+    label_map = {c: i for i, c in enumerate(classes)}
+    y_test_enc = np.array([label_map[l] for l in y_test])
+
+    # ====================================================
+    # 6. RESUME STANDARD PIPELINE
+    # ====================================================
+    if val_split > 0.0:
+        X_tr, X_val, y_tr, y_val = train_test_split(
+            X_train, y_train_enc, test_size=val_split, stratify=y_train_enc, random_state=seed
+        )
+        val_loader = _make_loader(X_val, y_val, batch_size, shuffle=False)
+        print(f"Data Split: Train={len(X_tr)}, Val={len(X_val)}, Test={len(X_test)}")
+    else:
+        X_tr, y_tr = X_train, y_train_enc
+        X_val, val_loader = None, None
+        print(f"Data Split: Train={len(X_tr)}, Val=0, Test={len(X_test)}")
+
+    train_loader = _make_loader(X_tr, y_tr, batch_size, shuffle=True)
+    test_loader = _make_loader(X_test, y_test_enc, batch_size, shuffle=False)
+    
+    # 7. Train Model
     model = model_class(in_channels=_detect_channels(x), num_classes=len(classes), include_top=True).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr); criterion = nn.CrossEntropyLoss()
+    model = _run_training_loop(model, train_loader, val_loader, optimizer, criterion, device, epochs, patience=10)
     
-    for ep in range(epochs): 
-        loss = _train_epoch(model, train_loader, optimizer, criterion, device)
-        print(f"Epoch {ep+1}/{epochs} | Loss: {loss:.4f}")
-    
+    # Switch model to feature extractor
     model.include_top = False
-    test_loader = _make_loader(X_test, y_test, batch_size, shuffle=False)
-    emb_test, labels_test = _get_embeddings(model, test_loader, device)
+
+    # ====================================================
+    # 8. MODEL CALIBRATION (Optional)
+    # ====================================================
+    if use_deployment_evaluation:
+        print("\n[INFO] --- REAL-WORLD DEPLOYMENT EVALUATION ---")
+        if val_split <= 0.0 or val_loader is None:
+            print("[WARN] No validation set provided (val_split=0.0). Falling back to the Training set.")
+            print("[WARN] NOTE: Using training data to find the threshold yields overly optimistic results. A separate validation set is strongly recommended!")
+            calib_loader = train_loader
+            calib_name = "Train (Fallback)"
+        else:
+            calib_loader = val_loader
+            calib_name = "Validation"
+        
+        print(f"[INFO] Extracting features for Calibration ({calib_name} Set)...")
+        calib_emb, calib_lab = _get_embeddings(model, calib_loader, device)
+        
+        print(f"[INFO] Generating Calibration Pairs to find Global Threshold...")
+        calib_scores, calib_pair_labels = _generate_pairs(
+            embeddings1=calib_emb, labels1=calib_lab, embeddings2=None, labels2=None,
+            num_pairs=num_pairs, sampling_mode=sampling_mode, matching_method=matching_method
+        )
+        global_threshold = _find_optimal_threshold(calib_scores, calib_pair_labels)
+        print(f"[INFO] Optimal Global Threshold Found: {global_threshold:.4f}")
     
+    # Extract Test Embeddings (Probes)
+    test_emb, test_lab = _get_embeddings(model, test_loader, device)
+
+    # ====================================================
+    # 9. EVALUATION STRATEGY
+    # ====================================================
+    if not use_template:
+        # STRATEGY A: Test vs Test (Intra-session unseen evaluation)
+        print(f"[INFO] Bypassing Templates. Generating pairs exclusively from Test split...")
+        scores, labels_pair = _generate_pairs(
+            embeddings1=test_emb, 
+            labels1=test_lab, 
+            embeddings2=None, # None forces Test vs Test matching
+            labels2=None, 
+            num_pairs=num_pairs, 
+            sampling_mode=sampling_mode, 
+            matching_method=matching_method
+        )
+    else:
+        # STRATEGY B: Test vs Train Templates (Authentication Simulation)
+        print(f"[INFO] Building Enrollment Templates from Train split...")
+        # [FIX]: Use y_train_enc to match the neural network encoding output
+        train_extract_loader = _make_loader(X_train, y_train_enc, batch_size, shuffle=False)
+        train_emb, train_lab = _get_embeddings(model, train_extract_loader, device)
+        
+        templates, temp_labels = _create_templates(
+            train_emb, train_lab, method=template_fusion_method, max_beats=template_size
+        )
+        
+        scores, labels_pair = _generate_pairs(
+            embeddings1=test_emb, # Probes
+            labels1=test_lab, 
+            embeddings2=templates, # Enrollment
+            labels2=temp_labels, 
+            num_pairs=num_pairs, 
+            sampling_mode=sampling_mode, 
+            matching_method=matching_method
+        )
+        
     if visualize:
         viz = Visualizer()
-        viz.plot_embeddings(emb_test, labels_test, title="Verification Embeddings (T-SNE)")
+        viz.plot_embeddings(test_emb, test_lab, title="Verification Test Embeddings (T-SNE)")
 
-    # Intra-session pair generation
-    scores, labels_pair = _generate_pairs(normalize(emb_test), labels_test, None, None, num_pairs, sampling_mode)
-    if len(scores) == 0: return 1.0, 0.5, 0.0, 0.0
+    if use_deployment_evaluation:
+        _evaluate_with_global_threshold(scores, labels_pair, global_threshold)
+
+    eer, auc_val, dprime, tar = _compute_metrics_verification(scores, labels_pair)
+
+    # Update hyperparams dictionary dynamically
+    hyperparams['epochs'] = f"{epochs} (stopped at {model.actual_epochs})" if model.actual_epochs < epochs else epochs
+
+    # ====================================================
+    # 10. SAVE RESULTS
+    # ====================================================
+    if _return_stats: 
+        return (eer, auc_val, dprime, tar), data_stats, hyperparams
+    
+    if save_results_and_settings:
+        data_stats = {
+            "Total Subjects": len(classes),
+            "Train Samples": len(X_tr),
+            "Validation Samples": len(X_val) if X_val is not None else 0,
+            "Test (Probe) Samples": len(X_test),
+            "Verification Pairs Generated": len(labels_pair),
+        }
+        _log_experiment_results(task_title, {"EER": eer, "AUC": auc_val, "d-prime": dprime, "TAR@0.1%FAR": tar}, 
+                                data_stats, hyperparams, loader)
 
     return _compute_metrics_verification(scores, labels_pair)
 
 # =============================================================================
-# TASK 4: SUBJECT-DISJOINT VERIFICATION
+# TASK 3: SUBJECT-DISJOINT IDENTIFICATION (OPEN SET / TEMPLATE MATCHING)
 # =============================================================================
-def run_subject_disjoint_verification(x, y, model_class, train_subject_ratio=0.7, epochs=30, batch_size=64, lr=1e-3, num_pairs=10000, sampling_mode="balanced", seed=42, device=None, visualize=False):
+def run_subject_disjoint_identification(x, y, model_class, epochs=30, batch_size=64, lr=1e-3, test_split=0.2, val_split=0.0, 
+                                        seed=42, device=None, visualize=False, use_template=True, template_fusion_method='mean', 
+                                        template_size=1, matching_method='cosine', outlier_filtering_on_train=False, 
+                                        outlier_filtering_on_test=False, sqi_scores=None, sqi_threshold=0.05, sqi_keep_pct=0.8,
+                                        probe_fusion_size=1, save_results_and_settings=False, loader=None, n_runs=1, _return_stats=False):
     """
-    Verification on Unseen Subjects.
-    Train on Set A, Verify on Set B. This is the hardest verification task.
-    """
+    Subject-Disjoint Identification Pipeline (Open-Set).
+    Evaluates identification performance on subjects entirely UNSEEN during the training phase.
+    The model learns generalized feature representations on Subject Group A, and builds a gallery for Subject Group B.
+
+    Args:
+        x (np.ndarray): Input ECG signals or features.
+        y (np.ndarray): Subject class labels corresponding to x.
+        model_class (nn.Module): The PyTorch model architecture class to instantiate.
+        epochs (int): Maximum number of training epochs.
+        batch_size (int): Number of samples per training batch.
+        lr (float): Learning rate for the Adam optimizer.
+        test_split (float): Fraction of unique SUBJECTS to hold out for the disjoint test set.
+        val_split (float): Fraction of training subjects to use for early stopping.
+        seed (int): Random seed for reproducibility.
+        device (str): Computation device ('cuda', 'cpu', or 'auto').
+        visualize (bool): If True, generates t-SNE scatter plots of the unseen embeddings.
+        use_template (bool): MUST be True for Open-Set identification (requires a gallery).
+        template_fusion_method (str): Logic used to enroll unseen subjects into the gallery.
+            Options: ['mean', 'median', 'trimmed_mean', 'representative', 'none']
+        template_size (int): Number of chronological beats (e.g., first 5) used to form the gallery template.
+        matching_method (str): Distance/Similarity metric used to search the gallery.
+            Options: ['cosine', 'euclidean', 'manhattan', 'correlation']
+        outlier_filtering_on_train (bool): If True, filters noisy beats from the representation learning phase.
+        outlier_filtering_on_test (bool): If True, filters noisy beats before forming gallery/probes.
+        sqi_scores (str or np.ndarray): SQI calculation method (e.g., 'kurtosis') or pre-computed array.
+        sqi_threshold (float): Absolute minimum SQI score required to keep a beat (0.0 to 1.0).
+        sqi_keep_pct (float): Top percentage of beats to keep per subject after filtering.
+        probe_fusion_size (int): Number of consecutive probe beats to average before searching the gallery.
+        save_results_and_settings (bool): If True, logs results and parameters to a text file.
+        loader (object): Dataset loader instance (used for extracting metadata for logging).
+        n_runs (int): Number of independent runs (with varying seeds) for statistical validation.
+        _return_stats (bool): Internal flag used to pass data back during multi-seed recursion.
+
+    Returns:
+        tuple: (Rank-1 Accuracy, Rank-5 Accuracy)
+               If n_runs > 1, returns tuples of (Mean, Std_Dev) for both metrics.
+    """   
+    # --- ENFORCE OUR AGREED TERMINOLOGY ---
+    if not use_template:
+        raise ValueError(
+            "[ERROR] use_template=False is invalid for Identification. "
+            "Identification is a 1:N search and MUST have a defined gallery/reference set. "
+            "Please set use_template=True. (If you want to evaluate raw beats without averaging, "
+            "set use_template=True and template_fusion_method='none')."
+        )
+    # --------------------------------------
+    
+    if template_size is None:
+        template_size = 1 # Fallback to single-shot enrollment
+
+    # --- MULTI-RUN AGGREGATOR ---
+    data_stats = {}
+    hyperparams = {
+        'epochs': epochs, 'batch_size': batch_size, 'learning_rate': lr, 'test_split_subjects': test_split, 'val_split': val_split,
+        'template_fusion_method': template_fusion_method, 'template_size': template_size, 
+        'matching_method': matching_method, 'probe_fusion_size': probe_fusion_size,
+        'outlier_filter_train': outlier_filtering_on_train, 'outlier_filter_test': outlier_filtering_on_test
+    }
+
+    if n_runs > 1:
+        call_args = locals().copy()
+        for k in ['data_stats', 'hyperparams', 'call_args']: call_args.pop(k, None)
+        call_args.update({'n_runs': 1, '_return_stats': True, 'save_results_and_settings': False})
+        base_seed = call_args.get('seed', 42)
+        results = []
+        
+        print(f"\n[INFO] Starting Multi-Seed Execution ({n_runs} runs)...")
+        for i in range(n_runs):
+            call_args['seed'] = base_seed + i
+            call_args['visualize'] = False 
+            print(f"\n{'='*40}\n RUN {i+1}/{n_runs} (Seed: {call_args['seed']})\n{'='*40}")
+            res, d_stats, h_params = run_subject_disjoint_identification(**call_args) 
+            results.append(res); data_stats = d_stats; hyperparams = h_params
+                
+        r1_mean, r1_std = np.mean([r[0] for r in results]), np.std([r[0] for r in results])
+        r5_mean, r5_std = np.mean([r[1] for r in results]), np.std([r[1] for r in results])
+        
+        if save_results_and_settings:
+            hyperparams['n_runs'] = n_runs
+            metrics_dict = {"Rank-1 Accuracy": f"{r1_mean:.4f} ± {r1_std:.4f}", "Rank-5 Accuracy": f"{r5_mean:.4f} ± {r5_std:.4f}"}
+            _log_experiment_results("Subject-Disjoint Identification", metrics_dict, data_stats, hyperparams, loader)
+        return (r1_mean, r1_std), (r5_mean, r5_std)
+    # ----------------------------
+
     _set_seed(seed); device = _get_device(device)
-    print(f"\n[TASK] Subject-Disjoint Verification on {device}")
+    task_title = "Subject-Disjoint Identification"
+    mode_str = f"Gallery: First {template_size} beats | Fusion: {template_fusion_method}"
+    print(f"\n[TASK] {task_title} | Mode: {mode_str} | Match: {matching_method}")
+
+    # ====================================================
+    # 1. DYNAMIC SQI CALCULATION
+    # ====================================================
+    if outlier_filtering_on_train or outlier_filtering_on_test:
+        if sqi_scores is None:
+            print("[WARN] Filtering requested but sqi_scores is None. Skipping filtering entirely.")
+            outlier_filtering_on_train = False
+            outlier_filtering_on_test = False
+        elif isinstance(sqi_scores, str):
+            print(f"[INFO] Calculating SQI using method: '{sqi_scores}'")
+            sqi_scores = np.array(_compute_sqi(x, method=sqi_scores))
+        elif isinstance(sqi_scores, (list, np.ndarray)):
+            sqi_scores = np.array(sqi_scores)
+        else:
+            raise TypeError("[ERROR] sqi_scores must be a string, array, or None.")
+    else:
+        sqi_scores = None
+
+    # ====================================================
+    # 2. PRE-SPLIT CLEANUP 
+    # ====================================================
+    # Test subjects absolutely MUST have enough beats for Gallery + at least 1 Probe
+    min_required = template_size + 1 
+    unique_classes, counts = np.unique(y, return_counts=True)
+    valid_classes = unique_classes[counts >= min_required]
     
-    # Split by Subject ID
-    subjects = np.unique(y)
-    train_subs, test_subs = train_test_split(subjects, train_size=train_subject_ratio, random_state=seed)
+    valid_mask = np.isin(y, valid_classes)
+    x, y = x[valid_mask], y[valid_mask]
+    if sqi_scores is not None: 
+        sqi_scores = sqi_scores[valid_mask]
+
+    # ====================================================
+    # 3. SPLIT SUBJECTS (Strictly Disjoint)
+    # ====================================================
+    y_enc, classes = _encode_labels(y)
+    unique_subjs = np.unique(y_enc)
     
-    mask_train = np.isin(y, train_subs)
-    X_train, y_train_raw = x[mask_train], y[mask_train]
-    y_train_enc, _ = _encode_labels(y_train_raw)
+    train_subs_full, test_subs = train_test_split(unique_subjs, test_size=test_split, random_state=seed)
     
-    train_loader = _make_loader(X_train, y_train_enc, batch_size, shuffle=True)
-    model = model_class(in_channels=_detect_channels(x), num_classes=len(train_subs), include_top=True).to(device)
+    if val_split > 0.0:
+        train_subs, val_subs = train_test_split(train_subs_full, test_size=val_split, random_state=seed)
+        val_mask = np.isin(y_enc, val_subs)
+        X_val, y_val = x[val_mask], y_enc[val_mask]
+        if sqi_scores is not None: sqi_val = sqi_scores[val_mask]
+        print(f"Subject Split: Train={len(train_subs)}, Val={len(val_subs)}, Test={len(test_subs)}")
+    else:
+        train_subs = train_subs_full
+        X_val, y_val, sqi_val, val_subs = None, None, None, None
+        print(f"Subject Split: Train={len(train_subs)}, Val=0, Test={len(test_subs)}")
+
+    train_mask = np.isin(y_enc, train_subs)
+    X_train, y_train = x[train_mask], y_enc[train_mask]
+    if sqi_scores is not None: sqi_train = sqi_scores[train_mask]
+    
+    test_mask = np.isin(y_enc, test_subs)
+    X_test, y_test = x[test_mask], y_enc[test_mask]
+    if sqi_scores is not None: sqi_test = sqi_scores[test_mask]
+
+    # ====================================================
+    # 4. APPLY SQI FILTERS
+    # ====================================================
+    if outlier_filtering_on_train and sqi_scores is not None:
+        print("\n[INFO] Filtering Train Set (Representation Learning)...")
+        X_train, y_train = _apply_outlier_filter(X_train, y_train, sqi_train, sqi_threshold, sqi_keep_pct)
+        # Note: We usually DO NOT filter the Val set to keep early stopping realistic.
+
+    if outlier_filtering_on_test and sqi_scores is not None:
+        print("\n[INFO] Filtering Test Set (Gallery & Probes)...")
+        X_test, y_test = _apply_outlier_filter(X_test, y_test, sqi_test, sqi_threshold, sqi_keep_pct)
+
+    # ====================================================
+    # 5. POST-FILTER SYNCHRONIZATION
+    # ====================================================
+    # Ensure Test subjects still have enough beats AFTER filtering
+    test_subjs_surviving, test_counts = np.unique(y_test, return_counts=True)
+    valid_test_subs = test_subjs_surviving[test_counts >= min_required]
+    
+    dropped_test_subs = len(test_subs) - len(valid_test_subs)
+    if dropped_test_subs > 0:
+        print(f"[WARN] Dropping {dropped_test_subs} Test subjects who lost too many beats during filtering to form a Gallery+Probe.")
+        
+    test_survivor_mask = np.isin(y_test, valid_test_subs)
+    X_test, y_test = X_test[test_survivor_mask], y_test[test_survivor_mask]
+    test_subs_final = valid_test_subs
+    
+    if len(test_subs_final) < 2:
+        raise ValueError("[ERROR] Data filtering was too aggressive. Not enough Test subjects left to evaluate!")
+
+    # Remap Train Labels to 0..N-1 so CrossEntropy is happy
+    y_train_remap, train_classes = _encode_labels(y_train)
+    num_train_classes = len(train_classes)
+    
+    if num_train_classes < 2:
+        raise ValueError("[ERROR] Too few Train subjects remaining after filtering.")
+
+    # ====================================================
+    # 6. LOADERS & CUSTOM TRAINING LOOP
+    # ====================================================
+    train_loader = _make_loader(X_train, y_train_remap, batch_size, shuffle=True)
+    if X_val is not None:
+        val_loader = _make_loader(X_val, y_val, batch_size, shuffle=False)
+    else:
+        X_val, val_loader = None, None
+        
+    test_loader = _make_loader(X_test, y_test, batch_size, shuffle=False)
+    
+    model = model_class(in_channels=_detect_channels(x), num_classes=num_train_classes, include_top=True).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr); criterion = nn.CrossEntropyLoss()
     
-    for ep in range(epochs): 
-        loss = _train_epoch(model, train_loader, optimizer, criterion, device)
-        print(f"Epoch {ep+1}/{epochs} | Loss: {loss:.4f}")
+    best_val_eer = float('inf')
+    patience_counter = 0
+    best_model_state = None
     
+    for ep in range(epochs):
+        model.include_top = True # Extract Logits
+        train_loss = _train_epoch(model, train_loader, optimizer, criterion, device)
+        
+        if val_loader is not None:
+            model.include_top = False # Extract Features
+            val_emb, val_lab = _get_embeddings(model, val_loader, device)
+            
+            # Evaluate Validation Set purely on feature separation (EER)
+            val_scores, val_pairs = _generate_pairs(
+                embeddings1=val_emb, labels1=val_lab, 
+                embeddings2=None, labels2=None, 
+                num_pairs=2000, sampling_mode="balanced", matching_method=matching_method
+            )
+            
+            if len(val_pairs) > 0:
+                fpr, tpr, _ = roc_curve(val_pairs, val_scores)
+                try: val_eer = brentq(lambda x: 1. - x - interp1d(fpr, tpr)(x), 0., 1.)
+                except: val_eer = 1.0
+            else:
+                val_eer = 1.0
+                
+            print(f"Epoch {ep+1}/{epochs} | Train Loss: {train_loss:.4f} | Val EER: {val_eer:.4f}")
+            
+            if val_eer < best_val_eer:
+                best_val_eer = val_eer
+                best_model_state = copy.deepcopy(model.state_dict())
+                patience_counter = 0
+            else:
+                patience_counter += 1
+                
+            if patience_counter >= 10:
+                print(f"--> Early stopping triggered at epoch {ep+1}.")
+                break
+        else:
+            print(f"Epoch {ep+1}/{epochs} | Train Loss: {train_loss:.4f}")
+            best_model_state = copy.deepcopy(model.state_dict())
+            
+    if best_model_state is not None:
+        model.load_state_dict(best_model_state)
+        
+    # ====================================================
+    # 7. FINAL INFERENCE ON UNSEEN TEST SUBJECTS
+    # ====================================================
     model.include_top = False
-    mask_test = np.isin(y, test_subs)
-    X_test, y_test_raw = x[mask_test], y[mask_test]
-    test_loader = _make_loader(X_test, None, batch_size, shuffle=False)
-    emb_test, _ = _get_embeddings(model, test_loader, device)
+    test_emb, test_lab = _get_embeddings(model, test_loader, device)
+
+    print(f"[INFO] Splitting Test Data: First {template_size} beats = Gallery, Rest = Probe")
+    enroll_embs_list, enroll_y_list = [], []
+    probe_embs_list, probe_y_list = [], []
+    
+    # Map disjoint test subject IDs to 0..N_test-1 for the identification metric array
+    test_sub_map = {sub: i for i, sub in enumerate(test_subs_final)}
+    
+    for sub in test_subs_final:
+        sub_idxs = np.where(test_lab == sub)[0]
+        # We already guaranteed sub_idxs > template_size in Step 5!
+        enroll_idx = sub_idxs[:template_size]
+        probe_idx = sub_idxs[template_size:]
+        
+        enroll_embs_list.append(test_emb[enroll_idx])
+        enroll_y_list.append(test_lab[enroll_idx])
+        probe_embs_list.append(test_emb[probe_idx])
+        probe_y_list.append(test_lab[probe_idx])
+
+    emb_enroll = np.vstack(enroll_embs_list)
+    lab_enroll = np.concatenate(enroll_y_list)
+    emb_probe = np.vstack(probe_embs_list)
+    lab_probe = np.concatenate(probe_y_list)
+    
+    # 8. Apply Template Fusion Strategy to the Gallery
+    gallery_emb, gallery_lab = _create_templates(
+        emb_enroll, lab_enroll, method=template_fusion_method, max_beats=None
+    )
+    
+    # 9. Generate Score Matrix for Rank-N Evaluation
+    probe_mapped = np.array([test_sub_map[l] for l in lab_probe])
+    
+    raw_scores = _compute_score_matrix(emb_probe, gallery_emb, method=matching_method)
+    scores = np.full((len(emb_probe), len(test_subs_final)), -np.inf)
+    
+    for class_idx, sub in enumerate(test_subs_final):
+        gallery_mask = (gallery_lab == sub)
+        if np.any(gallery_mask):
+            scores[:, class_idx] = np.max(raw_scores[:, gallery_mask], axis=1)
+
+    # ====================================================
+    # 10. APPLY SCORE-LEVEL FUSION
+    # ====================================================
+    final_scores, final_labels = _apply_score_fusion(
+        scores, probe_mapped, fusion_size=probe_fusion_size
+    )
 
     if visualize:
+        # Visualizing original un-fused test embeddings
         viz = Visualizer()
-        viz.plot_embeddings(emb_test, y_test_raw, title="Verification Embeddings (T-SNE)")
+        viz.plot_embeddings(test_emb, test_lab, title="Unseen Subject Embeddings (T-SNE)")
+
+    rank1, rank5 = _compute_metrics_identification(final_scores, final_labels)
+
+    # Update hyperparams dictionary dynamically using the local 'ep' variable
+    hyperparams['epochs'] = f"{epochs} (stopped at {ep + 1})" if (ep + 1) < epochs else epochs
+
+    if _return_stats: 
+        return (rank1, rank5), data_stats, hyperparams
+
+    if save_results_and_settings:
+        data_stats = {
+            "Train Subjects": len(train_subs),
+            "Train Samples": len(X_train),
+            "Validation Subjects": len(val_subs) if val_subs is not None else 0,
+            "Validation Samples": len(X_val) if X_val is not None else 0,
+            "Test Subjects": len(test_subs_final),
+            "Gallery Size": len(gallery_emb),
+            "Probe Samples": len(emb_probe)
+        }
+        _log_experiment_results(task_title, {"Rank-1 Accuracy": rank1, "Rank-5 Accuracy": rank5}, 
+                                data_stats, hyperparams, loader)
+
+    # 11. Report Identification Metrics
+    return _compute_metrics_identification(final_scores, final_labels)
+
+# =============================================================================
+# TASK 4: SUBJECT-DISJOINT VERIFICATION
+# =============================================================================
+def run_subject_disjoint_verification(x, y, model_class, epochs=30, batch_size=64, lr=1e-3, test_split=0.2, val_split=0.0, 
+                                      num_pairs=10000, sampling_mode="balanced", seed=42, device=None, visualize=False,
+                                      use_template=False, template_fusion_method='mean', template_size=1, matching_method='cosine',
+                                      outlier_filtering_on_train=False, outlier_filtering_on_test=False, sqi_scores=None, 
+                                      sqi_threshold=0.05, sqi_keep_pct=0.8, use_deployment_evaluation=False, 
+                                      save_results_and_settings=False, loader=None, n_runs=1, _return_stats=False):
+    """
+    Subject-Disjoint Verification Pipeline (Open-Set 1:1 Matching).
+    Tests the system's ability to verify the identity of completely new users.
+    The model is trained on Subject Group A and evaluated via pairs constructed from Subject Group B.
+
+    Args:
+        x (np.ndarray): Input ECG signals or features.
+        y (np.ndarray): Subject class labels corresponding to x.
+        model_class (nn.Module): The PyTorch model architecture class to instantiate.
+        epochs (int): Maximum number of training epochs.
+        batch_size (int): Number of samples per training batch.
+        lr (float): Learning rate for the Adam optimizer.
+        test_split (float): Fraction of unique SUBJECTS to hold out for the disjoint test set.
+        val_split (float): Fraction of training subjects to use for early stopping.
+        num_pairs (int): Total number of Genuine and Impostor pairs to generate.
+        sampling_mode (str): Logic used to pair beats together.
+            Options: ['balanced', 'all_genuine', 'random']
+        seed (int): Random seed for reproducibility.
+        device (str): Computation device ('cuda', 'cpu', or 'auto').
+        visualize (bool): If True, generates t-SNE scatter plots of the unseen embeddings.
+        use_template (bool): 
+            - False: "Cloud-based" matching (Random pairs formed entirely within the unseen Test group).
+            - True: "Authentication" simulation (Unseen subjects' later beats matched against their initial beats).
+        template_fusion_method (str): Logic used to create templates if use_template is True.
+            Options: ['mean', 'median', 'trimmed_mean', 'representative', 'none']
+        template_size (int): Number of initial beats to form the enrollment template for unseen subjects.
+        matching_method (str): Distance/Similarity metric used to score the pairs.
+            Options: ['cosine', 'euclidean', 'manhattan', 'correlation']
+        outlier_filtering_on_train (bool): If True, filters noisy beats from the representation learning phase.
+        outlier_filtering_on_test (bool): If True, filters noisy beats from the verification test subjects.
+        sqi_scores (str or np.ndarray): SQI calculation method (e.g., 'kurtosis') or pre-computed array.
+        sqi_threshold (float): Absolute minimum SQI score required to keep a beat (0.0 to 1.0).
+        sqi_keep_pct (float): Top percentage of beats to keep per subject after filtering.
+        use_deployment_evaluation (bool): Uses an unseen validation group to find a Global Threshold.
+        save_results_and_settings (bool): If True, logs results and parameters to a text file.
+        loader (object): Dataset loader instance (used for extracting metadata for logging).
+        n_runs (int): Number of independent runs (with varying seeds) for statistical validation.
+        _return_stats (bool): Internal flag used to pass data back during multi-seed recursion.
+
+    Returns:
+        tuple: (EER, AUC, d-prime, TAR @ 0.1% FAR)
+               If n_runs > 1, returns tuples of (Mean, Std_Dev) for all four metrics.
+    """
+
+    # --- MULTI-RUN AGGREGATOR ---
+    data_stats = {}
+    hyperparams = {
+        'epochs': epochs, 'batch_size': batch_size, 'learning_rate': lr, 'test_split_subjects': test_split, 'val_split': val_split, 'num_pairs': num_pairs,
+        'use_template': use_template, 'template_fusion_method': template_fusion_method, 'template_size': template_size, 
+        'matching_method': matching_method, 'outlier_filter_train': outlier_filtering_on_train, 'outlier_filter_test': outlier_filtering_on_test
+    }
+
+    if n_runs > 1:
+        call_args = locals().copy()
+        for k in ['data_stats', 'hyperparams', 'call_args']: call_args.pop(k, None)
+        call_args.update({'n_runs': 1, '_return_stats': True, 'save_results_and_settings': False})
+        base_seed = call_args.get('seed', 42)
+        results = []
+        
+        print(f"\n[INFO] Starting Multi-Seed Execution ({n_runs} runs)...")
+        for i in range(n_runs):
+            call_args['seed'] = base_seed + i
+            call_args['visualize'] = False 
+            print(f"\n{'='*40}\n RUN {i+1}/{n_runs} (Seed: {call_args['seed']})\n{'='*40}")
+            res, d_stats, h_params = run_subject_disjoint_verification(**call_args) 
+            results.append(res); data_stats = d_stats; hyperparams = h_params
+                
+        metrics_t = list(zip(*results))
+        means, stds = [np.mean(m) for m in metrics_t], [np.std(m) for m in metrics_t]
+        
+        if save_results_and_settings:
+            hyperparams['n_runs'] = n_runs
+            metrics_dict = {
+                "EER": f"{means[0]:.4f} ± {stds[0]:.4f}", "AUC": f"{means[1]:.4f} ± {stds[1]:.4f}", 
+                "d-prime": f"{means[2]:.4f} ± {stds[2]:.4f}", "TAR@0.1%FAR": f"{means[3]:.4f} ± {stds[3]:.4f}"
+            }
+            _log_experiment_results("Subject-Disjoint Verification", metrics_dict, data_stats, hyperparams, loader)
+        return tuple(zip(means, stds))
+    # ----------------------------
+
+    if use_template and template_size is None:
+        template_size = 1
+
+    _set_seed(seed); device = _get_device(device)       
+    task_title = "Subject-Disjoint Verification"        
+    mode_str = f"Template ({template_fusion_method}, First {template_size})" if use_template else "Cloud Pairs (Test Only)"
+    print(f"\n[TASK] {task_title} | Mode: {mode_str} | Match: {matching_method}")
+
     
-    scores, labels_pair = _generate_pairs(normalize(emb_test), y_test_raw, None, None, num_pairs, sampling_mode)
-    if len(scores) == 0: return 1.0, 0.5, 0.0, 0.0
+
+    # ====================================================
+    # 1. DYNAMIC SQI CALCULATION
+    # ====================================================
+    if outlier_filtering_on_train or outlier_filtering_on_test:
+        if sqi_scores is None:
+            print("[WARN] Filtering requested but sqi_scores is None. Skipping filtering entirely.")
+            outlier_filtering_on_train = False
+            outlier_filtering_on_test = False
+        elif isinstance(sqi_scores, str):
+            print(f"[INFO] Calculating SQI using method: '{sqi_scores}'")
+            sqi_scores = np.array(_compute_sqi(x, method=sqi_scores))
+        elif isinstance(sqi_scores, (list, np.ndarray)):
+            sqi_scores = np.array(sqi_scores)
+        else:
+            raise TypeError("[ERROR] sqi_scores must be a string, array, or None.")
+    else:
+        sqi_scores = None
+
+    # ====================================================
+    # 2. PRE-SPLIT CLEANUP 
+    # ====================================================
+    # If using templates, subjects need enough beats for Gallery + Probes.
+    # If not using templates, they just need at least 2 beats to form pairs.
+    min_required = (template_size + 1) if use_template else 2
     
+    unique_classes, counts = np.unique(y, return_counts=True)
+    valid_classes = unique_classes[counts >= min_required]
+    
+    valid_mask = np.isin(y, valid_classes)
+    x, y = x[valid_mask], y[valid_mask]
+    if sqi_scores is not None: 
+        sqi_scores = sqi_scores[valid_mask]
+
+    # ====================================================
+    # 3. SPLIT SUBJECTS (Strictly Disjoint)
+    # ====================================================
+    y_enc, classes = _encode_labels(y)
+    unique_subjs = np.unique(y_enc)
+    
+    train_subs_full, test_subs = train_test_split(unique_subjs, test_size=test_split, random_state=seed)
+    
+    if val_split > 0.0:
+        train_subs, val_subs = train_test_split(train_subs_full, test_size=val_split, random_state=seed)
+        val_mask = np.isin(y_enc, val_subs)
+        X_val, y_val = x[val_mask], y_enc[val_mask]
+        if sqi_scores is not None: sqi_val = sqi_scores[val_mask]
+        print(f"Subject Split: Train={len(train_subs)}, Val={len(val_subs)}, Test={len(test_subs)}")
+    else:
+        train_subs = train_subs_full
+        X_val, y_val, sqi_val, val_subs = None, None, None, None
+        print(f"Subject Split: Train={len(train_subs)}, Val=0, Test={len(test_subs)}")
+
+    train_mask = np.isin(y_enc, train_subs)
+    X_train, y_train = x[train_mask], y_enc[train_mask]
+    if sqi_scores is not None: sqi_train = sqi_scores[train_mask]
+    
+    test_mask = np.isin(y_enc, test_subs)
+    X_test, y_test = x[test_mask], y_enc[test_mask]
+    if sqi_scores is not None: sqi_test = sqi_scores[test_mask]
+
+    # ====================================================
+    # 4. APPLY SQI FILTERS
+    # ====================================================
+    if outlier_filtering_on_train and sqi_scores is not None:
+        print("\n[INFO] Filtering Train Set (Representation Learning)...")
+        X_train, y_train = _apply_outlier_filter(X_train, y_train, sqi_train, sqi_threshold, sqi_keep_pct)
+
+    if outlier_filtering_on_test and sqi_scores is not None:
+        print("\n[INFO] Filtering Test Set (Probes)...")
+        X_test, y_test = _apply_outlier_filter(X_test, y_test, sqi_test, sqi_threshold, sqi_keep_pct)
+
+    # ====================================================
+    # 5. POST-FILTER SYNCHRONIZATION
+    # ====================================================
+    test_subjs_surviving, test_counts = np.unique(y_test, return_counts=True)
+    valid_test_subs = test_subjs_surviving[test_counts >= min_required]
+    
+    dropped_test_subs = len(test_subs) - len(valid_test_subs)
+    if dropped_test_subs > 0:
+        print(f"[WARN] Dropping {dropped_test_subs} Test subjects who lost too many beats during filtering.")
+        
+    test_survivor_mask = np.isin(y_test, valid_test_subs)
+    X_test, y_test = X_test[test_survivor_mask], y_test[test_survivor_mask]
+    test_subs_final = valid_test_subs
+    
+    if len(test_subs_final) < 2:
+        raise ValueError("[ERROR] Data filtering was too aggressive. Not enough Test subjects left to evaluate!")
+
+    y_train_remap, train_classes = _encode_labels(y_train)
+    num_train_classes = len(train_classes)
+    
+    if num_train_classes < 2:
+        raise ValueError("[ERROR] Too few Train subjects remaining after filtering.")
+
+    # ====================================================
+    # 6. LOADERS & CUSTOM TRAINING LOOP
+    # ====================================================
+    train_loader = _make_loader(X_train, y_train_remap, batch_size, shuffle=True)
+    if X_val is not None:
+        val_loader = _make_loader(X_val, y_val, batch_size, shuffle=False)
+    else:
+        X_val, val_loader = None, None
+        
+    test_loader = _make_loader(X_test, y_test, batch_size, shuffle=False)
+    
+    model = model_class(in_channels=_detect_channels(x), num_classes=num_train_classes, include_top=True).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr); criterion = nn.CrossEntropyLoss()
+    
+    best_val_eer = float('inf')
+    patience_counter = 0
+    best_model_state = None
+    
+    for ep in range(epochs):
+        # A. Train Epoch (Classification on Known Subjects)
+        model.include_top = True
+        train_loss = _train_epoch(model, train_loader, optimizer, criterion, device)
+        
+        if val_loader is not None:
+            # B. Validate Epoch (Verification EER on Unseen Val Subjects)
+            model.include_top = False # Crucial: Extract features, not logits!
+            val_emb, val_lab = _get_embeddings(model, val_loader, device)
+            
+            # Generate pairs for validation (using fewer pairs for speed)
+            val_scores, val_pairs = _generate_pairs(
+                embeddings1=val_emb, labels1=val_lab, 
+                embeddings2=None, labels2=None, 
+                num_pairs=min(2000, num_pairs), # Cap at 2000 pairs to keep epochs fast
+                sampling_mode="balanced", matching_method=matching_method
+            )
+            
+            # Calculate EER silently
+            if len(val_pairs) > 0:
+                fpr, tpr, _ = roc_curve(val_pairs, val_scores)
+                try: val_eer = brentq(lambda x: 1. - x - interp1d(fpr, tpr)(x), 0., 1.)
+                except: val_eer = 1.0
+            else:
+                val_eer = 1.0
+                
+            print(f"Epoch {ep+1}/{epochs} | Train Loss: {train_loss:.4f} | Val EER: {val_eer:.4f}")
+            
+            # Check for improvement
+            if val_eer < best_val_eer:
+                best_val_eer = val_eer
+                best_model_state = copy.deepcopy(model.state_dict())
+                patience_counter = 0
+            else:
+                patience_counter += 1
+                
+            if patience_counter >= 10:
+                print(f"--> Early stopping triggered at epoch {ep+1}.")
+                break
+        else:
+            print(f"Epoch {ep+1}/{epochs} | Train Loss: {train_loss:.4f}")
+            best_model_state = copy.deepcopy(model.state_dict())
+            
+    if best_model_state is not None:
+        model.load_state_dict(best_model_state)
+
+    # ====================================================
+    # 7. MODEL CALIBRATION (Optional)
+    # ====================================================
+    model.include_top = False
+    
+    if use_deployment_evaluation:
+        print("\n[INFO] --- REAL-WORLD DEPLOYMENT EVALUATION ---")
+        if val_split <= 0.0 or val_loader is None:
+            print("[WARN] No validation set provided (val_split=0.0). Falling back to the Training set.")
+            print("[WARN] NOTE: Using training data to find the threshold yields overly optimistic results. A separate validation set is strongly recommended!")
+            calib_loader = train_loader
+            calib_name = "Train (Fallback)"
+        else:
+            calib_loader = val_loader
+            calib_name = "Validation"
+        
+        print(f"[INFO] Extracting features for Calibration ({calib_name} Set)...")
+        calib_emb, calib_lab = _get_embeddings(model, calib_loader, device)
+        
+        print(f"[INFO] Generating Calibration Pairs to find Global Threshold...")
+        calib_scores, calib_pair_labels = _generate_pairs(
+            embeddings1=calib_emb, labels1=calib_lab, embeddings2=None, labels2=None,
+            num_pairs=num_pairs, sampling_mode=sampling_mode, matching_method=matching_method
+        )
+        global_threshold = _find_optimal_threshold(calib_scores, calib_pair_labels)
+        print(f"[INFO] Optimal Global Threshold Found: {global_threshold:.4f}")
+        
+    # ====================================================
+    # 8. FINAL INFERENCE ON UNSEEN TEST SUBJECTS
+    # ====================================================
+    test_emb, test_lab = _get_embeddings(model, test_loader, device)
+
+    # 9. Evaluation Strategy
+    if not use_template:
+        print(f"[INFO] Bypassing Templates. Generating pairs entirely from Unseen Test Subjects...")
+        scores, labels_pair = _generate_pairs(
+            embeddings1=test_emb, labels1=test_lab, 
+            embeddings2=None, labels2=None, 
+            num_pairs=num_pairs, sampling_mode=sampling_mode, matching_method=matching_method
+        )
+    else:
+        print(f"[INFO] Splitting Test Data: First {template_size} beats = Enroll, Rest = Probe")
+        enroll_embs_list, enroll_y_list = [], []
+        probe_embs_list, probe_y_list = [], []
+        
+        # Use test_subs_final to guarantee valid indexing
+        for sub in test_subs_final:
+            sub_idxs = np.where(test_lab == sub)[0]
+            
+            enroll_idx = sub_idxs[:template_size]
+            probe_idx = sub_idxs[template_size:]
+            
+            enroll_embs_list.append(test_emb[enroll_idx])
+            enroll_y_list.append(test_lab[enroll_idx])
+            probe_embs_list.append(test_emb[probe_idx])
+            probe_y_list.append(test_lab[probe_idx])
+            
+        if len(enroll_embs_list) == 0:
+            print("[WARN] Not enough beats per subject for this template size.")
+            return 0.0, 0.0, 0.0, 0.0
+
+        emb_enroll = np.vstack(enroll_embs_list)
+        lab_enroll = np.concatenate(enroll_y_list)
+        emb_probe = np.vstack(probe_embs_list)
+        lab_probe = np.concatenate(probe_y_list)
+        
+        templates, temp_labels = _create_templates(
+            emb_enroll, lab_enroll, method=template_fusion_method, max_beats=None
+        )
+        
+        scores, labels_pair = _generate_pairs(
+            embeddings1=emb_probe, labels1=lab_probe, 
+            embeddings2=templates, labels2=temp_labels, 
+            num_pairs=num_pairs, sampling_mode=sampling_mode, matching_method=matching_method
+        )
+        
+    if visualize:
+        viz = Visualizer()
+        viz.plot_embeddings(test_emb, test_lab, title="Unseen Subject Embeddings (T-SNE)")
+
+    if use_deployment_evaluation:
+        _evaluate_with_global_threshold(scores, labels_pair, global_threshold)
+
+    eer, auc_val, dprime, tar = _compute_metrics_verification(scores, labels_pair)
+
+    # Update hyperparams dictionary dynamically using the local 'ep' variable
+    hyperparams['epochs'] = f"{epochs} (stopped at {ep + 1})" if (ep + 1) < epochs else epochs
+    
+    if _return_stats: 
+        return (eer, auc_val, dprime, tar), data_stats, hyperparams
+
+    if save_results_and_settings:
+        data_stats = {
+            "Train Subjects": len(train_subs), "Train Samples": len(X_train),
+            "Test Subjects": len(test_subs_final), "Test Pairs Evaluated": len(labels_pair)
+        }
+        _log_experiment_results(task_title, {"EER": eer, "AUC": auc_val, "d-prime": dprime, "TAR@0.1%FAR": tar}, 
+                                data_stats, hyperparams, loader)
+
     return _compute_metrics_verification(scores, labels_pair)
 
 # =============================================================================
 # TASK 5: CROSS-SESSION IDENTIFICATION
 # =============================================================================
-def run_cross_session_identification(x_train, y_train, x_test, y_test, model_class, epochs=30, batch_size=64, lr=1e-3, seed=42, device=None, visualize=False):
+def run_cross_session_identification(x_train, y_train, x_test, y_test, model_class, epochs=30, batch_size=64, lr=1e-3, 
+                                     val_split=0.0, seed=42, device=None, visualize=False, use_template=False, 
+                                     template_fusion_method='mean', template_size=None, matching_method='cosine',
+                                     outlier_filtering_on_train=False, outlier_filtering_on_test=False, sqi_train=None, 
+                                     sqi_test=None, sqi_threshold=0.05, sqi_keep_pct=0.8, probe_fusion_size=1, 
+                                     save_results_and_settings=False, loader=None, n_runs=1, _return_stats=False):
     """
-    Train on Session 1 (Enrollment) -> Identify in Session 2 (Probe).
-    Only evaluates on subjects present in BOTH sessions.
+    Cross-Session Identification Pipeline (Temporal Robustness).
+    Evaluates system robustness against physiological aging and sensor variations over time.
+    Trains the model on Session 1 (Enrollment) and identifies subjects using Session 2 (Probes).
+
+    Args:
+        x_train (np.ndarray): Input ECG signals from Session 1.
+        y_train (np.ndarray): Labels for Session 1.
+        x_test (np.ndarray): Input ECG signals from Session 2.
+        y_test (np.ndarray): Labels for Session 2.
+        model_class (nn.Module): The PyTorch model architecture class to instantiate.
+        epochs (int): Maximum number of training epochs.
+        batch_size (int): Number of samples per training batch.
+        lr (float): Learning rate for the Adam optimizer.
+        val_split (float): Fraction of Session 1 data to use for early stopping.
+        seed (int): Random seed for reproducibility.
+        device (str): Computation device ('cuda', 'cpu', or 'auto').
+        visualize (bool): If True, generates t-SNE scatter plots of the cross-session embeddings.
+        use_template (bool): 
+            - False: Uses the Session 1 Softmax classification weights to classify Session 2 data.
+            - True: Uses Session 1 features to form a gallery, and metric-matches Session 2 probes.
+        template_fusion_method (str): Logic used to create the Session 1 gallery template.
+            Options: ['mean', 'median', 'trimmed_mean', 'representative', 'none']
+        template_size (int, optional): Number of Session 1 beats used for enrollment. None uses all available.
+        matching_method (str): Distance/Similarity metric for template matching.
+            Options: ['cosine', 'euclidean', 'manhattan', 'correlation']
+        outlier_filtering_on_train (bool): Apply SQI filtering independently to Session 1.
+        outlier_filtering_on_test (bool): Apply SQI filtering independently to Session 2.
+        sqi_train (str or np.ndarray): SQI calculation method or pre-computed array for Session 1.
+        sqi_test (str or np.ndarray): SQI calculation method or pre-computed array for Session 2.
+        sqi_threshold (float): Absolute minimum SQI score required to keep a beat (0.0 to 1.0).
+        sqi_keep_pct (float): Top percentage of beats to keep per subject after filtering.
+        probe_fusion_size (int): Number of consecutive Session 2 beats to average before making a decision.
+        save_results_and_settings (bool): If True, logs results and parameters to a text file.
+        loader (object): Dataset loader instance (used for extracting metadata for logging).
+        n_runs (int): Number of independent runs (with varying seeds) for statistical validation.
+        _return_stats (bool): Internal flag used to pass data back during multi-seed recursion.
+
+    Returns:
+        tuple: (Rank-1 Accuracy, Rank-5 Accuracy)
+               If n_runs > 1, returns tuples of (Mean, Std_Dev) for both metrics.
     """
+    # --- MULTI-RUN AGGREGATOR ---
+    data_stats = {}
+    hyperparams = {
+        'epochs': epochs, 'batch_size': batch_size, 'learning_rate': lr, 'use_template': use_template, 
+        'template_fusion_method': template_fusion_method, 'template_size': template_size, 
+        'matching_method': matching_method, 'probe_fusion_size': probe_fusion_size, 'val_split': val_split,
+        'outlier_filter_train': outlier_filtering_on_train, 'outlier_filter_test': outlier_filtering_on_test
+    }
+
+    if n_runs > 1:
+        call_args = locals().copy()
+        for k in ['data_stats', 'hyperparams', 'call_args']: call_args.pop(k, None)
+        call_args.update({'n_runs': 1, '_return_stats': True, 'save_results_and_settings': False})
+        base_seed = call_args.get('seed', 42)
+        results = []
+        
+        print(f"\n[INFO] Starting Multi-Seed Execution ({n_runs} runs)...")
+        for i in range(n_runs):
+            call_args['seed'] = base_seed + i
+            call_args['visualize'] = False 
+            print(f"\n{'='*40}\n RUN {i+1}/{n_runs} (Seed: {call_args['seed']})\n{'='*40}")
+            res, d_stats, h_params = run_cross_session_identification(**call_args) 
+            results.append(res); data_stats = d_stats; hyperparams = h_params
+                
+        r1_mean, r1_std = np.mean([r[0] for r in results]), np.std([r[0] for r in results])
+        r5_mean, r5_std = np.mean([r[1] for r in results]), np.std([r[1] for r in results])
+        
+        if save_results_and_settings:
+            hyperparams['n_runs'] = n_runs
+            metrics_dict = {"Rank-1 Accuracy": f"{r1_mean:.4f} ± {r1_std:.4f}", "Rank-5 Accuracy": f"{r5_mean:.4f} ± {r5_std:.4f}"}
+            _log_experiment_results("Cross-Session Identification", metrics_dict, data_stats, hyperparams, loader)
+        return (r1_mean, r1_std), (r5_mean, r5_std)
+    # ----------------------------
+
     _set_seed(seed); device = _get_device(device)
-    print(f"\n[TASK] Cross-Session Identification (Rank-1/Rank-5) on {device}")
+    task_title = "Cross-Session Identification"
+    mode_str = f"Template ({template_fusion_method}, size={template_size or 'All'})" if use_template else "Softmax Classifier"
+    print(f"\n[TASK] {task_title} | Mode: {mode_str} | Match: {matching_method if use_template else 'N/A'}")
     
-    train_subs, test_subs = np.unique(y_train), np.unique(y_test)
-    common_subs = np.intersect1d(train_subs, test_subs)
-    if len(common_subs) == 0: raise ValueError("No overlapping subjects!")
-    common_subs.sort()
+    # ====================================================
+    # 1. DYNAMIC SQI CALCULATION (Independent Sessions)
+    # ====================================================
+    def _prepare_sqi(sqi_input, x_data, flag, name):
+        if not flag: return None
+        if sqi_input is None:
+            print(f"[WARN] Filtering requested for {name} but sqi scores are None. Skipping {name} filtering.")
+            return None
+        if isinstance(sqi_input, str):
+            print(f"[INFO] Calculating SQI for {name} using method: '{sqi_input}'")
+            return np.array(_compute_sqi(x_data, method=sqi_input))
+        if isinstance(sqi_input, (list, np.ndarray)):
+            return np.array(sqi_input)
+        raise TypeError(f"[ERROR] sqi_{name.lower()} must be a string, array, or None.")
+
+    sqi_train = _prepare_sqi(sqi_train, x_train, outlier_filtering_on_train, "Train")
+    sqi_test = _prepare_sqi(sqi_test, x_test, outlier_filtering_on_test, "Test")
+
+    # ====================================================
+    # 2. APPLY SQI FILTERS
+    # ====================================================
+    if sqi_train is not None:
+        print("\n[INFO] Filtering Session 1 (Enrollment)...")
+        x_train, y_train = _apply_outlier_filter(x_train, y_train, sqi_train, sqi_threshold, sqi_keep_pct)
+
+    if sqi_test is not None:
+        print("\n[INFO] Filtering Session 2 (Probes)...")
+        x_test, y_test = _apply_outlier_filter(x_test, y_test, sqi_test, sqi_threshold, sqi_keep_pct)
+
+    # ====================================================
+    # 3. INTERSECT SUBJECTS (Post-Filter Sync)
+    # ====================================================
+    train_subs = set(y_train)
+    test_subs = set(y_test)
+    common_subs = sorted(list(train_subs.intersection(test_subs)))
     
-    # Remap labels to 0..N for the common subset
-    cls_map = {s: i for i, s in enumerate(common_subs)}
+    if len(common_subs) < 2: 
+        print("[WARN] Not enough common subjects between sessions after filtering.")
+        return 0.0, 0.0
     
-    mask_train = np.isin(y_train, common_subs)
-    X_train_filt, y_train_filt = x_train[mask_train], y_train[mask_train]
-    y_train_enc = np.array([cls_map[s] for s in y_train_filt])
+    train_mask = np.isin(y_train, common_subs)
+    test_mask = np.isin(y_test, common_subs)
     
-    mask_test = np.isin(y_test, common_subs)
-    X_test_filt, y_test_filt = x_test[mask_test], y_test[mask_test]
-    y_test_enc = np.array([cls_map[s] for s in y_test_filt])
+    x_train_full, y_train_full = x_train[train_mask], y_train[train_mask]
+    x_test_filtered, y_test_filtered = x_test[test_mask], y_test[test_mask]
+
+    # Pre-split cleanup: Ensure Train classes have >= 2 beats so stratify doesn't crash
+    unique_classes, counts = np.unique(y_train_full, return_counts=True)
+    valid_classes = unique_classes[counts >= 2]
     
-    train_loader = _make_loader(X_train_filt, y_train_enc, batch_size, shuffle=True)
-    test_loader = _make_loader(X_test_filt, y_test_enc, batch_size, shuffle=False)
+    if len(valid_classes) < len(common_subs):
+        dropped = len(common_subs) - len(valid_classes)
+        print(f"[WARN] Dropping {dropped} subjects who have fewer than 2 beats left in Session 1.")
+        
+    final_train_mask = np.isin(y_train_full, valid_classes)
+    final_test_mask = np.isin(y_test_filtered, valid_classes) # Sync Session 2 again!
     
-    model = model_class(in_channels=_detect_channels(x_train), num_classes=len(common_subs), include_top=True).to(device)
+    x_train_full, y_train_full = x_train_full[final_train_mask], y_train_full[final_train_mask]
+    x_test_filtered, y_test_filtered = x_test_filtered[final_test_mask], y_test_filtered[final_test_mask]
+
+    # ====================================================
+    # 4. ENCODE LABELS
+    # ====================================================
+    # Encode Labels to 0..N-1 based strictly on the surviving training set classes
+    y_train_enc, classes = _encode_labels(y_train_full)
+    label_map = {c: i for i, c in enumerate(classes)}
+    y_test_enc = np.array([label_map[l] for l in y_test_filtered])
+    
+    # ====================================================
+    # 5. RESUME STANDARD PIPELINE
+    # ====================================================
+    # Validation Split (from Session 1)
+    if val_split > 0.0:
+        X_tr, X_val, y_tr, y_val = train_test_split(
+            x_train_full, y_train_enc, test_size=val_split, stratify=y_train_enc, random_state=seed
+        )
+        val_loader = _make_loader(X_val, y_val, batch_size, shuffle=False)
+        print(f"Session 1 Split: Train={len(X_tr)}, Val={len(X_val)} | Session 2 Probes={len(x_test_filtered)}")
+    else:
+        X_tr, y_tr = x_train_full, y_train_enc
+        X_val, val_loader = None, None
+        print(f"Session 1 Split: Train={len(X_tr)}, Val=0 | Session 2 Probes={len(x_test_filtered)}")
+
+    train_loader = _make_loader(X_tr, y_tr, batch_size, shuffle=True)
+    probe_loader = _make_loader(x_test_filtered, y_test_enc, batch_size, shuffle=False)
+    
+    # Train Model
+    model = model_class(in_channels=_detect_channels(x_train_full), num_classes=len(classes), include_top=True).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr); criterion = nn.CrossEntropyLoss()
     
-    for ep in range(epochs): 
-        loss = _train_epoch(model, train_loader, optimizer, criterion, device)
-        print(f"Epoch {ep+1}/{epochs} | Loss: {loss:.4f}")
+    model = _run_training_loop(model, train_loader, val_loader, optimizer, criterion, device, epochs, patience=10)
     
-    model.eval()
-    all_probs, all_trues = [], []
-    with torch.no_grad():
-        for xb, yb in test_loader:
-            xb = xb.to(device)
-            probs = torch.softmax(model(xb), dim=1)
-            all_probs.append(probs.cpu().numpy())
-            all_trues.append(yb.numpy())
-            
-    all_probs = np.vstack(all_probs)
-    all_trues = np.concatenate(all_trues)
-    
-    if visualize:
-        viz = Visualizer()
-        preds = np.argmax(all_probs, axis=1)
-        viz.plot_confusion_matrix(all_trues, preds, normalize=True)
+    # ====================================================
+    # 6. EVALUATION STRATEGY
+    # ====================================================
+    if not use_template:
+        # STRATEGY A: Standard Softmax Classification
+        print("[INFO] Bypassing Templates. Using standard Softmax Classifier trained on Session 1...")
+        model.eval()
+        all_probs, all_trues = [], []
+        with torch.no_grad():
+            for xb, yb in probe_loader:
+                xb = xb.to(device)
+                probs = torch.softmax(model(xb), dim=1)
+                all_probs.append(probs.cpu().numpy())
+                all_trues.append(yb.cpu().numpy())
+        final_scores = np.vstack(all_probs)
+        final_labels = np.concatenate(all_trues)
         
-    return _compute_metrics_identification(all_probs, all_trues)
+    else:
+        # STRATEGY B: Template Matching
+        print(f"[INFO] Building Enrollment Templates from Session 1...")
+        model.include_top = False # Switch to Feature Extractor
+        
+        enroll_loader = _make_loader(x_train_full, y_train_enc, batch_size, shuffle=False)
+        emb_enroll, lab_enroll = _get_embeddings(model, enroll_loader, device)
+        
+        gallery_emb, gallery_lab = _create_templates(
+            emb_enroll, lab_enroll, method=template_fusion_method, max_beats=template_size
+        )
+        
+        emb_probe, lab_probe = _get_embeddings(model, probe_loader, device)
+
+        # raw_scores shape: (N_Probes, N_Gallery_Items)
+        raw_scores = _compute_score_matrix(emb_probe, gallery_emb, method=matching_method)
+        
+        # Collapse raw_scores into class scores cleanly
+        scores = np.full((len(emb_probe), len(classes)), -np.inf)
+        for class_idx in range(len(classes)):
+            gallery_mask = (gallery_lab == class_idx)
+            if np.any(gallery_mask):
+                scores[:, class_idx] = np.max(raw_scores[:, gallery_mask], axis=1)
+                
+        final_scores = scores
+        final_labels = lab_probe
+        
+        # Restore model
+        model.include_top = True
+
+    # ====================================================
+    # 7. APPLY SCORE-LEVEL FUSION
+    # ====================================================
+    final_scores, final_labels = _apply_score_fusion(
+        final_scores, final_labels, fusion_size=probe_fusion_size
+    )
+
+    if visualize and use_template:
+        viz = Visualizer()
+        viz.plot_embeddings(emb_probe, final_labels, title="Cross-Session Probe Embeddings (T-SNE)")
+
+    rank1, rank5 = _compute_metrics_identification(final_scores, final_labels)
+
+    # Update hyperparams dictionary dynamically
+    hyperparams['epochs'] = f"{epochs} (stopped at {model.actual_epochs})" if model.actual_epochs < epochs else epochs
+
+    if _return_stats: 
+        return (rank1, rank5), data_stats, hyperparams
+
+    if save_results_and_settings:
+        data_stats = {
+            "Total Cross-Session Subjects": len(classes),
+            "Enrollment (S1) Samples": len(x_train_full),
+            "Probe (S2) Samples": len(x_test_filtered)
+        }
+        _log_experiment_results(task_title, {"Rank-1 Accuracy": rank1, "Rank-5 Accuracy": rank5}, 
+                                data_stats, hyperparams, loader)
+
+    # 8. Report Identification Metrics
+    return _compute_metrics_identification(final_scores, final_labels)
 
 # =============================================================================
 # TASK 6: CROSS-SESSION VERIFICATION
 # =============================================================================
-def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class, epochs=30, batch_size=64, lr=1e-3, num_pairs=10000, sampling_mode="balanced", seed=42, device=None, visualize=False):
+def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class, epochs=30, batch_size=64, lr=1e-3, 
+                                   val_split=0.0, num_pairs=10000, sampling_mode="balanced", seed=42, device=None, 
+                                   visualize=False, use_template=False, template_fusion_method='mean', template_size=None, 
+                                   matching_method='cosine', outlier_filtering_on_train=False, outlier_filtering_on_test=False, 
+                                   sqi_train=None, sqi_test=None, sqi_threshold=0.05, sqi_keep_pct=0.8, 
+                                   use_deployment_evaluation=False, save_results_and_settings=False, loader=None, 
+                                   n_runs=1, _return_stats=False):
     """
-    Train on S1 -> Generate Embeddings for S1 and S2 -> Pair S1 vs S2.
+    Cross-Session Verification Pipeline (Temporal Robustness 1:1).
+    Attempts to verify if a subject is who they claim to be across different time-separated recording sessions.
+
+    Args:
+        x_train (np.ndarray): Input ECG signals from Session 1.
+        y_train (np.ndarray): Labels for Session 1.
+        x_test (np.ndarray): Input ECG signals from Session 2.
+        y_test (np.ndarray): Labels for Session 2.
+        model_class (nn.Module): The PyTorch model architecture class to instantiate.
+        epochs (int): Maximum number of training epochs.
+        batch_size (int): Number of samples per training batch.
+        lr (float): Learning rate for the Adam optimizer.
+        val_split (float): Fraction of Session 1 data to use for early stopping.
+        num_pairs (int): Total number of Genuine and Impostor pairs to generate.
+        sampling_mode (str): Logic used to pair beats together.
+            Options: ['balanced', 'all_genuine', 'random']
+        seed (int): Random seed for reproducibility.
+        device (str): Computation device ('cuda', 'cpu', or 'auto').
+        visualize (bool): If True, generates t-SNE scatter plots of the cross-session embeddings.
+        use_template (bool):
+            - False: Evaluates raw temporal space (Session 2 beats paired vs other Session 2 beats).
+            - True: Simulates Authentication (Session 2 probes paired against Session 1 enrollment templates).
+        template_fusion_method (str): Logic used to create the Session 1 templates.
+            Options: ['mean', 'median', 'trimmed_mean', 'representative', 'none']
+        template_size (int, optional): Number of Session 1 beats used for enrollment. None uses all available.
+        matching_method (str): Distance/Similarity metric used to score the pairs.
+            Options: ['cosine', 'euclidean', 'manhattan', 'correlation']
+        outlier_filtering_on_train (bool): Apply SQI filtering independently to Session 1.
+        outlier_filtering_on_test (bool): Apply SQI filtering independently to Session 2.
+        sqi_train (str or np.ndarray): SQI calculation method or pre-computed array for Session 1.
+        sqi_test (str or np.ndarray): SQI calculation method or pre-computed array for Session 2.
+        sqi_threshold (float): Absolute minimum SQI score required to keep a beat (0.0 to 1.0).
+        sqi_keep_pct (float): Top percentage of beats to keep per subject after filtering.
+        use_deployment_evaluation (bool): Uses Session 1 Validation data to calculate a Global Threshold.
+        save_results_and_settings (bool): If True, logs results and parameters to a text file.
+        loader (object): Dataset loader instance (used for extracting metadata for logging).
+        n_runs (int): Number of independent runs (with varying seeds) for statistical validation.
+        _return_stats (bool): Internal flag used to pass data back during multi-seed recursion.
+
+    Returns:
+        tuple: (EER, AUC, d-prime, TAR @ 0.1% FAR)
+               If n_runs > 1, returns tuples of (Mean, Std_Dev) for all four metrics.
     """
+    # --- MULTI-RUN AGGREGATOR ---
+    data_stats = {}
+    hyperparams = {
+        'epochs': epochs, 'batch_size': batch_size, 'learning_rate': lr, 'num_pairs': num_pairs, 'use_template': use_template, 
+        'template_fusion_method': template_fusion_method, 'template_size': template_size, 
+        'matching_method': matching_method, 'val_split': val_split,
+        'outlier_filter_train': outlier_filtering_on_train, 'outlier_filter_test': outlier_filtering_on_test
+    }
+
+    if n_runs > 1:
+        call_args = locals().copy()
+        for k in ['data_stats', 'hyperparams', 'call_args']: call_args.pop(k, None)
+        call_args.update({'n_runs': 1, '_return_stats': True, 'save_results_and_settings': False})
+        base_seed = call_args.get('seed', 42)
+        results = []
+        
+        print(f"\n[INFO] Starting Multi-Seed Execution ({n_runs} runs)...")
+        for i in range(n_runs):
+            call_args['seed'] = base_seed + i
+            call_args['visualize'] = False 
+            print(f"\n{'='*40}\n RUN {i+1}/{n_runs} (Seed: {call_args['seed']})\n{'='*40}")
+            res, d_stats, h_params = run_cross_session_verification(**call_args) 
+            results.append(res); data_stats = d_stats; hyperparams = h_params
+                
+        metrics_t = list(zip(*results))
+        means, stds = [np.mean(m) for m in metrics_t], [np.std(m) for m in metrics_t]
+        
+        if save_results_and_settings:
+            hyperparams['n_runs'] = n_runs
+            metrics_dict = {
+                "EER": f"{means[0]:.4f} ± {stds[0]:.4f}", "AUC": f"{means[1]:.4f} ± {stds[1]:.4f}", 
+                "d-prime": f"{means[2]:.4f} ± {stds[2]:.4f}", "TAR@0.1%FAR": f"{means[3]:.4f} ± {stds[3]:.4f}"
+            }
+            _log_experiment_results("Cross-Session Verification", metrics_dict, data_stats, hyperparams, loader)
+        return tuple(zip(means, stds))
+    # ----------------------------
+
     _set_seed(seed); device = _get_device(device)
-    print(f"\n[TASK] Cross-Session Verification on {device}")
+    task_title = "Cross-Session Verification"
+    mode_str = f"Template ({template_fusion_method}, size={template_size or 'All'})" if use_template else "Cloud Pairs (Session 2 Only)"
+    print(f"\n[TASK] {task_title} | Mode: {mode_str} | Match: {matching_method}")
+
+    # ====================================================
+    # 1. DYNAMIC SQI CALCULATION (Independent Sessions)
+    # ====================================================
+    def _prepare_sqi(sqi_input, x_data, flag, name):
+        if not flag: return None
+        if sqi_input is None:
+            print(f"[WARN] Filtering requested for {name} but sqi scores are None. Skipping {name} filtering.")
+            return None
+        if isinstance(sqi_input, str):
+            print(f"[INFO] Calculating SQI for {name} using method: '{sqi_input}'")
+            return np.array(_compute_sqi(x_data, method=sqi_input))
+        if isinstance(sqi_input, (list, np.ndarray)):
+            return np.array(sqi_input)
+        raise TypeError(f"[ERROR] sqi_{name.lower()} must be a string, array, or None.")
+
+    sqi_train = _prepare_sqi(sqi_train, x_train, outlier_filtering_on_train, "Train")
+    sqi_test = _prepare_sqi(sqi_test, x_test, outlier_filtering_on_test, "Test")
+
+    # ====================================================
+    # 2. APPLY SQI FILTERS
+    # ====================================================
+    if sqi_train is not None:
+        print("\n[INFO] Filtering Session 1 (Enrollment)...")
+        x_train, y_train = _apply_outlier_filter(x_train, y_train, sqi_train, sqi_threshold, sqi_keep_pct)
+
+    if sqi_test is not None:
+        print("\n[INFO] Filtering Session 2 (Probes)...")
+        x_test, y_test = _apply_outlier_filter(x_test, y_test, sqi_test, sqi_threshold, sqi_keep_pct)
+
+    # ====================================================
+    # 3. INTERSECT SUBJECTS (Post-Filter Sync)
+    # ====================================================
+    train_subs = set(y_train)
+    test_subs = set(y_test)
+    common_subs = sorted(list(train_subs.intersection(test_subs)))
     
-    # Train on Combined Data (or just S1) to learn identity features
-    all_labels = np.concatenate([y_train, y_test])
-    unique_labels = np.unique(all_labels)
-    label_to_int = {label: i for i, label in enumerate(unique_labels)}
-    y_train_int = np.array([label_to_int[l] for l in y_train])
+    if len(common_subs) < 2: 
+        print("[WARN] Not enough common subjects between sessions after filtering.")
+        return 0.0, 0.0, 0.0, 0.0
     
-    train_loader = _make_loader(x_train, y_train_int, batch_size, shuffle=True)
-    model = model_class(in_channels=_detect_channels(x_train), num_classes=len(label_to_int), include_top=True).to(device)
+    train_mask = np.isin(y_train, common_subs)
+    test_mask = np.isin(y_test, common_subs)
+    
+    x_train_full, y_train_full = x_train[train_mask], y_train[train_mask]
+    x_test_filtered, y_test_filtered = x_test[test_mask], y_test[test_mask]
+
+    unique_classes, counts = np.unique(y_train_full, return_counts=True)
+    valid_classes = unique_classes[counts >= 2]
+    
+    if len(valid_classes) < len(common_subs):
+        dropped = len(common_subs) - len(valid_classes)
+        print(f"[WARN] Dropping {dropped} subjects who have fewer than 2 beats left in Session 1.")
+        
+    final_train_mask = np.isin(y_train_full, valid_classes)
+    final_test_mask = np.isin(y_test_filtered, valid_classes) # Sync Session 2 again!
+    
+    x_train_full, y_train_full = x_train_full[final_train_mask], y_train_full[final_train_mask]
+    x_test_filtered, y_test_filtered = x_test_filtered[final_test_mask], y_test_filtered[final_test_mask]
+
+    # ====================================================
+    # 4. ENCODE LABELS
+    # ====================================================
+    y_train_enc, classes = _encode_labels(y_train_full)
+    label_map = {c: i for i, c in enumerate(classes)}
+    y_test_enc = np.array([label_map[l] for l in y_test_filtered])
+    
+    # ====================================================
+    # 5. RESUME STANDARD PIPELINE
+    # ====================================================
+    if val_split > 0.0:
+        X_tr, X_val, y_tr, y_val = train_test_split(
+            x_train_full, y_train_enc, test_size=val_split, stratify=y_train_enc, random_state=seed
+        )
+        val_loader = _make_loader(X_val, y_val, batch_size, shuffle=False)
+        print(f"Session 1 Split: Train={len(X_tr)}, Val={len(X_val)} | Session 2 Probes={len(x_test_filtered)}")
+    else:
+        X_tr, y_tr = x_train_full, y_train_enc
+        X_val, val_loader = None, None
+        print(f"Session 1 Split: Train={len(X_tr)}, Val=0 | Session 2 Probes={len(x_test_filtered)}")
+
+    train_loader = _make_loader(X_tr, y_tr, batch_size, shuffle=True)
+    probe_loader = _make_loader(x_test_filtered, y_test_enc, batch_size, shuffle=False)
+    
+    # Train Model
+    model = model_class(in_channels=_detect_channels(x_train_full), num_classes=len(classes), include_top=True).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr); criterion = nn.CrossEntropyLoss()
     
-    for ep in range(epochs): 
-        loss = _train_epoch(model, train_loader, optimizer, criterion, device)
-        print(f"Epoch {ep+1}/{epochs} | Loss: {loss:.4f}")
-
-    model.include_top = False
+    model = _run_training_loop(model, train_loader, val_loader, optimizer, criterion, device, epochs, patience=10)
     
-    # Get Embeddings for S1 (Enrollment) and S2 (Probe)
-    loader1 = _make_loader(x_train, None, batch_size, shuffle=False)
-    emb1, _ = _get_embeddings(model, loader1, device)
-    lab1 = y_train  # Use the original string labels
-    
-    loader2 = _make_loader(x_test, None, batch_size, shuffle=False)
-    emb2, _ = _get_embeddings(model, loader2, device)
-    lab2 = y_test   # Use the original string labels        
+    # Switch to Feature Extractor
     model.include_top = False
 
-    # Cross-session pair generation (Pass S1 and S2 separately)
-    scores, labels_pair = _generate_pairs(normalize(emb1), lab1, normalize(emb2), lab2, num_pairs, sampling_mode)
-    
-    if len(scores) == 0: return 1.0, 0.5, 0.0, 0.0
-    
+    # ====================================================
+    # 6. MODEL CALIBRATION (Optional)
+    # ====================================================
+    if use_deployment_evaluation:
+        print("\n[INFO] --- REAL-WORLD DEPLOYMENT EVALUATION ---")
+        if val_split <= 0.0 or val_loader is None:
+            print("[WARN] No validation set provided (val_split=0.0). Falling back to the Training set.")
+            print("[WARN] NOTE: Using training data to find the threshold yields overly optimistic results. A separate validation set is strongly recommended!")
+            calib_loader = train_loader
+            calib_name = "Train (Fallback)"
+        else:
+            calib_loader = val_loader
+            calib_name = "Validation"
+        
+        print(f"[INFO] Extracting features for Calibration (Session 1 {calib_name} Set)...")
+        calib_emb, calib_lab = _get_embeddings(model, calib_loader, device)
+        
+        print(f"[INFO] Generating Calibration Pairs to find Global Threshold...")
+        calib_scores, calib_pair_labels = _generate_pairs(
+            embeddings1=calib_emb, labels1=calib_lab, embeddings2=None, labels2=None,
+            num_pairs=num_pairs, sampling_mode=sampling_mode, matching_method=matching_method
+        )
+        global_threshold = _find_optimal_threshold(calib_scores, calib_pair_labels)
+        print(f"[INFO] Optimal Global Threshold Found: {global_threshold:.4f}")
+
+    # ====================================================
+    # 7. EVALUATION STRATEGY
+    # ====================================================
+    emb_probe, lab_probe = _get_embeddings(model, probe_loader, device)
+
+    if not use_template:
+        # STRATEGY A: Session 2 vs Session 2 (Intra-session unseen evaluation)
+        print(f"[INFO] Bypassing Templates. Generating pairs exclusively from Session 2...")
+        scores, labels_pair = _generate_pairs(
+            embeddings1=emb_probe, 
+            labels1=lab_probe, 
+            embeddings2=None, # None forces test vs test matching
+            labels2=None, 
+            num_pairs=num_pairs, 
+            sampling_mode=sampling_mode, 
+            matching_method=matching_method
+        )
+    else:
+        # STRATEGY B: Session 2 Probes vs Session 1 Templates (Authentication Simulation)
+        print(f"[INFO] Building Enrollment Templates from Session 1...")
+        enroll_loader = _make_loader(x_train_full, y_train_enc, batch_size, shuffle=False)
+        emb_enroll, lab_enroll = _get_embeddings(model, enroll_loader, device)
+        
+        templates, temp_labels = _create_templates(
+            emb_enroll, lab_enroll, method=template_fusion_method, max_beats=template_size
+        )
+        
+        scores, labels_pair = _generate_pairs(
+            embeddings1=emb_probe, # Session 2 Probes
+            labels1=lab_probe, 
+            embeddings2=templates, # Session 1 Templates
+            labels2=temp_labels, 
+            num_pairs=num_pairs, 
+            sampling_mode=sampling_mode, 
+            matching_method=matching_method
+        )
+
     if visualize:
         viz = Visualizer()
-        viz.plot_embeddings(emb2, lab2, title="Verification Embeddings (T-SNE)")
+        viz.plot_embeddings(emb_probe, lab_probe, title="Cross-Session Probe Embeddings (T-SNE)")
 
+    # 8. Apply Deployment Calibration
+    if use_deployment_evaluation:
+        _evaluate_with_global_threshold(scores, labels_pair, global_threshold)
+
+    eer, auc_val, dprime, tar = _compute_metrics_verification(scores, labels_pair)
+
+    # Update hyperparams dictionary dynamically
+    hyperparams['epochs'] = f"{epochs} (stopped at {model.actual_epochs})" if model.actual_epochs < epochs else epochs
+
+    if _return_stats: 
+        return (eer, auc_val, dprime, tar), data_stats, hyperparams
+
+    if save_results_and_settings:
+        data_stats = {
+            "Total Cross-Session Subjects": len(classes),
+            "Enrollment (S1) Samples": len(x_train_full),
+            "Probe (S2) Samples": len(x_test_filtered),
+            "Pairs Evaluated": len(labels_pair)
+        }
+        _log_experiment_results(task_title, {"EER": eer, "AUC": auc_val, "d-prime": dprime, "TAR@0.1%FAR": tar}, 
+                                data_stats, hyperparams, loader)
+
+    # 9. Report Verification Metrics
     return _compute_metrics_verification(scores, labels_pair)
 
+# =============================================================================
+# TASK 7: SUBJECT-DISJOINT CROSS-SESSION IDENTIFICATION
+# =============================================================================
+def run_subject_disjoint_cross_session_identification(
+        x_s1, y_s1, x_s2, y_s2, model_class, epochs=30, batch_size=64, lr=1e-3, test_split=0.2, val_split=0.0, 
+        seed=42, device=None, visualize=False, use_template=True, template_fusion_method='mean', template_size=None, 
+        matching_method='cosine', outlier_filtering_on_train=False, outlier_filtering_on_test=False, sqi_s1=None, 
+        sqi_s2=None, sqi_threshold=0.05, sqi_keep_pct=0.8, probe_fusion_size=1, save_results_and_settings=False, 
+        loader=None, n_runs=1, _return_stats=False):
+    """
+    The Ultimate Biometric Test: Open-Set + Temporal Robustness Identification.
+    1. Trains a feature extractor on Session 1 of Subject Group A.
+    2. Enrolls Unseen Subject Group B using their Session 1 recordings to build a gallery.
+    3. Identifies Subject Group B using their Session 2 recordings as probes.
 
+    Args:
+        x_s1 (np.ndarray): Input ECG signals from Session 1.
+        y_s1 (np.ndarray): Labels for Session 1.
+        x_s2 (np.ndarray): Input ECG signals from Session 2.
+        y_s2 (np.ndarray): Labels for Session 2.
+        model_class (nn.Module): The PyTorch model architecture class to instantiate.
+        epochs (int): Maximum number of training epochs.
+        batch_size (int): Number of samples per training batch.
+        lr (float): Learning rate for the Adam optimizer.
+        test_split (float): Fraction of unique SUBJECTS to isolate for the Group B tests.
+        val_split (float): Fraction of Group A subjects to use for early stopping validation.
+        seed (int): Random seed for reproducibility.
+        device (str): Computation device ('cuda', 'cpu', or 'auto').
+        visualize (bool): If True, generates t-SNE scatter plots of the unseen temporal embeddings.
+        use_template (bool): MUST be True for this task (requires a gallery to identify unseen subjects).
+        template_fusion_method (str): Logic used to enroll unseen Session 1 data into the gallery.
+            Options: ['mean', 'median', 'trimmed_mean', 'representative', 'none']
+        template_size (int, optional): Number of Session 1 beats to form the gallery. None uses all available.
+        matching_method (str): Distance/Similarity metric used to search the gallery.
+            Options: ['cosine', 'euclidean', 'manhattan', 'correlation']
+        outlier_filtering_on_train (bool): Apply SQI filtering to Session 1 data.
+        outlier_filtering_on_test (bool): Apply SQI filtering to Session 2 data.
+        sqi_s1 (str or np.ndarray): SQI calculation method or pre-computed array for Session 1.
+        sqi_s2 (str or np.ndarray): SQI calculation method or pre-computed array for Session 2.
+        sqi_threshold (float): Absolute minimum SQI score required to keep a beat (0.0 to 1.0).
+        sqi_keep_pct (float): Top percentage of beats to keep per subject after filtering.
+        probe_fusion_size (int): Number of consecutive Session 2 beats to average before searching the gallery.
+        save_results_and_settings (bool): If True, logs results and parameters to a text file.
+        loader (object): Dataset loader instance (used for extracting metadata for logging).
+        n_runs (int): Number of independent runs (with varying seeds) for statistical validation.
+        _return_stats (bool): Internal flag used to pass data back during multi-seed recursion.
 
+    Returns:
+        tuple: (Rank-1 Accuracy, Rank-5 Accuracy)
+               If n_runs > 1, returns tuples of (Mean, Std_Dev) for both metrics.
+    """
+    # --- MULTI-RUN AGGREGATOR ---
+    data_stats = {}
+    hyperparams = {
+        'epochs': epochs, 'batch_size': batch_size, 'learning_rate': lr, 'test_split': test_split, 'val_split': val_split,
+        'template_fusion_method': template_fusion_method, 'template_size': template_size, 
+        'matching_method': matching_method, 'probe_fusion_size': probe_fusion_size,
+        'outlier_filter_train': outlier_filtering_on_train, 'outlier_filter_test': outlier_filtering_on_test
+    }
 
-# # run.py
-# # ---------------------------------------------------
-# # Unified Training & Evaluation Utility for ECG Biometrics
-# # Supports:
-# #   1. Closed-Set Identification (Classification)
-# #   2. Subject-Disjoint Identification (Open-Set / Enrollment)
-# #   3. Verification (Authentication / EER) - Random Split
-# #   4. Subject-Disjoint Verification (EER) - Open Set
-# #   5. Cross-Session Identification (Temporal Robustness)
-# #   6. Cross-Session Verification (Temporal Robustness)
-# # ---------------------------------------------------
-
-# import numpy as np
-# import random
-# from typing import Dict, Any, Union, Callable, Optional, List, Tuple
-
-# from sklearn.model_selection import train_test_split
-# from sklearn.metrics import roc_curve, auc, confusion_matrix
-# from sklearn.preprocessing import normalize
-# from scipy.optimize import brentq
-# from scipy.interpolate import interp1d
-
-# import torch
-# import torch.nn as nn
-# from torch.utils.data import TensorDataset, DataLoader
-
-# from visualizations import Visualizer
-
-# def _set_seed(seed: int = 42):
-#     import random
-#     random.seed(seed)
-#     np.random.seed(seed)
-#     torch.manual_seed(seed)
-#     if torch.cuda.is_available(): torch.cuda.manual_seed_all(seed)
-
-# def _get_device(device: Optional[str] = None) -> str:
-#     if device is None or device == "auto":
-#         return "cuda" if torch.cuda.is_available() else "cpu"
-#     return device
-
-# def _encode_labels(y: np.ndarray):
-#     classes, y_enc = np.unique(y, return_inverse=True)
-#     return y_enc.astype(np.int64), classes
-
-# def _detect_channels(x: np.ndarray) -> int:
-#     if x.ndim == 2: return 1
-#     elif x.ndim == 3: return x.shape[1]
-#     else: raise ValueError(f"Unexpected input shape: {x.shape}")
-
-# def _make_loader(x, y, batch_size, shuffle=True, device='cpu'):
-#     x_t = torch.from_numpy(x).float()
-#     if x_t.ndim == 2: x_t = x_t.unsqueeze(1)
-#     if y is not None: y_t = torch.from_numpy(y).long(); ds = TensorDataset(x_t, y_t)
-#     else: ds = TensorDataset(x_t, torch.zeros(len(x_t)))
-#     return DataLoader(ds, batch_size=batch_size, shuffle=shuffle)
-
-# def _train_epoch(model, loader, optimizer, criterion, device):
-#     model.train()
-#     total_loss = 0.0
-#     for xb, yb in loader:
-#         xb, yb = xb.to(device), yb.to(device)
-#         optimizer.zero_grad()
-#         logits = model(xb)
-#         loss = criterion(logits, yb)
-#         loss.backward()
-#         optimizer.step()
-#         total_loss += loss.item() * xb.size(0)
-#     return total_loss / len(loader.dataset)
-
-# def _get_embeddings(model, loader, device):
-#     model.eval()
-#     embeddings, labels = [], []
-#     with torch.no_grad():
-#         for xb, yb in loader:
-#             xb = xb.to(device)
-#             emb = model(xb)
-#             embeddings.append(emb.cpu().numpy())
-#             labels.append(yb.numpy())
-#     return np.vstack(embeddings), np.concatenate(labels)
-
-# def _compute_eer(embeddings, labels, num_pairs=10000, sampling_mode="balanced"):
-#     """
-#     Computes EER and AUC using different pair sampling strategies.
-    
-#     Args:
-#         embeddings: (N, D) array of feature vectors.
-#         labels: (N,) array of subject IDs.
-#         num_pairs: Number of pairs to generate (ignored if mode='all').
-#         sampling_mode: 'balanced' (recommended), 'all', or 'random'.
-#     """
-#     import collections
-#     from scipy.optimize import brentq
-#     from scipy.interpolate import interp1d
-#     from sklearn.metrics import roc_curve, auc
-
-#     scores = []
-#     labels_pair = []
-    
-#     # -------------------------------------------------------------------------
-#     # MODE 1: ALL PAIRS (Similarity Matrix)
-#     # -------------------------------------------------------------------------
-#     if sampling_mode == "all":
-#         print(f"[INFO] Computing ALL pairs (Full Similarity Matrix)...")
-#         # Compute full NxN similarity matrix
-#         sim_matrix = np.dot(embeddings, embeddings.T)
+    if n_runs > 1:
+        call_args = locals().copy()
+        for k in ['data_stats', 'hyperparams', 'call_args']: call_args.pop(k, None)
+        call_args.update({'n_runs': 1, '_return_stats': True, 'save_results_and_settings': False})
+        base_seed = call_args.get('seed', 42)
+        results = []
         
-#         # Create ground truth matrix (1 if same label, 0 if diff)
-#         # Broadcasting logic: labels[:, None] == labels[None, :]
-#         truth_matrix = (labels[:, None] == labels[None, :]).astype(int)
+        print(f"\n[INFO] Starting Multi-Seed Execution ({n_runs} runs)...")
+        for i in range(n_runs):
+            call_args['seed'] = base_seed + i
+            call_args['visualize'] = False 
+            print(f"\n{'='*40}\n RUN {i+1}/{n_runs} (Seed: {call_args['seed']})\n{'='*40}")
+            res, d_stats, h_params = run_subject_disjoint_cross_session_identification(**call_args) 
+            results.append(res); data_stats = d_stats; hyperparams = h_params
+                
+        r1_mean, r1_std = np.mean([r[0] for r in results]), np.std([r[0] for r in results])
+        r5_mean, r5_std = np.mean([r[1] for r in results]), np.std([r[1] for r in results])
         
-#         # We only want the upper triangle (excluding diagonal) to avoid duplicates
-#         # and self-comparisons (i.e., comparing A to A)
-#         upper_tri_indices = np.triu_indices(len(labels), k=1)
+        if save_results_and_settings:
+            hyperparams['n_runs'] = n_runs
+            metrics_dict = {"Rank-1 Accuracy": f"{r1_mean:.4f} ± {r1_std:.4f}", "Rank-5 Accuracy": f"{r5_mean:.4f} ± {r5_std:.4f}"}
+            _log_experiment_results("Subject-Disjoint Cross-Session ID", metrics_dict, data_stats, hyperparams, loader)
+        return (r1_mean, r1_std), (r5_mean, r5_std)
+    # ----------------------------
+
+    if not use_template:
+        raise ValueError("[ERROR] use_template=False is invalid for Identification. Must use templates to build a gallery.")
         
-#         scores = sim_matrix[upper_tri_indices]
-#         labels_pair = truth_matrix[upper_tri_indices]
+    _set_seed(seed); device = _get_device(device)
+    task_title = "Subject-Disjoint Cross-Session ID"
+    mode_str = f"Gallery: Session 1 ({template_fusion_method}, size={template_size or 'All'})"
+    print(f"\n[TASK] {task_title} | Mode: {mode_str} | Match: {matching_method}")
+
+    # ====================================================
+    # 1. PREPARE & APPLY SQI FILTERS
+    # ====================================================
+    def _prepare_sqi(sqi_input, x_data, flag, name):
+        if not flag: return None
+        if sqi_input is None: return None
+        if isinstance(sqi_input, str): return np.array(_compute_sqi(x_data, method=sqi_input))
+        return np.array(sqi_input)
+
+    sqi_s1 = _prepare_sqi(sqi_s1, x_s1, outlier_filtering_on_train, "Session 1")
+    sqi_s2 = _prepare_sqi(sqi_s2, x_s2, outlier_filtering_on_test, "Session 2")
+
+    if sqi_s1 is not None:
+        print("\n[INFO] Filtering Session 1 (Representation & Enrollment)...")
+        x_s1, y_s1 = _apply_outlier_filter(x_s1, y_s1, sqi_s1, sqi_threshold, sqi_keep_pct)
+
+    if sqi_s2 is not None:
+        print("\n[INFO] Filtering Session 2 (Probes)...")
+        x_s2, y_s2 = _apply_outlier_filter(x_s2, y_s2, sqi_s2, sqi_threshold, sqi_keep_pct)
+
+    # ====================================================
+    # 2. INTERSECT AND SPLIT SUBJECTS (STRICTLY DISJOINT)
+    # ====================================================
+    # We must only evaluate subjects that successfully completed both sessions.
+    common_subs = sorted(list(set(y_s1).intersection(set(y_s2))))
+    
+    if len(common_subs) < 2: 
+        raise ValueError("[ERROR] Not enough common subjects across sessions after filtering.")
         
-#         print(f"[INFO] Evaluated {len(scores)} unique pairs.")
+    # Split the distinct subjects into Train, Val, and Test cohorts
+    train_subs_full, test_subs = train_test_split(common_subs, test_size=test_split, random_state=seed)
+    
+    if val_split > 0.0:
+        train_subs, val_subs = train_test_split(train_subs_full, test_size=val_split, random_state=seed)
+        print(f"Subject Split: Train={len(train_subs)}, Val={len(val_subs)}, Test={len(test_subs)}")
+    else:
+        train_subs = train_subs_full
+        val_subs = []
+        print(f"Subject Split: Train={len(train_subs)}, Val=0, Test={len(test_subs)}")
 
-#     # -------------------------------------------------------------------------
-#     # MODE 2: BALANCED (50% Genuine / 50% Imposter) - STANDARD
-#     # -------------------------------------------------------------------------
-#     elif sampling_mode == "balanced":
-#         print(f"[INFO] Generating {num_pairs} BALANCED pairs (50/50 split)...")
+    # Extract respective datasets based on the disjoint subject split
+    X_train, Y_train = x_s1[np.isin(y_s1, train_subs)], y_s1[np.isin(y_s1, train_subs)]
+    
+    X_val_s1, Y_val_s1 = (x_s1[np.isin(y_s1, val_subs)], y_s1[np.isin(y_s1, val_subs)]) if len(val_subs) > 0 else (None, None)
+    X_val_s2, Y_val_s2 = (x_s2[np.isin(y_s2, val_subs)], y_s2[np.isin(y_s2, val_subs)]) if len(val_subs) > 0 else (None, None)
+    
+    X_enroll, Y_enroll = x_s1[np.isin(y_s1, test_subs)], y_s1[np.isin(y_s1, test_subs)]
+    X_probe, Y_probe = x_s2[np.isin(y_s2, test_subs)], y_s2[np.isin(y_s2, test_subs)]
+
+    # ====================================================
+    # 3. ENCODE LABELS (CRITICAL FIX FOR PYTORCH TENSORS)
+    # ====================================================
+    # PyTorch Datasets cannot handle raw strings (like "MLS" or "HPS").
+    # We must explicitly map these strings to integers (0 to N-1).
+    
+    # A. Train Labels
+    y_train_enc, train_classes = _encode_labels(Y_train)
+    num_train_classes = len(train_classes)
+    
+    # B. Validation Labels (Ensures S1 and S2 map to the exact same integers)
+    if len(val_subs) > 0:
+        val_map = {sub: i for i, sub in enumerate(val_subs)}
+        y_val_s1_enc = np.array([val_map[s] for s in Y_val_s1])
+        y_val_s2_enc = np.array([val_map[s] for s in Y_val_s2])
+    else:
+        y_val_s1_enc, y_val_s2_enc = None, None
+
+    # C. Test Labels (Ensures Enroll and Probe map to the exact same integers)
+    test_map = {sub: i for i, sub in enumerate(test_subs)}
+    y_enroll_enc = np.array([test_map[s] for s in Y_enroll])
+    y_probe_enc = np.array([test_map[s] for s in Y_probe])
+
+    # ====================================================
+    # 4. LOADERS & CUSTOM TRAINING LOOP
+    # ====================================================
+    train_loader = _make_loader(X_train, y_train_enc, batch_size, shuffle=True)
+    val_loader_s1 = _make_loader(X_val_s1, y_val_s1_enc, batch_size, shuffle=False) if X_val_s1 is not None else None
+    val_loader_s2 = _make_loader(X_val_s2, y_val_s2_enc, batch_size, shuffle=False) if X_val_s2 is not None else None
+    
+    model = model_class(in_channels=_detect_channels(x_s1), num_classes=num_train_classes, include_top=True).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr); criterion = nn.CrossEntropyLoss()
+    
+    best_val_eer = float('inf')
+    patience_counter = 0
+    best_model_state = None
+    
+    for ep in range(epochs):
+        model.include_top = True
+        train_loss = _train_epoch(model, train_loader, optimizer, criterion, device)
         
-#         # Map labels to indices for fast lookup
-#         class_indices = collections.defaultdict(list)
-#         for idx, label in enumerate(labels):
-#             class_indices[label].append(idx)
-        
-#         # A. Genuine Pairs (Positive)
-#         # We need classes that have at least 2 samples to form a genuine pair
-#         valid_genuine_classes = [c for c, idxs in class_indices.items() if len(idxs) >= 2]
-        
-#         if len(valid_genuine_classes) < 2:
-#             print("[WARN] Not enough classes with multiple samples for balanced EER.")
-#             return {"eer": 1.0, "auc": 0.5}
-
-#         for _ in range(num_pairs // 2):
-#             c = np.random.choice(valid_genuine_classes)
-#             # Pick 2 different samples from the same class
-#             idx1, idx2 = np.random.choice(class_indices[c], 2, replace=False)
-#             scores.append(np.dot(embeddings[idx1], embeddings[idx2]))
-#             labels_pair.append(1) # Genuine
-
-#         # B. Imposter Pairs (Negative)
-#         all_classes = list(class_indices.keys())
-#         for _ in range(num_pairs // 2):
-#             # Pick 2 different classes
-#             c1, c2 = np.random.choice(all_classes, 2, replace=False)
-#             idx1 = np.random.choice(class_indices[c1])
-#             idx2 = np.random.choice(class_indices[c2])
-#             scores.append(np.dot(embeddings[idx1], embeddings[idx2]))
-#             labels_pair.append(0) # Imposter
-
-#     # -------------------------------------------------------------------------
-#     # MODE 3: RANDOM (Unbalanced)
-#     # -------------------------------------------------------------------------
-#     elif sampling_mode == "random":
-#         print(f"[INFO] Generating {num_pairs} RANDOM pairs (likely imbalanced)...")
-#         indices = np.arange(len(labels))
-#         for _ in range(num_pairs):
-#             i1, i2 = np.random.choice(indices, 2, replace=False)
-#             scores.append(np.dot(embeddings[i1], embeddings[i2]))
-#             labels_pair.append(1 if labels[i1] == labels[i2] else 0)
-
-#     else:
-#         raise ValueError(f"Unknown sampling_mode: {sampling_mode}")
-
-#     # -------------------------------------------------------------------------
-#     # COMPUTE METRICS
-#     # -------------------------------------------------------------------------
-#     fpr, tpr, thresholds = roc_curve(labels_pair, scores)
-#     roc_auc = auc(fpr, tpr)
-    
-#     try:
-#         eer = brentq(lambda x : 1. - x - interp1d(fpr, tpr)(x), 0., 1.)
-#     except Exception as e:
-#         print(f"[WARN] EER calculation failed (likely perfect separation): {e}")
-#         eer = 0.0
-
-#     print(f"[RESULT] Mode: {sampling_mode.upper()} | EER: {eer:.4f} | AUC: {roc_auc:.4f}")
-#     return {"eer": eer, "auc": roc_auc}
-
-# # --- TASK 1: CLOSED-SET IDENTIFICATION ---
-# def run_closed_set_identification(x, y, model_class, epochs=30, batch_size=64, lr=1e-3, val_split=0.2, seed=42, device=None, visualize=False):
-#     _set_seed(seed); device = _get_device(device)
-#     print(f"\n[TASK] Closed-Set Identification on {device}")
-#     y_enc, classes = _encode_labels(y)
-#     X_train, X_test, y_train, y_test = train_test_split(x, y_enc, test_size=val_split, stratify=y_enc, random_state=seed)
-#     train_loader = _make_loader(X_train, y_train, batch_size, shuffle=True)
-#     test_loader = _make_loader(X_test, y_test, batch_size, shuffle=False)
-#     in_ch = _detect_channels(x)
-#     model = model_class(in_channels=in_ch, num_classes=len(classes), include_top=True).to(device)
-#     optimizer = torch.optim.Adam(model.parameters(), lr=lr); criterion = nn.CrossEntropyLoss()
-    
-#     for ep in range(epochs):
-#         loss = _train_epoch(model, train_loader, optimizer, criterion, device)
-#         print(f"    Epoch {ep+1:03d} | Loss: {loss:.4f}")
-        
-#     model.eval()
-#     all_preds, all_trues = [], []
-#     with torch.no_grad():
-#         for xb, yb in test_loader:
-#             xb, yb = xb.to(device), yb.to(device)
-#             preds = torch.argmax(model(xb), dim=1)
-#             all_preds.append(preds.cpu().numpy()); all_trues.append(yb.cpu().numpy())
-#     all_preds = np.concatenate(all_preds); all_trues = np.concatenate(all_trues)
-#     acc = np.mean(all_preds == all_trues)
-#     print(f"[RESULT] Closed-Set Accuracy: {acc:.4f}")
-
-#     if visualize:
-#         viz = Visualizer()
-#         viz.plot_confusion_matrix(all_trues, all_preds, normalize=True)
-
-#     return acc
-
-# # --- TASK 2: SUBJECT-DISJOINT IDENTIFICATION ---
-# def run_subject_disjoint_identification(x, y, model_class, train_subject_ratio=0.7, enrollment_beats=5, epochs=30, batch_size=64, lr=1e-3, seed=42, device=None, visualize=False):
-#     _set_seed(seed); device = _get_device(device)
-#     print(f"\n[TASK] Subject-Disjoint Identification on {device}")
-#     subjects = np.unique(y)
-#     train_subs, test_subs = train_test_split(subjects, train_size=train_subject_ratio, random_state=seed)
-    
-#     # Train
-#     mask_train = np.isin(y, train_subs)
-#     X_train, y_train = x[mask_train], y[mask_train]
-#     y_train_enc, _ = _encode_labels(y_train)
-#     train_loader = _make_loader(X_train, y_train_enc, batch_size, shuffle=True)
-#     in_ch = _detect_channels(x)
-#     model = model_class(in_channels=in_ch, num_classes=len(train_subs), include_top=True).to(device)
-#     optimizer = torch.optim.Adam(model.parameters(), lr=lr); criterion = nn.CrossEntropyLoss()
-    
-#     print("[INFO] Phase 1: Training feature extractor...")
-#     for ep in range(epochs): 
-#         loss = _train_epoch(model, train_loader, optimizer, criterion, device)
-#         print(f"    Epoch {ep+1:03d} | Loss: {loss:.4f}")
-    
-#     # Test
-#     print("[INFO] Phase 2: Enrollment & Matching...")
-#     model.include_top = False
-#     mask_test = np.isin(y, test_subs)
-#     X_test_all, y_test_all = x[mask_test], y[mask_test]
-#     X_enroll, y_enroll, X_query, y_query = [], [], [], []
-    
-#     for sub in test_subs:
-#         sub_beats = X_test_all[y_test_all == sub]
-#         if len(sub_beats) <= enrollment_beats: continue
-#         X_enroll.append(sub_beats[:enrollment_beats]); y_enroll.extend([sub]*enrollment_beats)
-#         X_query.append(sub_beats[enrollment_beats:]); y_query.extend([sub]*(len(sub_beats)-enrollment_beats))
-        
-#     enroll_loader = _make_loader(np.vstack(X_enroll), None, batch_size, shuffle=False)
-#     query_loader = _make_loader(np.vstack(X_query), None, batch_size, shuffle=False)
-#     emb_enroll, _ = _get_embeddings(model, enroll_loader, device)
-#     emb_query, _ = _get_embeddings(model, query_loader, device)
-    
-#     templates, template_ids = [], []
-#     for sub in np.unique(y_enroll):
-#         idxs = np.where(np.array(y_enroll) == sub)[0]
-#         templates.append(np.mean(emb_enroll[idxs], axis=0))
-#         template_ids.append(sub)
-    
-#     sim_matrix = np.dot(normalize(emb_query), normalize(np.array(templates)).T)
-#     preds = np.array(template_ids)[np.argmax(sim_matrix, axis=1)]
-#     acc = np.mean(preds == np.array(y_query))
-#     print(f"[RESULT] Subject-Disjoint Accuracy: {acc:.4f}")
-#     if visualize:
-#         viz = Visualizer()
-#         viz.plot_confusion_matrix(y_query, preds, normalize=True)
-#     return acc
-
-# # =============================================================================
-# # TASK 3: VERIFICATION (RANDOM SPLIT / CLOSED-SET)
-# # =============================================================================
-# def run_verification(x, y, model_class, train_split=0.7, epochs=30, batch_size=64, lr=1e-3, num_pairs=10000, sampling_mode="balanced", seed=42, device=None, visualize=False):
-#     """
-#     Performs 'Closed-Set' Verification (Seen Subjects).
-    
-#     SCENARIO:
-#     The model is trained on a set of subjects (e.g., Alice, Bob) and tested on 
-#     different recordings of the SAME subjects (Alice, Bob).
-    
-#     USE CASE:
-#     - Unlocking a personal phone (the phone knows you, it just needs to verify it's you now).
-#     - Biometric attendance systems for employees.
-    
-#     Args:
-#         x: Input signals.
-#         y: Labels.
-#         sampling_mode: 'balanced' (50/50 +/-, recommended), 'all' (N*N matrix), or 'random'.
-#     """
-#     _set_seed(seed)
-#     device = _get_device(device)
-#     print(f"\n[TASK] Verification (Random Split / Closed-Set) on {device}")
-    
-#     # 1. Encode Labels (0, 1, 2...)
-#     y_enc, classes = _encode_labels(y)
-    
-#     # 2. Random Split (Stratified)
-#     # WARNING: This splits by SAMPLE. If a subject has 10 beats, 7 go to train, 3 to test.
-#     # The model "sees" the subject during training.
-#     X_train, X_test, y_train, y_test = train_test_split(
-#         x, y_enc, test_size=(1-train_split), stratify=y_enc, random_state=seed
-#     )
-    
-#     train_loader = _make_loader(X_train, y_train, batch_size, shuffle=True)
-#     in_ch = _detect_channels(x)
-    
-#     # 3. Model Setup (Includes Classification Head for Training)
-#     model = model_class(in_channels=in_ch, num_classes=len(classes), include_top=True).to(device)
-#     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-#     criterion = nn.CrossEntropyLoss()
-    
-#     print("[INFO] Phase 1: Training feature extractor (Learning Identity)...")
-#     for ep in range(epochs): 
-#         loss = _train_epoch(model, train_loader, optimizer, criterion, device)
-#         print(f"    Epoch {ep+1:03d} | Loss: {loss:.4f}")
-    
-#     # 4. Evaluation (Remove Classification Head)
-#     print(f"[INFO] Phase 2: Computing EER using '{sampling_mode}' sampling...")
-#     model.include_top = False # Switch to embedding mode
-    
-#     test_loader = _make_loader(X_test, y_test, batch_size, shuffle=False)
-#     emb_test, labels_test = _get_embeddings(model, test_loader, device)
-
-#     if visualize:
-#         viz = Visualizer()
-#         # Plot T-SNE of the test embeddings
-#         viz.plot_embeddings(emb_test, labels_test, title="Verification Embeddings (T-SNE)")
-    
-#     # Compute EER
-#     # Note: We normalize embeddings to unit length for Cosine Similarity
-#     return _compute_eer(normalize(emb_test), labels_test, num_pairs, sampling_mode=sampling_mode)
-
-
-# # =============================================================================
-# # TASK 4: SUBJECT-DISJOINT VERIFICATION (OPEN-SET)
-# # =============================================================================
-# def run_subject_disjoint_verification(x, y, model_class, train_subject_ratio=0.7, epochs=30, batch_size=64, lr=1e-3, num_pairs=10000, sampling_mode="balanced", seed=42, device=None, visualize=False):
-#     """
-#     Performs 'Open-Set' Verification (Unseen Subjects).
-    
-#     SCENARIO:
-#     The model is trained on a set of subjects (e.g., Alice, Bob) but tested on 
-#     completely NEW subjects (e.g., Charlie, Dave) it has never seen before.
-    
-#     USE CASE:
-#     - Universal Feature Extractors.
-#     - Testing if the model learned "What makes an ECG unique?" rather than "What does Alice look like?"
-#     - Large-scale surveillance or border control systems.
-    
-#     Args:
-#         train_subject_ratio: % of subjects to use for training (e.g., 0.7 means 70% of people are in train).
-#         sampling_mode: 'balanced' (recommended), 'all', or 'random'.
-#     """
-#     _set_seed(seed)
-#     device = _get_device(device)
-#     print(f"\n[TASK] Subject-Disjoint Verification (Open-Set) on {device}")
-    
-#     # 1. Split by SUBJECT ID (Not by sample)
-#     subjects = np.unique(y)
-#     train_subs, test_subs = train_test_split(subjects, train_size=train_subject_ratio, random_state=seed)
-#     print(f"[INFO] Splitting: {len(train_subs)} Training Subjects vs {len(test_subs)} Test Subjects")
-    
-#     # 2. Create Train Set (Only Train Subjects)
-#     mask_train = np.isin(y, train_subs)
-#     X_train, y_train_raw = x[mask_train], y[mask_train]
-#     y_train_enc, _ = _encode_labels(y_train_raw) # Encode 0..N for Softmax loss
-    
-#     train_loader = _make_loader(X_train, y_train_enc, batch_size, shuffle=True)
-    
-#     in_ch = _detect_channels(x)
-#     model = model_class(in_channels=in_ch, num_classes=len(train_subs), include_top=True).to(device)
-#     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-#     criterion = nn.CrossEntropyLoss()
-    
-#     print("[INFO] Phase 1: Training on Known Subjects...")
-#     for ep in range(epochs): 
-#         loss = _train_epoch(model, train_loader, optimizer, criterion, device)
-#         print(f"    Epoch {ep+1:03d} | Loss: {loss:.4f}")
-    
-#     # 3. Create Test Set (Only New/Unseen Subjects)
-#     print(f"[INFO] Phase 2: Computing EER on {len(test_subs)} Unseen Subjects...")
-#     model.include_top = False # Remove classifier, we only want embeddings
-    
-#     mask_test = np.isin(y, test_subs)
-#     X_test, y_test_raw = x[mask_test], y[mask_test]
-    
-#     # Note: We don't need encoded labels for testing, just the raw IDs to check equality
-#     test_loader = _make_loader(X_test, None, batch_size, shuffle=False)
-#     emb_test, _ = _get_embeddings(model, test_loader, device)
-
-#     if visualize:
-#         viz = Visualizer()
-#         # Plot T-SNE of the test embeddings
-#         viz.plot_embeddings(emb_test, y_test_raw, title="Verification Embeddings (T-SNE)")
-    
-#     return _compute_eer(normalize(emb_test), y_test_raw, num_pairs, sampling_mode=sampling_mode)
-
-# # =============================================================================
-# # TASK 5: CROSS-SESSION IDENTIFICATION (1:N)
-# # =============================================================================
-# def run_cross_session_identification(x_train, y_train, x_test, y_test, model_class, epochs=30, batch_size=64, lr=1e-3, seed=42, device=None, visualize=False):
-#     """
-#     Train on Session 1 -> Predict Class in Session 2.
-    
-#     SCENARIO:
-#     "I enrolled on Day 1. Can the system recognize me on Day 2?"
-    
-#     CRITICAL: 
-#     We typically filter for 'Overlapping Subjects' (those present in BOTH sessions).
-#     If a user is in Session 2 but wasn't in Session 1, the model literally has no 
-#     output neuron for them, so we cannot calculate standard accuracy.
-#     """
-#     _set_seed(seed)
-#     device = _get_device(device)
-#     print(f"\n[TASK] Cross-Session Identification (Rank-1) on {device}")
-    
-#     # 1. Find Common Subjects
-#     train_subs = np.unique(y_train)
-#     test_subs = np.unique(y_test)
-#     common_subs = np.intersect1d(train_subs, test_subs)
-    
-#     if len(common_subs) == 0:
-#         raise ValueError("No overlapping subjects between Session 1 and Session 2!")
-    
-#     print(f"[INFO] Subjects: {len(train_subs)} in Train, {len(test_subs)} in Test.")
-#     print(f"[INFO] Evaluated on intersection: {len(common_subs)} common subjects.")
-    
-#     # 2. Filter Data (Keep only common subjects)
-#     mask_train = np.isin(y_train, common_subs)
-#     X_train_filt, y_train_filt = x_train[mask_train], y_train[mask_train]
-    
-#     mask_test = np.isin(y_test, common_subs)
-#     X_test_filt, y_test_filt = x_test[mask_test], y_test[mask_test]
-    
-#     # 3. Remap Labels (Subject ID -> 0..N)
-#     # We sort common_subs so the mapping is deterministic (Subj A -> 0, Subj B -> 1...)
-#     common_subs.sort()
-#     cls_map = {s: i for i, s in enumerate(common_subs)}
-    
-#     y_train_enc = np.array([cls_map[s] for s in y_train_filt])
-#     y_test_enc = np.array([cls_map[s] for s in y_test_filt])
-    
-#     # 4. Train
-#     train_loader = _make_loader(X_train_filt, y_train_enc, batch_size, shuffle=True)
-#     test_loader = _make_loader(X_test_filt, y_test_enc, batch_size, shuffle=False)
-    
-#     in_ch = _detect_channels(X_train_filt)
-#     model = model_class(in_channels=in_ch, num_classes=len(common_subs), include_top=True).to(device)
-#     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-#     criterion = nn.CrossEntropyLoss()
-    
-#     print("[INFO] Phase 1: Training Classifier on Session 1...")
-#     for ep in range(epochs): 
-#         loss = _train_epoch(model, train_loader, optimizer, criterion, device)
-#         print(f"    Epoch {ep+1:03d} | Loss: {loss:.4f}")
-    
-#     # 5. Test
-#     print("[INFO] Phase 2: Predicting on Session 2...")
-#     model.eval()
-#     all_preds = []
-#     all_trues = []
-    
-#     with torch.no_grad():
-#         for xb, yb in test_loader:
-#             xb = xb.to(device)
-#             outputs = model(xb)
-#             preds = torch.argmax(outputs, dim=1)
-#             all_preds.extend(preds.cpu().numpy())
-#             all_trues.extend(yb.numpy())
+        if val_loader_s1 is not None and val_loader_s2 is not None:
+            # We track validation using Cross-Session feature separation
+            model.include_top = False # Extract features
             
-#     acc = np.mean(np.array(all_preds) == np.array(all_trues))
-#     print(f"[RESULT] Cross-Session Identification Accuracy: {acc*100:.2f}%")
-
-#     if visualize:
-#         viz = Visualizer()
-#         viz.plot_confusion_matrix(all_trues, all_preds, normalize=True)
-
-#     return acc
-
-# # =============================================================================
-# # TASK 6: CROSS-SESSION VERIFICATION (1:1)
-# # =============================================================================
-# def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class, epochs=30, batch_size=64, lr=1e-3, num_pairs=10000, sampling_mode="balanced", seed=42, device=None, visualize=False):
-#     """
-#     Train on Session 1 -> Verify Identity in Session 2.
-    
-#     SCENARIO:
-#     "I enrolled on Day 1. Can I unlock my phone on Day 2?"
-    
-#     LOGIC:
-#     - Train feature extractor on Session 1.
-#     - Extract embeddings for S1 (Templates) and S2 (Probes).
-#     - Generate pairs where one element is from S1 and one is from S2.
-#     """
-#     import collections
-#     from scipy.optimize import brentq
-#     from scipy.interpolate import interp1d
-#     from sklearn.metrics import roc_curve, auc
-
-#     _set_seed(seed)
-#     device = _get_device(device)
-#     print(f"\n[TASK] Cross-Session Verification (EER) on {device}")
-    
-#     # 1. Train on Session 1
-#     # We use all available S1 data for training to get the best features
-#     # y_train_enc, classes = _encode_labels(y_train)
-#     all_labels = np.concatenate([y_train, y_test])
-#     unique_labels = np.unique(all_labels)
-#     label_to_int = {label: i for i, label in enumerate(unique_labels)}
-    
-#     y_train_int = np.array([label_to_int[l] for l in y_train])
-#     y_test_int = np.array([label_to_int[l] for l in y_test])
-
-#     train_loader = _make_loader(x_train, y_train_int, batch_size, shuffle=True)
-    
-#     in_ch = _detect_channels(x_train)
-#     model = model_class(in_channels=in_ch, num_classes=len(label_to_int), include_top=True).to(device)
-#     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-#     criterion = nn.CrossEntropyLoss()
-    
-#     print("[INFO] Phase 1: Training Feature Extractor on Session 1...")
-#     for ep in range(epochs): 
-#         loss = _train_epoch(model, train_loader, optimizer, criterion, device)
-#         print(f"    Epoch {ep+1:03d} | Loss: {loss:.4f}")
-        
-#     # 2. Extract Embeddings
-#     print("[INFO] Phase 2: Extracting Embeddings for Pairing...")
-#     model.include_top = False # Remove classifier
-    
-#     # S1 Embeddings (Enrollment)
-#     loader1 = _make_loader(x_train, y_train_int, batch_size, shuffle=False)
-#     emb1, lab1 = _get_embeddings(model, loader1, device)
-    
-#     # S2 Embeddings (Probe)
-#     loader2 = _make_loader(x_test, y_test_int, batch_size, shuffle=False)
-#     emb2, lab2 = _get_embeddings(model, loader2, device)
-
-#     # Normalize
-#     emb1 = normalize(emb1)
-#     emb2 = normalize(emb2)
-
-#     # 3. Generate Cross-Session Pairs
-#     # We cannot use the standard _compute_eer function because that assumes 
-#     # a single list of embeddings. Here we must pair (List1 vs List2).
-    
-#     scores = []
-#     labels_pair = []
-    
-#     # Map indices by subject ID
-#     s1_indices = collections.defaultdict(list)
-#     for idx, label in enumerate(lab1): s1_indices[label].append(idx)
-        
-#     s2_indices = collections.defaultdict(list)
-#     for idx, label in enumerate(lab2): s2_indices[label].append(idx)
-    
-#     # Find overlapping subjects for Genuine pairs
-#     common_subs = list(set(s1_indices.keys()) & set(s2_indices.keys()))
-#     if len(common_subs) < 2:
-#         print("[WARN] Not enough overlapping subjects for verification.")
-#         return 1.0 # EER = 100% (Fail)
-
-#     print(f"[INFO] Generating {num_pairs} Cross-Session Pairs ({sampling_mode})...")
-
-#     if sampling_mode == "balanced":
-#         # A. Genuine Pairs (User X S1 vs User X S2)
-#         for _ in range(num_pairs // 2):
-#             subj = np.random.choice(common_subs)
-#             idx1 = np.random.choice(s1_indices[subj])
-#             idx2 = np.random.choice(s2_indices[subj])
-#             scores.append(np.dot(emb1[idx1], emb2[idx2]))
-#             labels_pair.append(1)
+            val_emb_s1, val_lab_s1 = _get_embeddings(model, val_loader_s1, device)
+            val_emb_s2, val_lab_s2 = _get_embeddings(model, val_loader_s2, device)
             
-#         # B. Imposter Pairs (User X S1 vs User Y S2)
-#         all_s1_subs = list(s1_indices.keys())
-#         all_s2_subs = list(s2_indices.keys())
-#         for _ in range(num_pairs // 2):
-#             sub_a = np.random.choice(all_s1_subs)
-#             # Pick sub_b such that it is NOT sub_a
-#             possible_b = [s for s in all_s2_subs if s != sub_a]
-#             if not possible_b: continue # Should not happen if N > 1
+            val_scores, val_pairs = _generate_pairs(
+                embeddings1=val_emb_s2, labels1=val_lab_s2, 
+                embeddings2=val_emb_s1, labels2=val_lab_s1, 
+                num_pairs=2000, sampling_mode="balanced", matching_method=matching_method
+            )
             
-#             sub_b = np.random.choice(possible_b)
-#             idx1 = np.random.choice(s1_indices[sub_a])
-#             idx2 = np.random.choice(s2_indices[sub_b])
-#             scores.append(np.dot(emb1[idx1], emb2[idx2]))
-#             labels_pair.append(0)
+            if len(val_pairs) > 0:
+                fpr, tpr, _ = roc_curve(val_pairs, val_scores)
+                try: val_eer = brentq(lambda x: 1. - x - interp1d(fpr, tpr)(x), 0., 1.)
+                except: val_eer = 1.0
+            else:
+                val_eer = 1.0
+                
+            print(f"Epoch {ep+1}/{epochs} | Train Loss: {train_loss:.4f} | Val Cross-Session EER: {val_eer:.4f}")
+            
+            if val_eer < best_val_eer:
+                best_val_eer = val_eer
+                best_model_state = copy.deepcopy(model.state_dict())
+                patience_counter = 0
+            else:
+                patience_counter += 1
+                
+            if patience_counter >= 10:
+                print(f"--> Early stopping triggered at epoch {ep+1}.")
+                break
+        else:
+            print(f"Epoch {ep+1}/{epochs} | Train Loss: {train_loss:.4f}")
+            best_model_state = copy.deepcopy(model.state_dict())
+            
+    if best_model_state is not None:
+        model.load_state_dict(best_model_state)
 
-#     elif sampling_mode == "random":
-#         # Pure random picking
-#         indices1 = np.arange(len(lab1))
-#         indices2 = np.arange(len(lab2))
-#         for _ in range(num_pairs):
-#             idx1 = np.random.choice(indices1)
-#             idx2 = np.random.choice(indices2)
-#             is_same = 1 if lab1[idx1] == lab2[idx2] else 0
-#             scores.append(np.dot(emb1[idx1], emb2[idx2]))
-#             labels_pair.append(is_same)
-
-#     # 4. Compute Metrics
-#     fpr, tpr, _ = roc_curve(labels_pair, scores)
-#     roc_auc = auc(fpr, tpr)
-#     try:
-#         eer = brentq(lambda x : 1. - x - interp1d(fpr, tpr)(x), 0., 1.)
-#     except:
-#         eer = 1.0
-
-#     print(f"[RESULT] Cross-Session EER: {eer:.4f} | AUC: {roc_auc:.4f}")
-
-#     if visualize:
-#         viz = Visualizer()
-#         # Plot T-SNE of the test embeddings
-#         viz.plot_embeddings(emb2, lab2, title="Verification Embeddings (T-SNE)")
-
-#     return {"eer": eer, "auc": roc_auc}
-
-# # run.py
-# # ---------------------------------------------------
-# # Unified Training & Evaluation Utility for ECG Biometrics
-# # ---------------------------------------------------
-
-# import numpy as np
-# import random
-# from typing import Dict, Any, Union, Callable, Optional, List, Tuple
-# import collections
-
-# from sklearn.model_selection import train_test_split
-# from sklearn.metrics import roc_curve, auc, confusion_matrix
-# from sklearn.preprocessing import normalize
-# from scipy.optimize import brentq
-# from scipy.interpolate import interp1d
-
-# import torch
-# import torch.nn as nn
-# from torch.utils.data import TensorDataset, DataLoader
-
-# from visualizations import Visualizer
-
-# def _set_seed(seed: int = 42):
-#     import random
-#     random.seed(seed)
-#     np.random.seed(seed)
-#     torch.manual_seed(seed)
-#     if torch.cuda.is_available(): torch.cuda.manual_seed_all(seed)
-
-# def _get_device(device: Optional[str] = None) -> str:
-#     if device is None or device == "auto":
-#         return "cuda" if torch.cuda.is_available() else "cpu"
-#     return device
-
-# def _encode_labels(y: np.ndarray):
-#     classes, y_enc = np.unique(y, return_inverse=True)
-#     return y_enc.astype(np.int64), classes
-
-# def _detect_channels(x: np.ndarray) -> int:
-#     if x.ndim == 2: return 1
-#     elif x.ndim == 3: return x.shape[1]
-#     else: raise ValueError(f"Unexpected input shape: {x.shape}")
-
-# def _make_loader(x, y, batch_size, shuffle=True, device='cpu'):
-#     x_t = torch.from_numpy(x).float()
-#     if x_t.ndim == 2: x_t = x_t.unsqueeze(1)
-#     if y is not None: y_t = torch.from_numpy(y).long(); ds = TensorDataset(x_t, y_t)
-#     else: ds = TensorDataset(x_t, torch.zeros(len(x_t)))
-#     return DataLoader(ds, batch_size=batch_size, shuffle=shuffle)
-
-# def _train_epoch(model, loader, optimizer, criterion, device):
-#     model.train()
-#     total_loss = 0.0
-#     for xb, yb in loader:
-#         xb, yb = xb.to(device), yb.to(device)
-#         optimizer.zero_grad()
-#         logits = model(xb)
-#         loss = criterion(logits, yb)
-#         loss.backward()
-#         optimizer.step()
-#         total_loss += loss.item() * xb.size(0)
-#     return total_loss / len(loader.dataset)
-
-# def _get_embeddings(model, loader, device):
-#     model.eval()
-#     embeddings, labels = [], []
-#     with torch.no_grad():
-#         for xb, yb in loader:
-#             xb = xb.to(device)
-#             emb = model(xb)
-#             embeddings.append(emb.cpu().numpy())
-#             labels.append(yb.numpy())
-#     return np.vstack(embeddings), np.concatenate(labels)
-
-# def _compute_eer(embeddings, labels, num_pairs=10000, sampling_mode="balanced"):
-#     """
-#     Computes EER and AUC using different pair sampling strategies.
-#     RETURNS: (eer, auc) tuple
-#     """
-#     scores = []
-#     labels_pair = []
+    # ====================================================
+    # 5. FINAL INFERENCE ON UNSEEN SUBJECTS
+    # ====================================================
+    model.include_top = False # Final metric extraction
     
-#     # -------------------------------------------------------------------------
-#     # MODE 1: ALL PAIRS (Similarity Matrix)
-#     # -------------------------------------------------------------------------
-#     if sampling_mode == "all":
-#         print(f"[INFO] Computing ALL pairs (Full Similarity Matrix)...")
-#         sim_matrix = np.dot(embeddings, embeddings.T)
-#         truth_matrix = (labels[:, None] == labels[None, :]).astype(int)
-#         upper_tri_indices = np.triu_indices(len(labels), k=1)
-#         scores = sim_matrix[upper_tri_indices]
-#         labels_pair = truth_matrix[upper_tri_indices]
+    print(f"[INFO] Building Enrollment Templates for Unseen Subjects from Session 1...")
+    enroll_loader = _make_loader(X_enroll, y_enroll_enc, batch_size, shuffle=False)
+    emb_enroll, lab_enroll = _get_embeddings(model, enroll_loader, device)
+    
+    gallery_emb, gallery_lab = _create_templates(
+        emb_enroll, lab_enroll, method=template_fusion_method, max_beats=template_size
+    )
 
-#     # -------------------------------------------------------------------------
-#     # MODE 2: BALANCED (Standard)
-#     # -------------------------------------------------------------------------
-#     elif sampling_mode == "balanced":
-#         print(f"[INFO] Generating {num_pairs} BALANCED pairs (50/50 split)...")
-#         class_indices = collections.defaultdict(list)
-#         for idx, label in enumerate(labels):
-#             class_indices[label].append(idx)
+    print(f"[INFO] Probing with Unseen Subjects from Session 2...")
+    probe_loader = _make_loader(X_probe, y_probe_enc, batch_size, shuffle=False)
+    emb_probe, lab_probe = _get_embeddings(model, probe_loader, device)
+
+    # Because we mapped y_enroll_enc and y_probe_enc to integers, 
+    # gallery_lab and lab_probe are already perfectly aligned from 0 to N-1!
+    raw_scores = _compute_score_matrix(emb_probe, gallery_emb, method=matching_method)
+    scores = np.full((len(emb_probe), len(test_subs)), -np.inf)
+    
+    for class_idx in range(len(test_subs)):
+        gallery_mask = (gallery_lab == class_idx)
+        if np.any(gallery_mask):
+            scores[:, class_idx] = np.max(raw_scores[:, gallery_mask], axis=1)
+
+    # ====================================================
+    # 6. APPLY SCORE-LEVEL FUSION & EVALUATE
+    # ====================================================
+    final_scores, final_labels = _apply_score_fusion(scores, lab_probe, fusion_size=probe_fusion_size)
+
+    if visualize:
+        viz = Visualizer()
+        viz.plot_embeddings(emb_probe, lab_probe, title="Disjoint Cross-Session Embeddings (T-SNE)")
+
+    rank1, rank5 = _compute_metrics_identification(final_scores, final_labels)
+
+    # Update hyperparams dictionary dynamically using the local 'ep' variable
+    hyperparams['epochs'] = f"{epochs} (stopped at {ep + 1})" if (ep + 1) < epochs else epochs
+
+    if _return_stats: 
+        return (rank1, rank5), data_stats, hyperparams
+
+    if save_results_and_settings:
+        data_stats = {
+            "Train Subjects": len(train_subs), "Test Subjects": len(test_subs),
+            "Train (S1) Samples": len(X_train), "Enrollment (S1) Samples": len(X_enroll),
+            "Probe (S2) Samples": len(X_probe)
+        }
+        _log_experiment_results(task_title, {"Rank-1 Accuracy": rank1, "Rank-5 Accuracy": rank5}, 
+                                data_stats, hyperparams, loader)
+
+    return _compute_metrics_identification(final_scores, final_labels)
+
+
+# =============================================================================
+# TASK 8: SUBJECT-DISJOINT CROSS-SESSION VERIFICATION
+# =============================================================================
+def run_subject_disjoint_cross_session_verification(
+        x_s1, y_s1, x_s2, y_s2, model_class, epochs=30, batch_size=64, lr=1e-3, test_split=0.2, val_split=0.0, 
+        num_pairs=10000, sampling_mode="balanced", seed=42, device=None, visualize=False, use_template=False, 
+        template_fusion_method='mean', template_size=None, matching_method='cosine', outlier_filtering_on_train=False, 
+        outlier_filtering_on_test=False, sqi_s1=None, sqi_s2=None, sqi_threshold=0.05, sqi_keep_pct=0.8,
+        use_deployment_evaluation=False, save_results_and_settings=False, loader=None, n_runs=1, _return_stats=False):
+    """
+    The Ultimate Biometric Test: Open-Set + Temporal Robustness 1:1 Verification.
+    Verifies the identity of subjects completely excluded from representation learning, across different recording days.
+    The model learns generalized features on Session 1 of Subject Group A, and evaluates verification on Subject Group B.
+
+    Args:
+        x_s1 (np.ndarray): Input ECG signals from Session 1.
+        y_s1 (np.ndarray): Labels for Session 1.
+        x_s2 (np.ndarray): Input ECG signals from Session 2.
+        y_s2 (np.ndarray): Labels for Session 2.
+        model_class (nn.Module): The PyTorch model architecture class to instantiate.
+        epochs (int): Maximum number of training epochs.
+        batch_size (int): Number of samples per training batch.
+        lr (float): Learning rate for the Adam optimizer.
+        test_split (float): Fraction of unique SUBJECTS to isolate for the Group B tests.
+        val_split (float): Fraction of Group A subjects to use for early stopping validation.
+        num_pairs (int): Total number of Genuine and Impostor pairs to generate for evaluation.
+        sampling_mode (str): Logic used to pair beats together.
+            Options: ['balanced', 'all_genuine', 'random']
+        seed (int): Random seed for reproducibility.
+        device (str): Computation device ('cuda', 'cpu', or 'auto').
+        visualize (bool): If True, generates t-SNE scatter plots of the unseen temporal embeddings.
+        use_template (bool):
+            - False: Evaluates raw temporal space (Group B's Session 2 paired vs Group B's Session 2).
+            - True: Simulates Authentication (Group B's Session 2 probes matched vs Group B's Session 1 templates).
+        template_fusion_method (str): Logic used to create Session 1 templates.
+            Options: ['mean', 'median', 'trimmed_mean', 'representative', 'none']
+        template_size (int, optional): Number of Session 1 beats used for enrollment. None uses all available.
+        matching_method (str): Distance/Similarity metric used to score the pairs.
+            Options: ['cosine', 'euclidean', 'manhattan', 'correlation']
+        outlier_filtering_on_train (bool): Apply SQI filtering to Session 1 data.
+        outlier_filtering_on_test (bool): Apply SQI filtering to Session 2 data.
+        sqi_s1 (str or np.ndarray): SQI calculation method or pre-computed array for Session 1.
+        sqi_s2 (str or np.ndarray): SQI calculation method or pre-computed array for Session 2.
+        sqi_threshold (float): Absolute minimum SQI score required to keep a beat (0.0 to 1.0).
+        sqi_keep_pct (float): Top percentage of beats to keep per subject after filtering.
+        use_deployment_evaluation (bool): Uses unseen validation subjects from Group A to calculate a Global Threshold.
+        save_results_and_settings (bool): If True, logs results and parameters to a text file.
+        loader (object): Dataset loader instance (used for extracting metadata for logging).
+        n_runs (int): Number of independent runs (with varying seeds) for statistical validation.
+        _return_stats (bool): Internal flag used to pass data back during multi-seed recursion.
+
+    Returns:
+        tuple: (EER, AUC, d-prime, TAR @ 0.1% FAR)
+               If n_runs > 1, returns tuples of (Mean, Std_Dev) for all four metrics.
+    """
+    # --- MULTI-RUN AGGREGATOR ---
+    data_stats = {}
+    hyperparams = {
+        'epochs': epochs, 'batch_size': batch_size, 'learning_rate': lr, 'test_split': test_split, 'val_split': val_split, 
+        'num_pairs': num_pairs, 'use_template': use_template, 'template_fusion_method': template_fusion_method,
+        'template_size': template_size, 'matching_method': matching_method, 'outlier_filter_train': outlier_filtering_on_train, 
+        'outlier_filter_test': outlier_filtering_on_test
+    }
+
+    if n_runs > 1:
+        call_args = locals().copy()
+        for k in ['data_stats', 'hyperparams', 'call_args']: call_args.pop(k, None)
+        call_args.update({'n_runs': 1, '_return_stats': True, 'save_results_and_settings': False})
+        base_seed = call_args.get('seed', 42)
+        results = []
         
-#         valid_genuine_classes = [c for c, idxs in class_indices.items() if len(idxs) >= 2]
+        print(f"\n[INFO] Starting Multi-Seed Execution ({n_runs} runs)...")
+        for i in range(n_runs):
+            call_args['seed'] = base_seed + i
+            call_args['visualize'] = False 
+            print(f"\n{'='*40}\n RUN {i+1}/{n_runs} (Seed: {call_args['seed']})\n{'='*40}")
+            res, d_stats, h_params = run_subject_disjoint_cross_session_verification(**call_args) 
+            results.append(res); data_stats = d_stats; hyperparams = h_params
+                
+        metrics_t = list(zip(*results))
+        means, stds = [np.mean(m) for m in metrics_t], [np.std(m) for m in metrics_t]
         
-#         if len(valid_genuine_classes) < 2:
-#             print("[WARN] Not enough classes with multiple samples for balanced EER.")
-#             return 1.0, 0.5 # Return Tuple
+        if save_results_and_settings:
+            hyperparams['n_runs'] = n_runs
+            metrics_dict = {
+                "EER": f"{means[0]:.4f} ± {stds[0]:.4f}", "AUC": f"{means[1]:.4f} ± {stds[1]:.4f}", 
+                "d-prime": f"{means[2]:.4f} ± {stds[2]:.4f}", "TAR@0.1%FAR": f"{means[3]:.4f} ± {stds[3]:.4f}"
+            }
+            _log_experiment_results("Subject-Disjoint Cross-Session Verification", metrics_dict, data_stats, hyperparams, loader)
+        return tuple(zip(means, stds))
+    # ----------------------------
 
-#         # Genuine
-#         for _ in range(num_pairs // 2):
-#             c = np.random.choice(valid_genuine_classes)
-#             idx1, idx2 = np.random.choice(class_indices[c], 2, replace=False)
-#             scores.append(np.dot(embeddings[idx1], embeddings[idx2]))
-#             labels_pair.append(1)
+    _set_seed(seed); device = _get_device(device)
+    task_title = "Subject-Disjoint Cross-Session Verification"
+    mode_str = f"Template ({template_fusion_method}, S1 Enroll -> S2 Probe)" if use_template else "Cloud Pairs (S2 vs S2)"
+    print(f"\n[TASK] {task_title} | Mode: {mode_str} | Match: {matching_method}")
 
-#         # Imposter
-#         all_classes = list(class_indices.keys())
-#         for _ in range(num_pairs // 2):
-#             c1, c2 = np.random.choice(all_classes, 2, replace=False)
-#             idx1 = np.random.choice(class_indices[c1])
-#             idx2 = np.random.choice(class_indices[c2])
-#             scores.append(np.dot(embeddings[idx1], embeddings[idx2]))
-#             labels_pair.append(0)
+    # ====================================================
+    # 1. PREPARE & APPLY SQI FILTERS
+    # ====================================================
+    def _prepare_sqi(sqi_input, x_data, flag, name):
+        if not flag: return None
+        if sqi_input is None: return None
+        if isinstance(sqi_input, str): return np.array(_compute_sqi(x_data, method=sqi_input))
+        return np.array(sqi_input)
 
-#     # -------------------------------------------------------------------------
-#     # MODE 3: RANDOM
-#     # -------------------------------------------------------------------------
-#     elif sampling_mode == "random":
-#         print(f"[INFO] Generating {num_pairs} RANDOM pairs...")
-#         indices = np.arange(len(labels))
-#         for _ in range(num_pairs):
-#             i1, i2 = np.random.choice(indices, 2, replace=False)
-#             scores.append(np.dot(embeddings[i1], embeddings[i2]))
-#             labels_pair.append(1 if labels[i1] == labels[i2] else 0)
-#     else:
-#         raise ValueError(f"Unknown sampling_mode: {sampling_mode}")
+    sqi_s1 = _prepare_sqi(sqi_s1, x_s1, outlier_filtering_on_train, "Session 1")
+    sqi_s2 = _prepare_sqi(sqi_s2, x_s2, outlier_filtering_on_test, "Session 2")
 
-#     # Compute Metrics
-#     fpr, tpr, thresholds = roc_curve(labels_pair, scores)
-#     roc_auc = auc(fpr, tpr)
+    if sqi_s1 is not None:
+        print("\n[INFO] Filtering Session 1 (Representation & Enrollment)...")
+        x_s1, y_s1 = _apply_outlier_filter(x_s1, y_s1, sqi_s1, sqi_threshold, sqi_keep_pct)
+
+    if sqi_s2 is not None:
+        print("\n[INFO] Filtering Session 2 (Probes)...")
+        x_s2, y_s2 = _apply_outlier_filter(x_s2, y_s2, sqi_s2, sqi_threshold, sqi_keep_pct)
+
+    # ====================================================
+    # 2. INTERSECT AND SPLIT SUBJECTS
+    # ====================================================
+    common_subs = sorted(list(set(y_s1).intersection(set(y_s2))))
     
-#     try:
-#         eer = brentq(lambda x : 1. - x - interp1d(fpr, tpr)(x), 0., 1.)
-#     except Exception as e:
-#         print(f"[WARN] EER calculation failed: {e}")
-#         eer = 0.0
-
-#     print(f"[RESULT] Mode: {sampling_mode.upper()} | EER: {eer:.4f} | AUC: {roc_auc:.4f}")
-    
-#     # FIXED: Return Tuple
-#     return eer, roc_auc
-
-# # --- TASK 1: CLOSED-SET IDENTIFICATION ---
-# def run_closed_set_identification(x, y, model_class, epochs=30, batch_size=64, lr=1e-3, val_split=0.2, seed=42, device=None, visualize=False):
-#     _set_seed(seed); device = _get_device(device)
-#     print(f"\n[TASK] Closed-Set Identification on {device}")
-#     y_enc, classes = _encode_labels(y)
-#     X_train, X_test, y_train, y_test = train_test_split(x, y_enc, test_size=val_split, stratify=y_enc, random_state=seed)
-#     train_loader = _make_loader(X_train, y_train, batch_size, shuffle=True)
-#     test_loader = _make_loader(X_test, y_test, batch_size, shuffle=False)
-#     in_ch = _detect_channels(x)
-#     model = model_class(in_channels=in_ch, num_classes=len(classes), include_top=True).to(device)
-#     optimizer = torch.optim.Adam(model.parameters(), lr=lr); criterion = nn.CrossEntropyLoss()
-    
-#     for ep in range(epochs):
-#         loss = _train_epoch(model, train_loader, optimizer, criterion, device)
-#         print(f"    Epoch {ep+1:03d} | Loss: {loss:.4f}")
+    if len(common_subs) < 2: 
+        raise ValueError("[ERROR] Not enough common subjects across sessions after filtering.")
         
-#     model.eval()
-#     all_preds, all_trues = [], []
-#     with torch.no_grad():
-#         for xb, yb in test_loader:
-#             xb, yb = xb.to(device), yb.to(device)
-#             preds = torch.argmax(model(xb), dim=1)
-#             all_preds.append(preds.cpu().numpy()); all_trues.append(yb.cpu().numpy())
-#     all_preds = np.concatenate(all_preds); all_trues = np.concatenate(all_trues)
-#     acc = np.mean(all_preds == all_trues)
-#     print(f"[RESULT] Closed-Set Accuracy: {acc:.4f}")
+    train_subs_full, test_subs = train_test_split(common_subs, test_size=test_split, random_state=seed)
+    
+    if val_split > 0.0:
+        train_subs, val_subs = train_test_split(train_subs_full, test_size=val_split, random_state=seed)
+        print(f"Subject Split: Train={len(train_subs)}, Val={len(val_subs)}, Test={len(test_subs)}")
+    else:
+        train_subs = train_subs_full
+        val_subs = []
+        print(f"Subject Split: Train={len(train_subs)}, Val=0, Test={len(test_subs)}")
 
-#     if visualize:
-#         viz = Visualizer()
-#         viz.plot_confusion_matrix(all_trues, all_preds, normalize=True)
+    X_train, Y_train = x_s1[np.isin(y_s1, train_subs)], y_s1[np.isin(y_s1, train_subs)]
+    X_val_s1, Y_val_s1 = (x_s1[np.isin(y_s1, val_subs)], y_s1[np.isin(y_s1, val_subs)]) if len(val_subs) > 0 else (None, None)
+    X_val_s2, Y_val_s2 = (x_s2[np.isin(y_s2, val_subs)], y_s2[np.isin(y_s2, val_subs)]) if len(val_subs) > 0 else (None, None)
+    X_enroll, Y_enroll = x_s1[np.isin(y_s1, test_subs)], y_s1[np.isin(y_s1, test_subs)]
+    X_probe, Y_probe = x_s2[np.isin(y_s2, test_subs)], y_s2[np.isin(y_s2, test_subs)]
 
-#     return acc
+    # ====================================================
+    # 3. ENCODE LABELS (CRITICAL FIX FOR PYTORCH TENSORS)
+    # ====================================================
+    y_train_enc, train_classes = _encode_labels(Y_train)
+    num_train_classes = len(train_classes)
+    
+    if len(val_subs) > 0:
+        val_map = {sub: i for i, sub in enumerate(val_subs)}
+        y_val_s1_enc = np.array([val_map[s] for s in Y_val_s1])
+        y_val_s2_enc = np.array([val_map[s] for s in Y_val_s2])
+    else:
+        y_val_s1_enc, y_val_s2_enc = None, None
 
-# # --- TASK 2: SUBJECT-DISJOINT IDENTIFICATION (TEMPLATE MATCHING) ---
-# def run_subject_disjoint_identification(x, y, model_class, train_subject_ratio=0.7, enrollment_beats=5, epochs=30, batch_size=64, lr=1e-3, seed=42, device=None, visualize=False):
-#     _set_seed(seed); device = _get_device(device)
-#     print(f"\n[TASK] Subject-Disjoint Identification (Template Matching) on {device}")
+    test_map = {sub: i for i, sub in enumerate(test_subs)}
+    y_enroll_enc = np.array([test_map[s] for s in Y_enroll])
+    y_probe_enc = np.array([test_map[s] for s in Y_probe])
+
+    # ====================================================
+    # 4. TRAINING LOOP
+    # ====================================================
+    train_loader = _make_loader(X_train, y_train_enc, batch_size, shuffle=True)
+    val_loader_s1 = _make_loader(X_val_s1, y_val_s1_enc, batch_size, shuffle=False) if X_val_s1 is not None else None
+    val_loader_s2 = _make_loader(X_val_s2, y_val_s2_enc, batch_size, shuffle=False) if X_val_s2 is not None else None
     
-#     # ... (Splitting Logic same as before) ...
-#     subjects = np.unique(y)
-#     train_subs, test_subs = train_test_split(subjects, train_size=train_subject_ratio, random_state=seed)
+    model = model_class(in_channels=_detect_channels(x_s1), num_classes=num_train_classes, include_top=True).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr); criterion = nn.CrossEntropyLoss()
     
-#     # Train Feature Extractor (Softmax on Train Subjects)
-#     mask_train = np.isin(y, train_subs)
-#     X_train, y_train = x[mask_train], y[mask_train]
-#     y_train_enc, _ = _encode_labels(y_train)
-#     train_loader = _make_loader(X_train, y_train_enc, batch_size, shuffle=True)
-#     in_ch = _detect_channels(x)
-#     model = model_class(in_channels=in_ch, num_classes=len(train_subs), include_top=True).to(device)
-#     optimizer = torch.optim.Adam(model.parameters(), lr=lr); criterion = nn.CrossEntropyLoss()
+    best_val_eer = float('inf')
+    patience_counter = 0
+    best_model_state = None
     
-#     print("[INFO] Phase 1: Training feature extractor...")
-#     for ep in range(epochs): 
-#         loss = _train_epoch(model, train_loader, optimizer, criterion, device)
-#         print(f"    Epoch {ep+1:03d} | Loss: {loss:.4f}")
-    
-#     # Test (Nearest Neighbor Matching)
-#     print("[INFO] Phase 2: Enrollment & Matching (1-NN)...")
-#     model.include_top = False
-#     mask_test = np.isin(y, test_subs)
-#     X_test_all, y_test_all = x[mask_test], y[mask_test]
-#     X_enroll, y_enroll, X_query, y_query = [], [], [], []
-    
-#     for sub in test_subs:
-#         sub_beats = X_test_all[y_test_all == sub]
-#         if len(sub_beats) <= enrollment_beats: continue
-#         X_enroll.append(sub_beats[:enrollment_beats]); y_enroll.extend([sub]*enrollment_beats)
-#         X_query.append(sub_beats[enrollment_beats:]); y_query.extend([sub]*(len(sub_beats)-enrollment_beats))
+    for ep in range(epochs):
+        model.include_top = True
+        train_loss = _train_epoch(model, train_loader, optimizer, criterion, device)
         
-#     enroll_loader = _make_loader(np.vstack(X_enroll), None, batch_size, shuffle=False)
-#     query_loader = _make_loader(np.vstack(X_query), None, batch_size, shuffle=False)
-#     emb_enroll, _ = _get_embeddings(model, enroll_loader, device)
-#     emb_query, _ = _get_embeddings(model, query_loader, device)
-    
-#     # Create Prototypes (Mean of enrollment shots)
-#     templates, template_ids = [], []
-#     for sub in np.unique(y_enroll):
-#         idxs = np.where(np.array(y_enroll) == sub)[0]
-#         templates.append(np.mean(emb_enroll[idxs], axis=0))
-#         template_ids.append(sub)
-    
-#     # Cosine Similarity Matching
-#     sim_matrix = np.dot(normalize(emb_query), normalize(np.array(templates)).T)
-#     preds = np.array(template_ids)[np.argmax(sim_matrix, axis=1)]
-#     acc = np.mean(preds == np.array(y_query))
-    
-#     print(f"[RESULT] Subject-Disjoint Accuracy: {acc:.4f}")
-#     if visualize:
-#         viz = Visualizer()
-#         viz.plot_confusion_matrix(y_query, preds, normalize=True)
-#     return acc
+        if val_loader_s1 is not None and val_loader_s2 is not None:
+            model.include_top = False # Extract features
+            
+            val_emb_s1, val_lab_s1 = _get_embeddings(model, val_loader_s1, device)
+            val_emb_s2, val_lab_s2 = _get_embeddings(model, val_loader_s2, device)
+            
+            val_scores, val_pairs = _generate_pairs(
+                embeddings1=val_emb_s2, labels1=val_lab_s2, 
+                embeddings2=val_emb_s1, labels2=val_lab_s1, 
+                num_pairs=2000, sampling_mode="balanced", matching_method=matching_method
+            )
+            
+            if len(val_pairs) > 0:
+                fpr, tpr, _ = roc_curve(val_pairs, val_scores)
+                try: val_eer = brentq(lambda x: 1. - x - interp1d(fpr, tpr)(x), 0., 1.)
+                except: val_eer = 1.0
+            else:
+                val_eer = 1.0
+                
+            print(f"Epoch {ep+1}/{epochs} | Train Loss: {train_loss:.4f} | Val Cross-Session EER: {val_eer:.4f}")
+            
+            if val_eer < best_val_eer:
+                best_val_eer = val_eer
+                best_model_state = copy.deepcopy(model.state_dict())
+                patience_counter = 0
+            else:
+                patience_counter += 1
+                
+            if patience_counter >= 10:
+                print(f"--> Early stopping triggered at epoch {ep+1}.")
+                break
+        else:
+            print(f"Epoch {ep+1}/{epochs} | Train Loss: {train_loss:.4f}")
+            best_model_state = copy.deepcopy(model.state_dict())
+            
+    if best_model_state is not None:
+        model.load_state_dict(best_model_state)
 
-# # --- TASK 3: VERIFICATION (RANDOM SPLIT) ---
-# def run_verification(x, y, model_class, train_split=0.7, epochs=30, batch_size=64, lr=1e-3, num_pairs=10000, sampling_mode="balanced", seed=42, device=None, visualize=False):
-#     _set_seed(seed); device = _get_device(device)
-#     print(f"\n[TASK] Verification (Closed-Set) on {device}")
-#     y_enc, classes = _encode_labels(y)
-#     X_train, X_test, y_train, y_test = train_test_split(x, y_enc, test_size=(1-train_split), stratify=y_enc, random_state=seed)
-#     train_loader = _make_loader(X_train, y_train, batch_size, shuffle=True)
-#     in_ch = _detect_channels(x)
-#     model = model_class(in_channels=in_ch, num_classes=len(classes), include_top=True).to(device)
-#     optimizer = torch.optim.Adam(model.parameters(), lr=lr); criterion = nn.CrossEntropyLoss()
+    # ====================================================
+    # 5. MODEL CALIBRATION (Optional)
+    # ====================================================
+    model.include_top = False
     
-#     for ep in range(epochs): 
-#         loss = _train_epoch(model, train_loader, optimizer, criterion, device)
-#         print(f"    Epoch {ep+1:03d} | Loss: {loss:.4f}")
-    
-#     model.include_top = False
-#     test_loader = _make_loader(X_test, y_test, batch_size, shuffle=False)
-#     emb_test, labels_test = _get_embeddings(model, test_loader, device)
-    
-#     if visualize:
-#         viz = Visualizer()
-#         viz.plot_embeddings(emb_test, labels_test, title="Verification Embeddings (T-SNE)")
+    if use_deployment_evaluation:
+        print("\n[INFO] --- REAL-WORLD DEPLOYMENT EVALUATION ---")
+        if val_loader_s1 is None or val_loader_s2 is None:
+            print("[WARN] No validation set provided (val_split=0.0). Global Threshold calculation requires Validation subjects.")
+            print("[WARN] Falling back to default Threshold = 0.5")
+            global_threshold = 0.5
+        else:
+            print(f"[INFO] Extracting features for Calibration (Validation Unseen Subjects)...")
+            calib_emb_s1, calib_lab_s1 = _get_embeddings(model, val_loader_s1, device)
+            calib_emb_s2, calib_lab_s2 = _get_embeddings(model, val_loader_s2, device)
+            
+            print(f"[INFO] Generating Calibration Pairs to find Global Threshold...")
+            calib_scores, calib_pair_labels = _generate_pairs(
+                embeddings1=calib_emb_s2, labels1=calib_lab_s2, 
+                embeddings2=calib_emb_s1, labels2=calib_lab_s1,
+                num_pairs=num_pairs, sampling_mode=sampling_mode, matching_method=matching_method
+            )
+            global_threshold = _find_optimal_threshold(calib_scores, calib_pair_labels)
+            print(f"[INFO] Optimal Global Threshold Found: {global_threshold:.4f}")
 
-#     # Returns (eer, auc)
-#     return _compute_eer(normalize(emb_test), labels_test, num_pairs, sampling_mode=sampling_mode)
+    # ====================================================
+    # 6. EVALUATION STRATEGY ON UNSEEN TEST SUBJECTS
+    # ====================================================
+    probe_loader = _make_loader(X_probe, y_probe_enc, batch_size, shuffle=False)
+    emb_probe, lab_probe = _get_embeddings(model, probe_loader, device)
 
-# # --- TASK 4: SUBJECT-DISJOINT VERIFICATION ---
-# def run_subject_disjoint_verification(x, y, model_class, train_subject_ratio=0.7, epochs=30, batch_size=64, lr=1e-3, num_pairs=10000, sampling_mode="balanced", seed=42, device=None, visualize=False):
-#     _set_seed(seed); device = _get_device(device)
-#     print(f"\n[TASK] Subject-Disjoint Verification on {device}")
-#     subjects = np.unique(y)
-#     train_subs, test_subs = train_test_split(subjects, train_size=train_subject_ratio, random_state=seed)
-    
-#     mask_train = np.isin(y, train_subs)
-#     X_train, y_train_raw = x[mask_train], y[mask_train]
-#     y_train_enc, _ = _encode_labels(y_train_raw)
-#     train_loader = _make_loader(X_train, y_train_enc, batch_size, shuffle=True)
-#     in_ch = _detect_channels(x)
-#     model = model_class(in_channels=in_ch, num_classes=len(train_subs), include_top=True).to(device)
-#     optimizer = torch.optim.Adam(model.parameters(), lr=lr); criterion = nn.CrossEntropyLoss()
-    
-#     for ep in range(epochs): 
-#         loss = _train_epoch(model, train_loader, optimizer, criterion, device)
-#         print(f"    Epoch {ep+1:03d} | Loss: {loss:.4f}")
-    
-#     model.include_top = False
-#     mask_test = np.isin(y, test_subs)
-#     X_test, y_test_raw = x[mask_test], y[mask_test]
-#     test_loader = _make_loader(X_test, None, batch_size, shuffle=False)
-#     emb_test, _ = _get_embeddings(model, test_loader, device)
-
-#     if visualize:
-#         viz = Visualizer()
-#         viz.plot_embeddings(emb_test, y_test_raw, title="Verification Embeddings (T-SNE)")
-    
-#     # Returns (eer, auc)
-#     return _compute_eer(normalize(emb_test), y_test_raw, num_pairs, sampling_mode=sampling_mode)
-
-# # --- TASK 5: CROSS-SESSION IDENTIFICATION ---
-# def run_cross_session_identification(x_train, y_train, x_test, y_test, model_class, epochs=30, batch_size=64, lr=1e-3, seed=42, device=None, visualize=False):
-#     _set_seed(seed); device = _get_device(device)
-#     print(f"\n[TASK] Cross-Session Identification (Rank-1) on {device}")
-    
-#     train_subs, test_subs = np.unique(y_train), np.unique(y_test)
-#     common_subs = np.intersect1d(train_subs, test_subs)
-#     if len(common_subs) == 0: raise ValueError("No overlapping subjects!")
-    
-#     common_subs.sort()
-#     cls_map = {s: i for i, s in enumerate(common_subs)}
-    
-#     mask_train = np.isin(y_train, common_subs)
-#     X_train_filt, y_train_filt = x_train[mask_train], y_train[mask_train]
-#     y_train_enc = np.array([cls_map[s] for s in y_train_filt])
-    
-#     mask_test = np.isin(y_test, common_subs)
-#     X_test_filt, y_test_filt = x_test[mask_test], y_test[mask_test]
-#     y_test_enc = np.array([cls_map[s] for s in y_test_filt])
-    
-#     train_loader = _make_loader(X_train_filt, y_train_enc, batch_size, shuffle=True)
-#     test_loader = _make_loader(X_test_filt, y_test_enc, batch_size, shuffle=False)
-    
-#     in_ch = _detect_channels(X_train_filt)
-#     model = model_class(in_channels=in_ch, num_classes=len(common_subs), include_top=True).to(device)
-#     optimizer = torch.optim.Adam(model.parameters(), lr=lr); criterion = nn.CrossEntropyLoss()
-    
-#     for ep in range(epochs): 
-#         loss = _train_epoch(model, train_loader, optimizer, criterion, device)
-#         print(f"    Epoch {ep+1:03d} | Loss: {loss:.4f}")
-    
-#     model.eval()
-#     all_preds, all_trues = [], []
-#     with torch.no_grad():
-#         for xb, yb in test_loader:
-#             xb = xb.to(device)
-#             preds = torch.argmax(model(xb), dim=1)
-#             all_preds.extend(preds.cpu().numpy()); all_trues.extend(yb.numpy())
-#     acc = np.mean(np.array(all_preds) == np.array(all_trues))
-#     print(f"[RESULT] Cross-Session Accuracy: {acc:.4f}")
-
-#     if visualize:
-#         viz = Visualizer()
-#         viz.plot_confusion_matrix(all_trues, all_preds, normalize=True)
-#     return acc
-
-# # --- TASK 6: CROSS-SESSION VERIFICATION ---
-# def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class, epochs=30, batch_size=64, lr=1e-3, num_pairs=10000, sampling_mode="balanced", seed=42, device=None, visualize=False):
-#     _set_seed(seed); device = _get_device(device)
-#     print(f"\n[TASK] Cross-Session Verification on {device}")
-    
-#     # Train on S1
-#     all_labels = np.concatenate([y_train, y_test])
-#     unique_labels = np.unique(all_labels)
-#     label_to_int = {label: i for i, label in enumerate(unique_labels)}
-#     y_train_int = np.array([label_to_int[l] for l in y_train])
-#     y_test_int = np.array([label_to_int[l] for l in y_test])
-
-#     train_loader = _make_loader(x_train, y_train_int, batch_size, shuffle=True)
-#     in_ch = _detect_channels(x_train)
-#     model = model_class(in_channels=in_ch, num_classes=len(label_to_int), include_top=True).to(device)
-#     optimizer = torch.optim.Adam(model.parameters(), lr=lr); criterion = nn.CrossEntropyLoss()
-    
-#     for ep in range(epochs): 
-#         loss = _train_epoch(model, train_loader, optimizer, criterion, device)
-#         print(f"    Epoch {ep+1:03d} | Loss: {loss:.4f}")
+    if not use_template:
+        print(f"[INFO] Bypassing Templates. Generating pairs entirely from Session 2 for Unseen Subjects...")
+        scores, labels_pair = _generate_pairs(
+            embeddings1=emb_probe, labels1=lab_probe, 
+            embeddings2=None, labels2=None, 
+            num_pairs=num_pairs, sampling_mode=sampling_mode, matching_method=matching_method
+        )
+    else:
+        print(f"[INFO] Building Enrollment Templates for Unseen Subjects from Session 1...")
+        enroll_loader = _make_loader(X_enroll, y_enroll_enc, batch_size, shuffle=False)
+        emb_enroll, lab_enroll = _get_embeddings(model, enroll_loader, device)
         
-#     model.include_top = False
-#     loader1 = _make_loader(x_train, y_train_int, batch_size, shuffle=False)
-#     emb1, lab1 = _get_embeddings(model, loader1, device)
-#     loader2 = _make_loader(x_test, y_test_int, batch_size, shuffle=False)
-#     emb2, lab2 = _get_embeddings(model, loader2, device)
+        templates, temp_labels = _create_templates(
+            emb_enroll, lab_enroll, method=template_fusion_method, max_beats=template_size
+        )
+        
+        scores, labels_pair = _generate_pairs(
+            embeddings1=emb_probe, # Session 2 Probes
+            labels1=lab_probe, 
+            embeddings2=templates, # Session 1 Templates
+            labels2=temp_labels, 
+            num_pairs=num_pairs, 
+            sampling_mode=sampling_mode, 
+            matching_method=matching_method
+        )
+        
+    if visualize:
+        viz = Visualizer()
+        viz.plot_embeddings(emb_probe, lab_probe, title="Disjoint Cross-Session Embeddings (T-SNE)")
 
-#     # Pairing Logic (Cross-Session)
-#     scores, labels_pair = [], []
-#     s1_indices = collections.defaultdict(list)
-#     for idx, label in enumerate(lab1): s1_indices[label].append(idx)
-#     s2_indices = collections.defaultdict(list)
-#     for idx, label in enumerate(lab2): s2_indices[label].append(idx)
-#     common = list(set(s1_indices.keys()) & set(s2_indices.keys()))
-    
-#     if len(common) < 2: return 1.0, 0.5
+    if use_deployment_evaluation:
+        _evaluate_with_global_threshold(scores, labels_pair, global_threshold)
 
-#     emb1 = normalize(emb1); emb2 = normalize(emb2)
+    eer, auc_val, dprime, tar = _compute_metrics_verification(scores, labels_pair)
 
-#     if sampling_mode == "balanced":
-#         # Genuine
-#         for _ in range(num_pairs // 2):
-#             subj = np.random.choice(common)
-#             scores.append(np.dot(emb1[np.random.choice(s1_indices[subj])], emb2[np.random.choice(s2_indices[subj])]))
-#             labels_pair.append(1)
-#         # Imposter
-#         all_s2 = list(s2_indices.keys())
-#         for _ in range(num_pairs // 2):
-#             s_a = np.random.choice(list(s1_indices.keys()))
-#             possible_b = [s for s in all_s2 if s != s_a]
-#             if not possible_b: continue
-#             s_b = np.random.choice(possible_b)
-#             scores.append(np.dot(emb1[np.random.choice(s1_indices[s_a])], emb2[np.random.choice(s2_indices[s_b])]))
-#             labels_pair.append(0)
-    
-#     fpr, tpr, _ = roc_curve(labels_pair, scores)
-#     roc_auc = auc(fpr, tpr)
-#     try: eer = brentq(lambda x : 1. - x - interp1d(fpr, tpr)(x), 0., 1.)
-#     except: eer = 1.0
+    # Update hyperparams dictionary dynamically using the local 'ep' variable
+    hyperparams['epochs'] = f"{epochs} (stopped at {ep + 1})" if (ep + 1) < epochs else epochs
 
-#     print(f"[RESULT] Cross-Session EER: {eer:.4f} | AUC: {roc_auc:.4f}")
-#     if visualize:
-#         viz = Visualizer()
-#         viz.plot_embeddings(emb2, lab2, title="Verification Embeddings (T-SNE)")
+    if _return_stats: 
+        return (eer, auc_val, dprime, tar), data_stats, hyperparams
 
-#     # FIXED: Return Tuple
-#     return eer, roc_auc
+    if save_results_and_settings:
+        data_stats = {
+            "Train Subjects": len(train_subs), "Test Subjects": len(test_subs),
+            "Train (S1) Samples": len(X_train), "Enrollment (S1) Samples": len(X_enroll),
+            "Probe (S2) Samples": len(X_probe), "Test Pairs Evaluated": len(labels_pair)
+        }
+        _log_experiment_results(task_title, {"EER": eer, "AUC": auc_val, "d-prime": dprime, "TAR@0.1%FAR": tar}, 
+                                data_stats, hyperparams, loader)
+
+    return _compute_metrics_verification(scores, labels_pair)
+# =============================================================================
