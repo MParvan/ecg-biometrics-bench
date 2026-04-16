@@ -34,3 +34,13 @@ Clone the repository and install the required dependencies:
 git clone https://github.com/MParvan/ecg-biometrics-bench.git
 cd ecg-biometrics-bench
 pip install -r requirements.txt
+```
+
+---
+
+## Citation
+
+If you use ECG-Biometrics-Bench in your research, please cite our paper:
+
+
+
