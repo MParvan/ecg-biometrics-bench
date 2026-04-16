@@ -293,51 +293,197 @@ def _validate_epoch(model, loader, criterion, device):
             total_loss += loss.item() * xb.size(0)
     return total_loss / len(loader.dataset)
 
-def _run_training_loop(model, train_loader, val_loader, optimizer, criterion, device, epochs, patience=10):
+def _run_training_loop(model, train_loader, val_loader, optimizer, criterion, device, epochs, 
+                       patience=40, lr_patience=5):
     """
-    Runs training with optional validation and early stopping.
-    If val_loader is provided:
-      - Tracks validation loss.
-      - Stops if no improvement for 'patience' epochs.
-      - Restores the best model weights before returning.
+    Advanced Training Loop with LR Decay and Weight Rollback.
     """
-    best_val_loss = float('inf')
-    patience_counter = 0
-    best_model_state = None
+    best_val_metric = float('inf')
+    epochs_no_improve = 0
+    best_model_weights = copy.deepcopy(model.state_dict())
     
+    # Advanced LR Scheduler Settings
+    lr_factor = 0.8       # Reduce the learning rate
+    min_lr = 1e-6         # Do not drop below this
+
     for ep in range(epochs):
-        train_loss = _train_epoch(model, train_loader, optimizer, criterion, device)
-        
-        log_msg = f"Epoch {ep+1}/{epochs} | Train Loss: {train_loss:.4f}"
-        
+        # --- 1. TRAIN PASS ---
+        model.train()
+        train_loss = 0.0
+        for xb, yb in train_loader:
+            xb, yb = xb.to(device), yb.to(device)
+            optimizer.zero_grad()
+            out = model(xb)
+            loss = criterion(out, yb)
+            loss.backward()
+            optimizer.step()
+            train_loss += loss.item()
+        train_loss /= len(train_loader)
+
+        # --- 2. BYPASS FOR NO VALIDATION ---
+        # If the user sets val_split=0.0, we just train continuously for all epochs
+        if val_loader is None:
+            print(f"Epoch {ep+1}/{epochs} | Train Loss: {train_loss:.4f}")
+            best_model_weights = copy.deepcopy(model.state_dict())
+            actual_ep = ep + 1
+            continue  # Skips the validation and rollback logic!
+
+        # --- 3. VALIDATION PASS ---
+        val_metric = float('inf')
         if val_loader is not None:
-            val_loss = _validate_epoch(model, val_loader, criterion, device)
-            log_msg += f" | Val Loss: {val_loss:.4f}"
-            
-            # Check for improvement
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                best_model_state = copy.deepcopy(model.state_dict())
-                patience_counter = 0 # Reset
-            else:
-                patience_counter += 1
-                
-            print(log_msg)
-            
-            # Early Stopping Check
-            if patience_counter >= patience:
-                print(f"--> Early stopping triggered at epoch {ep+1}. No improvement for {patience} epochs.")
-                break
+            model.eval()
+            val_loss = 0.0
+            import torch
+            with torch.no_grad():
+                for xb, yb in val_loader:
+                    xb, yb = xb.to(device), yb.to(device)
+                    out = model(xb)
+                    val_loss += criterion(out, yb).item()
+            val_metric = val_loss / len(val_loader)
         else:
-            print(log_msg)
+            # If no validation set, use train loss as the metric to track
+            val_metric = train_loss
 
-    # Restore best model if validation was used
-    if best_model_state is not None:
-        print(f"--> Restoring best model from epoch with Val Loss: {best_val_loss:.4f}")
-        model.load_state_dict(best_model_state)
+        # --- 4. CHECK IMPROVEMENT ---
+        if val_metric < best_val_metric:
+            best_val_metric = val_metric
+            best_model_weights = copy.deepcopy(model.state_dict())
+            epochs_no_improve = 0
+            print(f"Epoch {ep+1}/{epochs} | Train: {train_loss:.4f} | Val: {val_metric:.4f}")
+        else:
+            epochs_no_improve += 1
+            print(f"Epoch {ep+1}/{epochs} | Train: {train_loss:.4f} | Val: {val_metric:.4f} | Patience: {epochs_no_improve}/{patience}")
 
+        # --- 5. LEARNING RATE DECAY & ROLLBACK ---
+        # If we hit the lr_patience limit, reduce the LR and restore the best weights!
+        if epochs_no_improve > 0 and epochs_no_improve % lr_patience == 0:
+            current_lr = optimizer.param_groups[0]['lr']
+            if current_lr > min_lr:
+                new_lr = max(current_lr * lr_factor, min_lr)
+                print(f"    -> [LR STEP] No improvement for {lr_patience} epochs.")
+                print(f"    -> Rolling back to best weights and reducing LR: {current_lr:.1e} -> {new_lr:.1e}")
+                
+                # Rollback to best state
+                model.load_state_dict(best_model_weights)
+                
+                # Apply new LR
+                for param_group in optimizer.param_groups:
+                    param_group['lr'] = new_lr
+
+        # --- 6. HARD EARLY STOPPING ---
+        if epochs_no_improve >= patience:
+            print(f"\n[INFO] Hard early stopping triggered after {ep+1} epochs.")
+            break
+
+    # Restore the absolute best weights before returning the model
+    print(f"[INFO] Training complete. Restoring best model weights.")
+    model.load_state_dict(best_model_weights)
     model.actual_epochs = ep + 1
     
+    return model
+
+def _run_train_loop_unseen_subjects(model, train_loader, val_loader_seen, val_loader_unseen, optimizer, criterion, device, 
+                                    epochs, matching_method='cosine', patience=40, lr_patience=15):
+    """
+    Advanced Training Loop for Open-Set Tasks using a Composite Metric.
+    Score = (Normalized Seen Val Loss) + (Unseen Val EER)
+    """
+    best_combined_score = float('inf')
+    patience_counter = 0
+    best_model_state = copy.deepcopy(model.state_dict())
+    
+    lr_factor = 0.8
+    min_lr = 1e-6
+    actual_ep = epochs
+    baseline_seen_loss = None # Used to normalize the CE Loss
+    
+    for ep in range(epochs):
+        # --- 1. TRAIN PASS ---
+        model.train()
+        model.include_top = True
+        train_loss = _train_epoch(model, train_loader, optimizer, criterion, device)
+
+        # --- 2. BYPASS FOR NO VALIDATION ---
+        # If the user sets val_split=0.0, we just train continuously for all epochs
+        if val_loader_seen is None and val_loader_unseen is None:
+            print(f"Epoch {ep+1}/{epochs} | Train Loss: {train_loss:.4f}")
+            best_model_state = copy.deepcopy(model.state_dict())
+            actual_ep = ep + 1
+            continue  # Skips the rest of the loop!
+        
+        # --- 3. VALIDATION PASS: SEEN SUBJECTS (Cross-Entropy Loss) ---
+        model.eval()
+        val_loss_seen = 0.0
+        if val_loader_seen is not None:
+            with torch.no_grad():
+                for xb, yb in val_loader_seen:
+                    xb, yb = xb.to(device), yb.to(device)
+                    out = model(xb)
+                    val_loss_seen += criterion(out, yb).item()
+            val_loss_seen /= len(val_loader_seen)
+        else:
+            val_loss_seen = train_loss # Fallback
+            
+        # Normalize the loss so it scales similarly to EER (1.0 -> 0.0)
+        if baseline_seen_loss is None:
+            baseline_seen_loss = val_loss_seen + 1e-8
+        norm_val_loss = val_loss_seen / baseline_seen_loss
+        
+        # --- 4. VALIDATION PASS: UNSEEN SUBJECTS (EER) ---
+        val_eer_unseen = 1.0
+        if val_loader_unseen is not None:
+            model.include_top = False # Extract Features
+            
+            # Handle Cross-Session (Tuple) vs Intra-Session (Single)
+            if isinstance(val_loader_unseen, tuple):
+                val_s1, val_s2 = val_loader_unseen
+                val_emb_s1, val_lab_s1 = _get_embeddings(model, val_s1, device)
+                val_emb_s2, val_lab_s2 = _get_embeddings(model, val_s2, device)
+                val_scores, val_pairs = _generate_pairs(val_emb_s2, val_lab_s2, val_emb_s1, val_lab_s1, 
+                                                        2000, "balanced", matching_method)
+            else:
+                val_emb, val_lab = _get_embeddings(model, val_loader_unseen, device)
+                val_scores, val_pairs = _generate_pairs(val_emb, val_lab, None, None, 
+                                                        2000, "balanced", matching_method)
+            
+            if len(val_pairs) > 0:
+                fpr, tpr, _ = roc_curve(val_pairs, val_scores)
+                try: val_eer_unseen = brentq(lambda x: 1. - x - interp1d(fpr, tpr)(x), 0., 1.)
+                except: pass
+                
+        # --- 5. COMPOSITE SCORE CALCULATION ---
+        combined_score = norm_val_loss + val_eer_unseen
+        
+        # --- 6. CHECK IMPROVEMENT & ROLLBACK ---
+        if combined_score < best_combined_score:
+            best_combined_score = combined_score
+            best_model_state = copy.deepcopy(model.state_dict())
+            patience_counter = 0
+            print(f"Epoch {ep+1}/{epochs} | Train Loss: {train_loss:.4f} | Seen Val Loss: {val_loss_seen:.4f} | Unseen EER: {val_eer_unseen:.4f} | Score: {combined_score:.4f}")
+        else:
+            patience_counter += 1
+            print(f"Epoch {ep+1}/{epochs} | Train Loss: {train_loss:.4f} | Seen Val Loss: {val_loss_seen:.4f} | Unseen EER: {val_eer_unseen:.4f} | Score: {combined_score:.4f} | Patience: {patience_counter}/{patience}")
+            
+            if patience_counter > 0 and patience_counter % lr_patience == 0:
+                current_lr = optimizer.param_groups[0]['lr']
+                if current_lr > min_lr:
+                    new_lr = max(current_lr * lr_factor, min_lr)
+                    print(f"    -> [LR STEP] No improvement for {lr_patience} epochs.")
+                    print(f"    -> Rolling back to best weights and reducing LR: {current_lr:.1e} -> {new_lr:.1e}")
+                    model.load_state_dict(best_model_state)
+                    for param_group in optimizer.param_groups:
+                        param_group['lr'] = new_lr
+            
+            if patience_counter >= patience:
+                print(f"--> Hard early stopping triggered at epoch {ep+1}.")
+                actual_ep = ep + 1
+                break
+                
+    print(f"[INFO] Training complete. Restoring best model weights.")
+    if best_model_state is not None:
+        model.load_state_dict(best_model_state)
+    model.actual_epochs = actual_ep
+
     return model
 
 def _get_embeddings(model, loader, device):
@@ -431,7 +577,7 @@ def _compute_metrics_identification(preds_probs, true_labels):
 # HELPER: PAIR GENERATION (Supports ALL, BALANCED, RANDOM)
 # =============================================================================
 def _generate_pairs(embeddings1, labels1, embeddings2=None, labels2=None, 
-                    num_pairs=10000, sampling_mode="balanced", matching_method='cosine'):
+                    num_pairs=10000, sampling_mode="all", matching_method='cosine'):
     """
     Generates similarity scores and ground truth labels for verification.
     

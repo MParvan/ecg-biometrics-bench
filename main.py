@@ -3,6 +3,8 @@ import sys
 import numpy as np
 import yaml
 from pathlib import Path
+import run
+import utils
 
 # Import Dataset Loaders
 from load_dataset import (
@@ -36,7 +38,7 @@ def get_parser():
             "datasets, biometric tasks, and neural network architectures.\n\n"
             "Supported Tasks:\n"
             "  1 : Closed-Set Identification           (Intra-session, Known Subjects)\n"
-            "  2 : Verification                        (Intra-session, Known Subjects)\n"
+            "  2 : Closed-Set Verification             (Intra-session, Known Subjects)\n"
             "  3 : Subject-Disjoint Identification     (Intra-session, Unseen Subjects)\n"
             "  4 : Subject-Disjoint Verification       (Intra-session, Unseen Subjects)\n"
             "  5 : Cross-Session Identification        (Temporal Robustness, Known)\n"
@@ -97,11 +99,11 @@ def get_parser():
     # TRAINING HYPERPARAMETERS
     # ----------------------------------------------------
     train_group = parser.add_argument_group('Training Hyperparameters')
-    train_group.add_argument('--epochs', type=int, default=30, help="Max epochs (default: 30).")
-    train_group.add_argument('--batch_size', type=int, default=64, help="Batch size (default: 64).")
+    train_group.add_argument('--epochs', type=int, default=150, help="Max epochs (default: 150).")
+    train_group.add_argument('--batch_size', type=int, default=256, help="Batch size (default: 256).")
     train_group.add_argument('--lr', type=float, default=1e-3, help="Learning rate (default: 0.001).")
     train_group.add_argument('--test_split', type=float, default=0.2, help="Percentage for Test set (default: 0.2).")
-    train_group.add_argument('--val_split', type=float, default=0.0, help="Percentage for Validation set (default: 0.0).")
+    train_group.add_argument('--val_split', type=float, default=0.1, help="Percentage for Validation set (default: 0.0).")
     train_group.add_argument('--seed', type=int, default=42, help="Random seed for reproducibility.")
 
     # ----------------------------------------------------
@@ -217,13 +219,14 @@ def main():
     # ==========================================
     # Tasks 1 to 4: Intra-Session or Single Array operations
     if args.task in [1, 2, 3, 4]:
-        # If it's a dataset that requires specific routing, pull the train session.
-        # Otherwise, load all available data.
         if args.dataset in ['cybhi', 'heartprint']:
             x, y = loader.load_session("train")
         else:
-            try: x, y = loader.load_session("train")
-            except: x, y = loader.load_all_data()
+            # EXPLICIT ROUTING: No more try/except guessing!
+            if args.data_split_mode in ["all-available", "single-session"]:
+                x, y = loader.load_all_data()
+            else:
+                x, y = loader.load_session("train")
 
         print(f"\n[INFO] Data Loaded: X={x.shape}, Y={y.shape}")
         if x.shape[0] == 0:

@@ -1,30 +1,62 @@
-# ==========================================
-# EXPERIMENT CONFIGURATION TEMPLATE
-# ==========================================
+# ==============================================================================
+# 🫀 ECG BIOMETRICS FRAMEWORK - GLOBAL EXPERIMENT CONFIGURATION
+# ==============================================================================
 
-# --- Training Hyperparameters ---
-epochs: 35
-batch_size: 64
-lr: 0.001
-test_split: 0.2
-val_split: 0.1
-seed: 42
+# --- 1. CORE MODEL SETTINGS ---
+model: 'deepecg'
+# Available options:
+# - 'deepecg'     : DeepECG CNN architecture (Default, highly effective)
+# - 'resnet1d'    : 1D ResNet architecture
+# - 'rnn'         : Recurrent Neural Network (LSTM/GRU)
+# - 'hybrid'      : CNN-LSTM Hybrid architecture
+# - 'transformer' : ECG Transformer network
 
-# --- Evaluation & Biometric Settings ---
-use_template: true
-template_fusion_method: "representative"
-template_size: null  # Leave as null (or ~) to use all available beats
-matching_method: "cosine"
-num_pairs: 10000
+# --- 2. TRAINING HYPERPARAMETERS ---
+epochs: 150             # Maximum number of training epochs
+batch_size: 256         # Number of ECG signals per training batch
+lr: 0.001               # Learning rate for the Adam optimizer (e.g., 1e-3)
+test_split: 0.2         # Fraction of subjects/data held out for testing (0.0 to 1.0)
+val_split: 0.1          # Validation split used for Verification tasks (ID tasks automatically override this to 0)
+seed: 42                # Random seed for reproducibility across splits and weights
+n_runs: 5               # Number of independent runs (with varying seeds) for robust statistical validation
 
-# --- Signal Quality & Filtering ---
-outlier_filtering_on_train: true
-outlier_filtering_on_test: false
-sqi_method: "kurtosis"
-sqi_threshold: 0.05
-sqi_keep_pct: 0.80
+# --- 3. BIOMETRIC EVALUATION & TEMPLATE SETTINGS ---
+use_template: true      # true: Extract features for Gallery/Probe matching. false: Standard Softmax classification
+template_fusion_method: 'mean'
+# Available options:
+# - 'mean'          : Averages embeddings (Standard, fast)
+# - 'median'        : Median of embeddings (Robust to outliers)
+# - 'trimmed_mean'  : Removes top/bottom % before averaging
+# - 'representative': Selects the single beat closest to the class mean
+# - 'none'          : Keeps all individual beats in the gallery (no fusion)
 
-# --- Logging & Misc ---
-save_results: true
-visualize: false
-device: "auto"
+template_size: null     # Number of beats to form the gallery template (e.g., 1, 5, or null/None to use all available)
+probe_fusion_size: 3    # Number of consecutive probe beats to average before searching the gallery (Score-Level Fusion)
+
+matching_method: 'cosine'
+# Available options:
+# - 'cosine'      : Cosine similarity / distance (Best for normalized embeddings)
+# - 'euclidean'   : L2 distance
+# - 'manhattan'   : L1 distance
+# - 'correlation' : Pearson correlation distance
+
+num_pairs: 10000        # Number of Genuine/Impostor pairs to generate for Verification evaluation
+sampling_mode: 'balanced'
+# Available options:
+# - 'balanced'    : 50% Genuine, 50% Impostor pairs
+# - 'all'         : Exhaustive pairing of all possible combinations
+# - 'random'      : Purely random sampling
+
+use_deployment_evaluation: false # true: Calculates Global Threshold on Validation set, applies to Test set
+
+# --- 4. SIGNAL QUALITY & OUTLIER FILTERING ---
+outlier_filtering_on_train: false  # true: Filters noisy beats during representation learning/enrollment
+outlier_filtering_on_test: false   # true: Filters noisy beats from probes before matching
+sqi_method: 'kurtosis'             # SQI calculation metric (e.g., 'kurtosis')
+sqi_threshold: 0.05                # Absolute minimum SQI score required to keep a beat (0.0 to 1.0)
+sqi_keep_pct: 0.80                 # Top percentage of beats to keep per subject after filtering (e.g., 0.80 = 80%)
+
+# --- 5. HARDWARE & LOGGING ---
+device: 'auto'                  # 'cuda' (GPU), 'cpu', or 'auto' (detects available hardware)
+visualize: false                # true: Generates t-SNE scatter plots and confusion matrices (disable for multi-run loops)
+save_results_and_settings: true # true: Automatically writes params and metrics to .txt logs

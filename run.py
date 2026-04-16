@@ -3,17 +3,23 @@
 # UNIFIED TRAINING & EVALUATION UTILITY FOR ECG BIOMETRICS
 # -----------------------------------------------------------------------------
 # This module handles the core deep learning and biometric evaluation logic.
-# It supports:
-#   1. Closed-Set Identification (Who is this person?)
-#   2. Subject-Disjoint Identification (Can we identify new people via templates?)
-#   3. Verification (Is this person who they claim to be? - Random Split)
-#   4. Subject-Disjoint Verification (Generalization to unseen subjects)
-#   5. Cross-Session Identification (Temporal Robustness)
-#   6. Cross-Session Verification (Temporal Robustness)
+# It features advanced training loops including dynamic Learning Rate rollback,
+# strict temporal isolation, and a Composite Validation Metric (CE Loss + EER) 
+# to optimize Open-Set generalization.
+#
+# SUPPORTED TASKS:
+#   1. Closed-Set Identification           (Intra-session, Known Subjects)
+#   2. Closed-Set Verification             (Intra-session, Known Subjects)
+#   3. Subject-Disjoint Identification     (Intra-session, Unseen Subjects)
+#   4. Subject-Disjoint Verification       (Intra-session, Unseen Subjects)
+#   5. Cross-Session Identification        (Temporal Robustness, Known Subjects)
+#   6. Cross-Session Verification          (Temporal Robustness, Known Subjects)
+#   7. Subject-Disjoint Cross-Session ID   (Ultimate Test: Unseen + Temporal)
+#   8. Subject-Disjoint Cross-Session Verif(Ultimate Test: Unseen + Temporal)
 #
 # METRICS:
-#   - ID: Rank-1 Accuracy, Rank-5 Accuracy (CMC)
-#   - Verif: EER, AUC, d-prime, TAR @ 0.1% FAR
+#   - Identification: Rank-1 Accuracy, Rank-5 Accuracy (with Score-Level Fusion)
+#   - Verification:   EER, AUC, d-prime, TAR @ 0.1% FAR
 # -----------------------------------------------------------------------------
 
 import numpy as np
@@ -33,7 +39,7 @@ from utils import (
     _get_embeddings, _create_templates, _generate_pairs, _apply_score_fusion,
     _find_optimal_threshold, _evaluate_with_global_threshold,
     _compute_metrics_identification, _compute_metrics_verification,
-    _run_training_loop, _train_epoch, _detect_channels
+    _run_training_loop, _run_train_loop_unseen_subjects, _train_epoch, _detect_channels
 )
 
 import torch
@@ -125,13 +131,13 @@ def _log_experiment_results(task_name, metrics_dict, data_stats, hyperparams, lo
 # =============================================================================
 # TASK 1: CLOSED-SET IDENTIFICATION
 # =============================================================================
-def run_closed_set_identification(x, y, model_class, epochs=30, batch_size=64, 
-                                  lr=1e-3, test_split=0.2, val_split=0.0, seed=42, 
+def run_closed_set_identification(x, y, model_class, epochs=150, batch_size=256, 
+                                  lr=1e-3, test_split=0.2, val_split=0.1, seed=42, 
                                   device=None, visualize=False, use_template=False, 
                                   template_fusion_method='mean', template_size=None,
                                   matching_method='cosine', outlier_filtering_on_train=False,
                                   outlier_filtering_on_test=False, sqi_scores=None,
-                                  sqi_threshold=0.05, sqi_keep_pct=0.8, probe_fusion_size=1,
+                                  sqi_threshold=0.05, sqi_keep_pct=0.8, probe_fusion_size=3,
                                   save_results_and_settings=False, loader=None, 
                                   n_runs=1, _return_stats=False):
     """
@@ -174,6 +180,10 @@ def run_closed_set_identification(x, y, model_class, epochs=30, batch_size=64,
         tuple: (Rank-1 Accuracy, Rank-5 Accuracy)
                If n_runs > 1, returns tuples of (Mean, Std_Dev) for both metrics.
     """
+
+    # ====================================================
+    # 0. Capture Hyperparameters for Logger & MULTI-RUN AGGREGATOR
+    # ====================================================
     data_stats = {}
     hyperparams = {
         'epochs': epochs, 'batch_size': batch_size, 'learning_rate': lr, 
@@ -240,17 +250,6 @@ def run_closed_set_identification(x, y, model_class, epochs=30, batch_size=64,
     task_title = "Closed-Set Identification"
     mode_str = f"Template ({template_fusion_method}, {matching_method})" if use_template else "Softmax"
     print(f"\n[TASK] {task_title} | Mode: {mode_str} | Device: {device}")
-
-    # ====================================================
-    # 0. Capture Hyperparameters for Logger
-    # ====================================================
-    hyperparams = {
-        'epochs': epochs, 'batch_size': batch_size, 'learning_rate': lr, 
-        'test_split': test_split, 'val_split': val_split, 'use_template': use_template,
-        'template_fusion_method': template_fusion_method, 'template_size': template_size,
-        'matching_method': matching_method, 'probe_fusion_size': probe_fusion_size,
-        'outlier_filter_train': outlier_filtering_on_train, 'outlier_filter_test': outlier_filtering_on_test
-    }
 
     # ====================================================
     # 1. DYNAMIC SQI CALCULATION
@@ -360,7 +359,7 @@ def run_closed_set_identification(x, y, model_class, epochs=30, batch_size=64,
     model = model_class(in_channels=_detect_channels(x), num_classes=len(classes), include_top=True).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr); criterion = nn.CrossEntropyLoss()
     
-    model = _run_training_loop(model, train_loader, val_loader, optimizer, criterion, device, epochs, patience=10)
+    model = _run_training_loop(model, train_loader, val_loader, optimizer, criterion, device, epochs)
 
     # 4. Evaluation Logic
     if not use_template:
@@ -446,12 +445,15 @@ def run_closed_set_identification(x, y, model_class, epochs=30, batch_size=64,
 # =============================================================================
 # TASK 2: CLOSED-SET VERIFICATION
 # =============================================================================
-def run_closed_set_verification(x, y, model_class, epochs=30, batch_size=64, lr=1e-3, test_split=0.2, val_split=0.0, 
-                                num_pairs=10000, sampling_mode="balanced", seed=42, device=None, visualize=False,
-                                use_template=False, template_fusion_method='mean', template_size=None, matching_method='cosine',
-                                outlier_filtering_on_train=False, outlier_filtering_on_test=False, sqi_scores=None,
-                                sqi_threshold=0.05, sqi_keep_pct=0.8, use_deployment_evaluation=False,
-                                save_results_and_settings=False, loader=None, n_runs=1, _return_stats=False):
+def run_closed_set_verification(x, y, model_class, epochs=150, batch_size=256, lr=1e-3,
+                                test_split=0.2, val_split=0.0, num_pairs=10000, 
+                                sampling_mode="all", seed=42, device=None, visualize=False,
+                                use_template=False, template_fusion_method='mean', 
+                                template_size=None, matching_method='cosine',
+                                outlier_filtering_on_train=False, outlier_filtering_on_test=False, 
+                                sqi_scores=None, sqi_threshold=0.05, sqi_keep_pct=0.8, 
+                                use_deployment_evaluation=False, save_results_and_settings=False, 
+                                loader=None, n_runs=1, _return_stats=False):
     """
     Standard Closed-Set Verification Pipeline (Intra-session).
     Determines "Is this person who they claim to be?" (1:1 matching) for subjects known to the model.
@@ -467,7 +469,7 @@ def run_closed_set_verification(x, y, model_class, epochs=30, batch_size=64, lr=
         val_split (float): Fraction of the training data to use for early stopping.
         num_pairs (int): Total number of Genuine and Impostor pairs to generate for evaluation.
         sampling_mode (str): Logic used to pair beats together.
-            Options: ['balanced' (50/50 split), 'all_genuine', 'random']
+            Options: ['balanced' (50/50 split), 'all', 'random']
         seed (int): Random seed for reproducibility.
         device (str): Computation device ('cuda', 'cpu', or 'auto').
         visualize (bool): If True, generates t-SNE scatter plots of the test embeddings.
@@ -495,8 +497,9 @@ def run_closed_set_verification(x, y, model_class, epochs=30, batch_size=64, lr=
         tuple: (EER, AUC, d-prime, TAR @ 0.1% FAR)
                If n_runs > 1, returns tuples of (Mean, Std_Dev) for all four metrics.
     """
+
     # ====================================================
-    # 0. Capture Hyperparameters for Logger
+    # 0. Capture Hyperparameters for Logger & MULTI-RUN AGGREGATOR
     # ====================================================
     data_stats = {}
     hyperparams = {
@@ -513,7 +516,8 @@ def run_closed_set_verification(x, y, model_class, epochs=30, batch_size=64, lr=
     # --- MULTI-RUN AGGREGATOR ---
     if n_runs > 1:
         call_args = locals().copy()
-        for k in ['data_stats', 'hyperparams', 'call_args']: call_args.pop(k, None)
+        for k in ['data_stats', 'hyperparams', 'call_args']: 
+            call_args.pop(k, None)
         call_args.update({'n_runs': 1, '_return_stats': True, 'save_results_and_settings': False})
         base_seed = call_args.get('seed', 42)
         results = []
@@ -524,7 +528,9 @@ def run_closed_set_verification(x, y, model_class, epochs=30, batch_size=64, lr=
             call_args['visualize'] = False 
             print(f"\n{'='*40}\n RUN {i+1}/{n_runs} (Seed: {call_args['seed']})\n{'='*40}")
             res, d_stats, h_params = run_closed_set_verification(**call_args) 
-            results.append(res); data_stats = d_stats; hyperparams = h_params
+            results.append(res)
+            data_stats = d_stats
+            hyperparams = h_params
                 
         metrics_t = list(zip(*results))
         means, stds = [np.mean(m) for m in metrics_t], [np.std(m) for m in metrics_t]
@@ -535,12 +541,12 @@ def run_closed_set_verification(x, y, model_class, epochs=30, batch_size=64, lr=
                 "EER": f"{means[0]:.4f} ± {stds[0]:.4f}", "AUC": f"{means[1]:.4f} ± {stds[1]:.4f}", 
                 "d-prime": f"{means[2]:.4f} ± {stds[2]:.4f}", "TAR@0.1%FAR": f"{means[3]:.4f} ± {stds[3]:.4f}"
             }
-            _log_experiment_results("Random-Split Verification", metrics_dict, data_stats, hyperparams, loader)
+            _log_experiment_results("Closed-Set Verification", metrics_dict, data_stats, hyperparams, loader)
         return tuple(zip(means, stds))
     # ----------------------------
 
     _set_seed(seed); device = _get_device(device)
-    task_title = "Random-Split Verification"
+    task_title = "Closed-Set Verification"
     mode_str = f"Template ({template_fusion_method}, size={template_size})" if use_template else "Cloud Pairs (Test Only)"
     print(f"\n[TASK] {task_title} | Mode: {mode_str} | Match: {matching_method}")
 
@@ -644,8 +650,9 @@ def run_closed_set_verification(x, y, model_class, epochs=30, batch_size=64, lr=
     
     # 7. Train Model
     model = model_class(in_channels=_detect_channels(x), num_classes=len(classes), include_top=True).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr); criterion = nn.CrossEntropyLoss()
-    model = _run_training_loop(model, train_loader, val_loader, optimizer, criterion, device, epochs, patience=10)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    criterion = nn.CrossEntropyLoss()
+    model = _run_training_loop(model, train_loader, val_loader, optimizer, criterion, device, epochs)
     
     # Switch model to feature extractor
     model.include_top = False
@@ -748,11 +755,15 @@ def run_closed_set_verification(x, y, model_class, epochs=30, batch_size=64, lr=
 # =============================================================================
 # TASK 3: SUBJECT-DISJOINT IDENTIFICATION (OPEN SET / TEMPLATE MATCHING)
 # =============================================================================
-def run_subject_disjoint_identification(x, y, model_class, epochs=30, batch_size=64, lr=1e-3, test_split=0.2, val_split=0.0, 
-                                        seed=42, device=None, visualize=False, use_template=True, template_fusion_method='mean', 
-                                        template_size=1, matching_method='cosine', outlier_filtering_on_train=False, 
-                                        outlier_filtering_on_test=False, sqi_scores=None, sqi_threshold=0.05, sqi_keep_pct=0.8,
-                                        probe_fusion_size=1, save_results_and_settings=False, loader=None, n_runs=1, _return_stats=False):
+def run_subject_disjoint_identification(x, y, model_class, epochs=150, batch_size=256, lr=1e-3, 
+                                        test_split=0.2, val_split=0.1, seed=42, device=None, 
+                                        visualize=False, use_template=True, 
+                                        template_fusion_method='mean', template_size=1, 
+                                        matching_method='cosine', outlier_filtering_on_train=False, 
+                                        outlier_filtering_on_test=False, sqi_scores=None, 
+                                        sqi_threshold=0.05, sqi_keep_pct=0.8, probe_fusion_size=3, 
+                                        save_results_and_settings=False, loader=None, 
+                                        n_runs=1, _return_stats=False):
     """
     Subject-Disjoint Identification Pipeline (Open-Set).
     Evaluates identification performance on subjects entirely UNSEEN during the training phase.
@@ -791,6 +802,7 @@ def run_subject_disjoint_identification(x, y, model_class, epochs=30, batch_size
         tuple: (Rank-1 Accuracy, Rank-5 Accuracy)
                If n_runs > 1, returns tuples of (Mean, Std_Dev) for both metrics.
     """   
+
     # --- ENFORCE OUR AGREED TERMINOLOGY ---
     if not use_template:
         raise ValueError(
@@ -804,10 +816,13 @@ def run_subject_disjoint_identification(x, y, model_class, epochs=30, batch_size
     if template_size is None:
         template_size = 1 # Fallback to single-shot enrollment
 
-    # --- MULTI-RUN AGGREGATOR ---
+    # ====================================================
+    # 0. Capture Hyperparameters for Logger & MULTI-RUN AGGREGATOR
+    # ====================================================
     data_stats = {}
     hyperparams = {
-        'epochs': epochs, 'batch_size': batch_size, 'learning_rate': lr, 'test_split_subjects': test_split, 'val_split': val_split,
+        'epochs': epochs, 'batch_size': batch_size, 'learning_rate': lr, 
+        'test_split_subjects': test_split, 'val_split': val_split,
         'template_fusion_method': template_fusion_method, 'template_size': template_size, 
         'matching_method': matching_method, 'probe_fusion_size': probe_fusion_size,
         'outlier_filter_train': outlier_filtering_on_train, 'outlier_filter_test': outlier_filtering_on_test
@@ -941,62 +956,35 @@ def run_subject_disjoint_identification(x, y, model_class, epochs=30, batch_size
     # ====================================================
     # 6. LOADERS & CUSTOM TRAINING LOOP
     # ====================================================
-    train_loader = _make_loader(X_train, y_train_remap, batch_size, shuffle=True)
-    if X_val is not None:
-        val_loader = _make_loader(X_val, y_val, batch_size, shuffle=False)
+    # Create a Validation split from the SEEN Training subjects
+    if val_split > 0.0:
+        X_tr, X_val_seen, y_tr, y_val_seen = train_test_split(
+            X_train, y_train_remap, test_size=val_split, stratify=y_train_remap, random_state=seed
+        )
+        # Create loader ONLY if we actually made a split
+        val_loader_seen = _make_loader(X_val_seen, y_val_seen, batch_size, shuffle=False)
     else:
-        X_val, val_loader = None, None
-        
+        X_tr, y_tr = X_train, y_train_remap
+        # Gracefully assign None without calling _make_loader
+        val_loader_seen = None
+    
+    train_loader = _make_loader(X_tr, y_tr, batch_size, shuffle=True)
+    
+    # This remains the UNSEEN Validation subjects loader
+    val_loader_unseen = _make_loader(X_val, y_val, batch_size, shuffle=False) if X_val is not None else None
+    
     test_loader = _make_loader(X_test, y_test, batch_size, shuffle=False)
     
     model = model_class(in_channels=_detect_channels(x), num_classes=num_train_classes, include_top=True).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr); criterion = nn.CrossEntropyLoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    criterion = nn.CrossEntropyLoss()
     
-    best_val_eer = float('inf')
-    patience_counter = 0
-    best_model_state = None
-    
-    for ep in range(epochs):
-        model.include_top = True # Extract Logits
-        train_loss = _train_epoch(model, train_loader, optimizer, criterion, device)
-        
-        if val_loader is not None:
-            model.include_top = False # Extract Features
-            val_emb, val_lab = _get_embeddings(model, val_loader, device)
-            
-            # Evaluate Validation Set purely on feature separation (EER)
-            val_scores, val_pairs = _generate_pairs(
-                embeddings1=val_emb, labels1=val_lab, 
-                embeddings2=None, labels2=None, 
-                num_pairs=2000, sampling_mode="balanced", matching_method=matching_method
-            )
-            
-            if len(val_pairs) > 0:
-                fpr, tpr, _ = roc_curve(val_pairs, val_scores)
-                try: val_eer = brentq(lambda x: 1. - x - interp1d(fpr, tpr)(x), 0., 1.)
-                except: val_eer = 1.0
-            else:
-                val_eer = 1.0
-                
-            print(f"Epoch {ep+1}/{epochs} | Train Loss: {train_loss:.4f} | Val EER: {val_eer:.4f}")
-            
-            if val_eer < best_val_eer:
-                best_val_eer = val_eer
-                best_model_state = copy.deepcopy(model.state_dict())
-                patience_counter = 0
-            else:
-                patience_counter += 1
-                
-            if patience_counter >= 10:
-                print(f"--> Early stopping triggered at epoch {ep+1}.")
-                break
-        else:
-            print(f"Epoch {ep+1}/{epochs} | Train Loss: {train_loss:.4f}")
-            best_model_state = copy.deepcopy(model.state_dict())
-            
-    if best_model_state is not None:
-        model.load_state_dict(best_model_state)
-        
+    # Call the updated custom loop passing both validation loaders of seen and unseen subjects!
+    model = _run_train_loop_unseen_subjects(
+        model, train_loader, val_loader_seen, val_loader_unseen, optimizer, criterion, device, 
+        epochs, matching_method=matching_method, patience=40, lr_patience=15
+    )
+
     # ====================================================
     # 7. FINAL INFERENCE ON UNSEEN TEST SUBJECTS
     # ====================================================
@@ -1056,9 +1044,6 @@ def run_subject_disjoint_identification(x, y, model_class, epochs=30, batch_size
 
     rank1, rank5 = _compute_metrics_identification(final_scores, final_labels)
 
-    # Update hyperparams dictionary dynamically using the local 'ep' variable
-    hyperparams['epochs'] = f"{epochs} (stopped at {ep + 1})" if (ep + 1) < epochs else epochs
-
     if _return_stats: 
         return (rank1, rank5), data_stats, hyperparams
 
@@ -1081,12 +1066,15 @@ def run_subject_disjoint_identification(x, y, model_class, epochs=30, batch_size
 # =============================================================================
 # TASK 4: SUBJECT-DISJOINT VERIFICATION
 # =============================================================================
-def run_subject_disjoint_verification(x, y, model_class, epochs=30, batch_size=64, lr=1e-3, test_split=0.2, val_split=0.0, 
-                                      num_pairs=10000, sampling_mode="balanced", seed=42, device=None, visualize=False,
-                                      use_template=False, template_fusion_method='mean', template_size=1, matching_method='cosine',
-                                      outlier_filtering_on_train=False, outlier_filtering_on_test=False, sqi_scores=None, 
-                                      sqi_threshold=0.05, sqi_keep_pct=0.8, use_deployment_evaluation=False, 
-                                      save_results_and_settings=False, loader=None, n_runs=1, _return_stats=False):
+def run_subject_disjoint_verification(x, y, model_class, epochs=150, batch_size=256, lr=1e-3, 
+                                      test_split=0.2, val_split=0.1, num_pairs=10000, 
+                                      sampling_mode="balanced", seed=42, device=None, 
+                                      visualize=False, use_template=False, template_fusion_method='mean', 
+                                      template_size=1, matching_method='cosine',
+                                      outlier_filtering_on_train=False, outlier_filtering_on_test=False, 
+                                      sqi_scores=None, sqi_threshold=0.05, sqi_keep_pct=0.8, 
+                                      use_deployment_evaluation=False, save_results_and_settings=False, 
+                                      loader=None, n_runs=1, _return_stats=False):
     """
     Subject-Disjoint Verification Pipeline (Open-Set 1:1 Matching).
     Tests the system's ability to verify the identity of completely new users.
@@ -1131,12 +1119,16 @@ def run_subject_disjoint_verification(x, y, model_class, epochs=30, batch_size=6
                If n_runs > 1, returns tuples of (Mean, Std_Dev) for all four metrics.
     """
 
-    # --- MULTI-RUN AGGREGATOR ---
+    # ====================================================
+    # 0. Capture Hyperparameters for Logger & MULTI-RUN AGGREGATOR
+    # ====================================================
     data_stats = {}
     hyperparams = {
-        'epochs': epochs, 'batch_size': batch_size, 'learning_rate': lr, 'test_split_subjects': test_split, 'val_split': val_split, 'num_pairs': num_pairs,
-        'use_template': use_template, 'template_fusion_method': template_fusion_method, 'template_size': template_size, 
-        'matching_method': matching_method, 'outlier_filter_train': outlier_filtering_on_train, 'outlier_filter_test': outlier_filtering_on_test
+        'epochs': epochs, 'batch_size': batch_size, 'learning_rate': lr, 
+        'test_split_subjects': test_split, 'val_split': val_split, 'num_pairs': num_pairs,
+        'use_template': use_template, 'template_fusion_method': template_fusion_method, 
+        'template_size': template_size, 'matching_method': matching_method, 
+        'outlier_filter_train': outlier_filtering_on_train, 'outlier_filter_test': outlier_filtering_on_test
     }
 
     if n_runs > 1:
@@ -1174,8 +1166,6 @@ def run_subject_disjoint_verification(x, y, model_class, epochs=30, batch_size=6
     task_title = "Subject-Disjoint Verification"        
     mode_str = f"Template ({template_fusion_method}, First {template_size})" if use_template else "Cloud Pairs (Test Only)"
     print(f"\n[TASK] {task_title} | Mode: {mode_str} | Match: {matching_method}")
-
-    
 
     # ====================================================
     # 1. DYNAMIC SQI CALCULATION
@@ -1271,69 +1261,47 @@ def run_subject_disjoint_verification(x, y, model_class, epochs=30, batch_size=6
     if num_train_classes < 2:
         raise ValueError("[ERROR] Too few Train subjects remaining after filtering.")
 
-    # ====================================================
+# ====================================================
     # 6. LOADERS & CUSTOM TRAINING LOOP
     # ====================================================
-    train_loader = _make_loader(X_train, y_train_remap, batch_size, shuffle=True)
-    if X_val is not None:
-        val_loader = _make_loader(X_val, y_val, batch_size, shuffle=False)
+    # Create a Validation split from the SEEN Training subjects
+    # This gives us the smooth Cross-Entropy loss anchor for the composite metric
+    if val_split > 0.0:
+        X_tr, X_val_seen, y_tr, y_val_seen = train_test_split(
+            X_train, y_train_remap, test_size=val_split, stratify=y_train_remap, random_state=seed
+        )
+        # Create loader ONLY if we actually made a split
+        val_loader_seen = _make_loader(X_val_seen, y_val_seen, batch_size, shuffle=False)
     else:
-        X_val, val_loader = None, None
-        
+        X_tr, y_tr = X_train, y_train_remap
+        # Gracefully assign None without calling _make_loader
+        val_loader_seen = None
+    
+    train_loader = _make_loader(X_tr, y_tr, batch_size, shuffle=True)
+    
+    # This remains the UNSEEN Validation subjects loader (used for EER)
+    val_loader_unseen = _make_loader(X_val, y_val, batch_size, shuffle=False) if X_val is not None else None
+    
     test_loader = _make_loader(X_test, y_test, batch_size, shuffle=False)
     
     model = model_class(in_channels=_detect_channels(x), num_classes=num_train_classes, include_top=True).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr); criterion = nn.CrossEntropyLoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    criterion = nn.CrossEntropyLoss()
     
-    best_val_eer = float('inf')
-    patience_counter = 0
-    best_model_state = None
-    
-    for ep in range(epochs):
-        # A. Train Epoch (Classification on Known Subjects)
-        model.include_top = True
-        train_loss = _train_epoch(model, train_loader, optimizer, criterion, device)
-        
-        if val_loader is not None:
-            # B. Validate Epoch (Verification EER on Unseen Val Subjects)
-            model.include_top = False # Crucial: Extract features, not logits!
-            val_emb, val_lab = _get_embeddings(model, val_loader, device)
-            
-            # Generate pairs for validation (using fewer pairs for speed)
-            val_scores, val_pairs = _generate_pairs(
-                embeddings1=val_emb, labels1=val_lab, 
-                embeddings2=None, labels2=None, 
-                num_pairs=min(2000, num_pairs), # Cap at 2000 pairs to keep epochs fast
-                sampling_mode="balanced", matching_method=matching_method
-            )
-            
-            # Calculate EER silently
-            if len(val_pairs) > 0:
-                fpr, tpr, _ = roc_curve(val_pairs, val_scores)
-                try: val_eer = brentq(lambda x: 1. - x - interp1d(fpr, tpr)(x), 0., 1.)
-                except: val_eer = 1.0
-            else:
-                val_eer = 1.0
-                
-            print(f"Epoch {ep+1}/{epochs} | Train Loss: {train_loss:.4f} | Val EER: {val_eer:.4f}")
-            
-            # Check for improvement
-            if val_eer < best_val_eer:
-                best_val_eer = val_eer
-                best_model_state = copy.deepcopy(model.state_dict())
-                patience_counter = 0
-            else:
-                patience_counter += 1
-                
-            if patience_counter >= 10:
-                print(f"--> Early stopping triggered at epoch {ep+1}.")
-                break
-        else:
-            print(f"Epoch {ep+1}/{epochs} | Train Loss: {train_loss:.4f}")
-            best_model_state = copy.deepcopy(model.state_dict())
-            
-    if best_model_state is not None:
-        model.load_state_dict(best_model_state)
+    # Single line execution using the Composite Metric loop!
+    model = _run_train_loop_unseen_subjects(
+        model=model, 
+        train_loader=train_loader, 
+        val_loader_seen=val_loader_seen, 
+        val_loader_unseen=val_loader_unseen, 
+        optimizer=optimizer, 
+        criterion=criterion, 
+        device=device, 
+        epochs=epochs, 
+        matching_method=matching_method, 
+        patience=40,       # Max epochs to wait for composite score improvement
+        lr_patience=15     # Epochs to wait before halving Learning Rate
+    )
 
     # ====================================================
     # 7. MODEL CALIBRATION (Optional)
@@ -1342,14 +1310,17 @@ def run_subject_disjoint_verification(x, y, model_class, epochs=30, batch_size=6
     
     if use_deployment_evaluation:
         print("\n[INFO] --- REAL-WORLD DEPLOYMENT EVALUATION ---")
-        if val_split <= 0.0 or val_loader is None:
-            print("[WARN] No validation set provided (val_split=0.0). Falling back to the Training set.")
-            print("[WARN] NOTE: Using training data to find the threshold yields overly optimistic results. A separate validation set is strongly recommended!")
-            calib_loader = train_loader
-            calib_name = "Train (Fallback)"
+        
+        # Check for val_loader_unseen
+        if val_split <= 0.0 or val_loader_unseen is None:
+            print("[WARN] No unseen validation subjects provided (val_split=0.0).")
+            print("[WARN] Falling back to Seen Validation / Training set for threshold.")
+            print("[WARN] NOTE: This yields overly optimistic thresholds. A proper val_split is recommended!")
+            calib_loader = val_loader_seen if val_loader_seen is not None else train_loader
+            calib_name = "Seen Val/Train (Fallback)"
         else:
-            calib_loader = val_loader
-            calib_name = "Validation"
+            calib_loader = val_loader_unseen
+            calib_name = "Unseen Validation"
         
         print(f"[INFO] Extracting features for Calibration ({calib_name} Set)...")
         calib_emb, calib_lab = _get_embeddings(model, calib_loader, device)
@@ -1421,7 +1392,7 @@ def run_subject_disjoint_verification(x, y, model_class, epochs=30, batch_size=6
     eer, auc_val, dprime, tar = _compute_metrics_verification(scores, labels_pair)
 
     # Update hyperparams dictionary dynamically using the local 'ep' variable
-    hyperparams['epochs'] = f"{epochs} (stopped at {ep + 1})" if (ep + 1) < epochs else epochs
+    # hyperparams['epochs'] = f"{epochs} (stopped at {ep + 1})" if (ep + 1) < epochs else epochs
     
     if _return_stats: 
         return (eer, auc_val, dprime, tar), data_stats, hyperparams
@@ -1439,12 +1410,14 @@ def run_subject_disjoint_verification(x, y, model_class, epochs=30, batch_size=6
 # =============================================================================
 # TASK 5: CROSS-SESSION IDENTIFICATION
 # =============================================================================
-def run_cross_session_identification(x_train, y_train, x_test, y_test, model_class, epochs=30, batch_size=64, lr=1e-3, 
-                                     val_split=0.0, seed=42, device=None, visualize=False, use_template=False, 
-                                     template_fusion_method='mean', template_size=None, matching_method='cosine',
-                                     outlier_filtering_on_train=False, outlier_filtering_on_test=False, sqi_train=None, 
-                                     sqi_test=None, sqi_threshold=0.05, sqi_keep_pct=0.8, probe_fusion_size=1, 
-                                     save_results_and_settings=False, loader=None, n_runs=1, _return_stats=False):
+def run_cross_session_identification(x_train, y_train, x_test, y_test, model_class, epochs=150, 
+                                     batch_size=256, lr=1e-3, val_split=0.1, seed=42, device=None, 
+                                     visualize=False, use_template=False, template_fusion_method='mean',
+                                     template_size=None, matching_method='cosine',
+                                     outlier_filtering_on_train=False, outlier_filtering_on_test=False, 
+                                     sqi_train=None, sqi_test=None, sqi_threshold=0.05, 
+                                     sqi_keep_pct=0.8, probe_fusion_size=3, save_results_and_settings=False, 
+                                     loader=None, n_runs=1, _return_stats=False):
     """
     Cross-Session Identification Pipeline (Temporal Robustness).
     Evaluates system robustness against physiological aging and sensor variations over time.
@@ -1487,7 +1460,10 @@ def run_cross_session_identification(x_train, y_train, x_test, y_test, model_cla
         tuple: (Rank-1 Accuracy, Rank-5 Accuracy)
                If n_runs > 1, returns tuples of (Mean, Std_Dev) for both metrics.
     """
-    # --- MULTI-RUN AGGREGATOR ---
+
+    # ====================================================
+    # 0. Capture Hyperparameters for Logger & MULTI-RUN AGGREGATOR
+    # ====================================================
     data_stats = {}
     hyperparams = {
         'epochs': epochs, 'batch_size': batch_size, 'learning_rate': lr, 'use_template': use_template, 
@@ -1616,7 +1592,7 @@ def run_cross_session_identification(x_train, y_train, x_test, y_test, model_cla
     model = model_class(in_channels=_detect_channels(x_train_full), num_classes=len(classes), include_top=True).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr); criterion = nn.CrossEntropyLoss()
     
-    model = _run_training_loop(model, train_loader, val_loader, optimizer, criterion, device, epochs, patience=10)
+    model = _run_training_loop(model, train_loader, val_loader, optimizer, criterion, device, epochs)
     
     # ====================================================
     # 6. EVALUATION STRATEGY
@@ -1699,12 +1675,14 @@ def run_cross_session_identification(x_train, y_train, x_test, y_test, model_cla
 # =============================================================================
 # TASK 6: CROSS-SESSION VERIFICATION
 # =============================================================================
-def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class, epochs=30, batch_size=64, lr=1e-3, 
-                                   val_split=0.0, num_pairs=10000, sampling_mode="balanced", seed=42, device=None, 
-                                   visualize=False, use_template=False, template_fusion_method='mean', template_size=None, 
-                                   matching_method='cosine', outlier_filtering_on_train=False, outlier_filtering_on_test=False, 
-                                   sqi_train=None, sqi_test=None, sqi_threshold=0.05, sqi_keep_pct=0.8, 
-                                   use_deployment_evaluation=False, save_results_and_settings=False, loader=None, 
+def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class, epochs=150, 
+                                   batch_size=256, lr=1e-3, val_split=0.1, num_pairs=10000, 
+                                   sampling_mode="balanced", seed=42, device=None, visualize=False, 
+                                   use_template=False, template_fusion_method='mean', template_size=None, 
+                                   matching_method='cosine', outlier_filtering_on_train=False, 
+                                   outlier_filtering_on_test=False, sqi_train=None, sqi_test=None, 
+                                   sqi_threshold=0.05, sqi_keep_pct=0.8, use_deployment_evaluation=False, 
+                                   save_results_and_settings=False, loader=None, 
                                    n_runs=1, _return_stats=False):
     """
     Cross-Session Verification Pipeline (Temporal Robustness 1:1).
@@ -1750,7 +1728,10 @@ def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class
         tuple: (EER, AUC, d-prime, TAR @ 0.1% FAR)
                If n_runs > 1, returns tuples of (Mean, Std_Dev) for all four metrics.
     """
-    # --- MULTI-RUN AGGREGATOR ---
+    
+    # ====================================================
+    # 0. Capture Hyperparameters for Logger & MULTI-RUN AGGREGATOR
+    # ====================================================
     data_stats = {}
     hyperparams = {
         'epochs': epochs, 'batch_size': batch_size, 'learning_rate': lr, 'num_pairs': num_pairs, 'use_template': use_template, 
@@ -1879,7 +1860,7 @@ def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class
     model = model_class(in_channels=_detect_channels(x_train_full), num_classes=len(classes), include_top=True).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr); criterion = nn.CrossEntropyLoss()
     
-    model = _run_training_loop(model, train_loader, val_loader, optimizer, criterion, device, epochs, patience=10)
+    model = _run_training_loop(model, train_loader, val_loader, optimizer, criterion, device, epochs)
     
     # Switch to Feature Extractor
     model.include_top = False
@@ -1979,10 +1960,10 @@ def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class
 # TASK 7: SUBJECT-DISJOINT CROSS-SESSION IDENTIFICATION
 # =============================================================================
 def run_subject_disjoint_cross_session_identification(
-        x_s1, y_s1, x_s2, y_s2, model_class, epochs=30, batch_size=64, lr=1e-3, test_split=0.2, val_split=0.0, 
+        x_s1, y_s1, x_s2, y_s2, model_class, epochs=150, batch_size=256, lr=1e-3, test_split=0.2, val_split=0.1, 
         seed=42, device=None, visualize=False, use_template=True, template_fusion_method='mean', template_size=None, 
         matching_method='cosine', outlier_filtering_on_train=False, outlier_filtering_on_test=False, sqi_s1=None, 
-        sqi_s2=None, sqi_threshold=0.05, sqi_keep_pct=0.8, probe_fusion_size=1, save_results_and_settings=False, 
+        sqi_s2=None, sqi_threshold=0.05, sqi_keep_pct=0.8, probe_fusion_size=3, save_results_and_settings=False, 
         loader=None, n_runs=1, _return_stats=False):
     """
     The Ultimate Biometric Test: Open-Set + Temporal Robustness Identification.
@@ -2026,7 +2007,10 @@ def run_subject_disjoint_cross_session_identification(
         tuple: (Rank-1 Accuracy, Rank-5 Accuracy)
                If n_runs > 1, returns tuples of (Mean, Std_Dev) for both metrics.
     """
-    # --- MULTI-RUN AGGREGATOR ---
+    
+    # ====================================================
+    # 0. Capture Hyperparameters for Logger & MULTI-RUN AGGREGATOR
+    # ====================================================
     data_stats = {}
     hyperparams = {
         'epochs': epochs, 'batch_size': batch_size, 'learning_rate': lr, 'test_split': test_split, 'val_split': val_split,
@@ -2111,8 +2095,8 @@ def run_subject_disjoint_cross_session_identification(
     # Extract respective datasets based on the disjoint subject split
     X_train, Y_train = x_s1[np.isin(y_s1, train_subs)], y_s1[np.isin(y_s1, train_subs)]
     
+    # STRICT TEMPORAL ISOLATION: Validation uses ONLY Session 1 data
     X_val_s1, Y_val_s1 = (x_s1[np.isin(y_s1, val_subs)], y_s1[np.isin(y_s1, val_subs)]) if len(val_subs) > 0 else (None, None)
-    X_val_s2, Y_val_s2 = (x_s2[np.isin(y_s2, val_subs)], y_s2[np.isin(y_s2, val_subs)]) if len(val_subs) > 0 else (None, None)
     
     X_enroll, Y_enroll = x_s1[np.isin(y_s1, test_subs)], y_s1[np.isin(y_s1, test_subs)]
     X_probe, Y_probe = x_s2[np.isin(y_s2, test_subs)], y_s2[np.isin(y_s2, test_subs)]
@@ -2127,13 +2111,12 @@ def run_subject_disjoint_cross_session_identification(
     y_train_enc, train_classes = _encode_labels(Y_train)
     num_train_classes = len(train_classes)
     
-    # B. Validation Labels (Ensures S1 and S2 map to the exact same integers)
+    # B. Validation Labels (Ensures S1 map to the exact same integers)
     if len(val_subs) > 0:
         val_map = {sub: i for i, sub in enumerate(val_subs)}
         y_val_s1_enc = np.array([val_map[s] for s in Y_val_s1])
-        y_val_s2_enc = np.array([val_map[s] for s in Y_val_s2])
     else:
-        y_val_s1_enc, y_val_s2_enc = None, None
+        y_val_s1_enc = None
 
     # C. Test Labels (Ensures Enroll and Probe map to the exact same integers)
     test_map = {sub: i for i, sub in enumerate(test_subs)}
@@ -2143,59 +2126,41 @@ def run_subject_disjoint_cross_session_identification(
     # ====================================================
     # 4. LOADERS & CUSTOM TRAINING LOOP
     # ====================================================
-    train_loader = _make_loader(X_train, y_train_enc, batch_size, shuffle=True)
+    # Create a Validation split from the SEEN Training subjects
+    # This gives us the smooth Cross-Entropy loss anchor for the composite metric
+    if val_split > 0.0:
+        X_tr, X_val_seen, y_tr, y_val_seen = train_test_split(
+            X_train, y_train_enc, test_size=val_split, stratify=y_train_enc, random_state=seed
+        )
+        val_loader_seen = _make_loader(X_val_seen, y_val_seen, batch_size, shuffle=False)
+    else:
+        X_tr, y_tr = X_train, y_train_enc
+        val_loader_seen = None
+
+    train_loader = _make_loader(X_tr, y_tr, batch_size, shuffle=True)
     val_loader_s1 = _make_loader(X_val_s1, y_val_s1_enc, batch_size, shuffle=False) if X_val_s1 is not None else None
-    val_loader_s2 = _make_loader(X_val_s2, y_val_s2_enc, batch_size, shuffle=False) if X_val_s2 is not None else None
+    
+    # UNSEEN Validation now strictly passes the Session 1 loader only (Intra-Session check)
+    val_loader_unseen = val_loader_s1
     
     model = model_class(in_channels=_detect_channels(x_s1), num_classes=num_train_classes, include_top=True).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr); criterion = nn.CrossEntropyLoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    criterion = nn.CrossEntropyLoss()
     
-    best_val_eer = float('inf')
-    patience_counter = 0
-    best_model_state = None
-    
-    for ep in range(epochs):
-        model.include_top = True
-        train_loss = _train_epoch(model, train_loader, optimizer, criterion, device)
-        
-        if val_loader_s1 is not None and val_loader_s2 is not None:
-            # We track validation using Cross-Session feature separation
-            model.include_top = False # Extract features
-            
-            val_emb_s1, val_lab_s1 = _get_embeddings(model, val_loader_s1, device)
-            val_emb_s2, val_lab_s2 = _get_embeddings(model, val_loader_s2, device)
-            
-            val_scores, val_pairs = _generate_pairs(
-                embeddings1=val_emb_s2, labels1=val_lab_s2, 
-                embeddings2=val_emb_s1, labels2=val_lab_s1, 
-                num_pairs=2000, sampling_mode="balanced", matching_method=matching_method
-            )
-            
-            if len(val_pairs) > 0:
-                fpr, tpr, _ = roc_curve(val_pairs, val_scores)
-                try: val_eer = brentq(lambda x: 1. - x - interp1d(fpr, tpr)(x), 0., 1.)
-                except: val_eer = 1.0
-            else:
-                val_eer = 1.0
-                
-            print(f"Epoch {ep+1}/{epochs} | Train Loss: {train_loss:.4f} | Val Cross-Session EER: {val_eer:.4f}")
-            
-            if val_eer < best_val_eer:
-                best_val_eer = val_eer
-                best_model_state = copy.deepcopy(model.state_dict())
-                patience_counter = 0
-            else:
-                patience_counter += 1
-                
-            if patience_counter >= 10:
-                print(f"--> Early stopping triggered at epoch {ep+1}.")
-                break
-        else:
-            print(f"Epoch {ep+1}/{epochs} | Train Loss: {train_loss:.4f}")
-            best_model_state = copy.deepcopy(model.state_dict())
-            
-    if best_model_state is not None:
-        model.load_state_dict(best_model_state)
+    # Single line execution using the Composite Metric loop!
+    model = _run_train_loop_unseen_subjects(
+        model=model, 
+        train_loader=train_loader, 
+        val_loader_seen=val_loader_seen, 
+        val_loader_unseen=val_loader_unseen, 
+        optimizer=optimizer, 
+        criterion=criterion, 
+        device=device, 
+        epochs=epochs, 
+        matching_method=matching_method, 
+        patience=40,       # Max epochs to wait for composite score improvement
+        lr_patience=15     # Epochs to wait before halving Learning Rate
+    )
 
     # ====================================================
     # 5. FINAL INFERENCE ON UNSEEN SUBJECTS
@@ -2235,8 +2200,9 @@ def run_subject_disjoint_cross_session_identification(
 
     rank1, rank5 = _compute_metrics_identification(final_scores, final_labels)
 
-    # Update hyperparams dictionary dynamically using the local 'ep' variable
-    hyperparams['epochs'] = f"{epochs} (stopped at {ep + 1})" if (ep + 1) < epochs else epochs
+    # Update hyperparams dictionary dynamically using the model's tracked epochs
+    actual_ep = getattr(model, 'actual_epochs', epochs)
+    hyperparams['epochs'] = f"{epochs} (stopped at {actual_ep})" if actual_ep < epochs else epochs
 
     if _return_stats: 
         return (rank1, rank5), data_stats, hyperparams
@@ -2257,7 +2223,7 @@ def run_subject_disjoint_cross_session_identification(
 # TASK 8: SUBJECT-DISJOINT CROSS-SESSION VERIFICATION
 # =============================================================================
 def run_subject_disjoint_cross_session_verification(
-        x_s1, y_s1, x_s2, y_s2, model_class, epochs=30, batch_size=64, lr=1e-3, test_split=0.2, val_split=0.0, 
+        x_s1, y_s1, x_s2, y_s2, model_class, epochs=150, batch_size=256, lr=1e-3, test_split=0.2, val_split=0.1, 
         num_pairs=10000, sampling_mode="balanced", seed=42, device=None, visualize=False, use_template=False, 
         template_fusion_method='mean', template_size=None, matching_method='cosine', outlier_filtering_on_train=False, 
         outlier_filtering_on_test=False, sqi_s1=None, sqi_s2=None, sqi_threshold=0.05, sqi_keep_pct=0.8,
@@ -2308,7 +2274,10 @@ def run_subject_disjoint_cross_session_verification(
         tuple: (EER, AUC, d-prime, TAR @ 0.1% FAR)
                If n_runs > 1, returns tuples of (Mean, Std_Dev) for all four metrics.
     """
-    # --- MULTI-RUN AGGREGATOR ---
+    
+    # ====================================================
+    # 0. Capture Hyperparameters for Logger & MULTI-RUN AGGREGATOR
+    # ====================================================
     data_stats = {}
     hyperparams = {
         'epochs': epochs, 'batch_size': batch_size, 'learning_rate': lr, 'test_split': test_split, 'val_split': val_split, 
@@ -2389,8 +2358,10 @@ def run_subject_disjoint_cross_session_verification(
         print(f"Subject Split: Train={len(train_subs)}, Val=0, Test={len(test_subs)}")
 
     X_train, Y_train = x_s1[np.isin(y_s1, train_subs)], y_s1[np.isin(y_s1, train_subs)]
+    
+    # STRICT TEMPORAL ISOLATION: Validation uses ONLY Session 1 data
     X_val_s1, Y_val_s1 = (x_s1[np.isin(y_s1, val_subs)], y_s1[np.isin(y_s1, val_subs)]) if len(val_subs) > 0 else (None, None)
-    X_val_s2, Y_val_s2 = (x_s2[np.isin(y_s2, val_subs)], y_s2[np.isin(y_s2, val_subs)]) if len(val_subs) > 0 else (None, None)
+    
     X_enroll, Y_enroll = x_s1[np.isin(y_s1, test_subs)], y_s1[np.isin(y_s1, test_subs)]
     X_probe, Y_probe = x_s2[np.isin(y_s2, test_subs)], y_s2[np.isin(y_s2, test_subs)]
 
@@ -2403,69 +2374,51 @@ def run_subject_disjoint_cross_session_verification(
     if len(val_subs) > 0:
         val_map = {sub: i for i, sub in enumerate(val_subs)}
         y_val_s1_enc = np.array([val_map[s] for s in Y_val_s1])
-        y_val_s2_enc = np.array([val_map[s] for s in Y_val_s2])
     else:
-        y_val_s1_enc, y_val_s2_enc = None, None
+        y_val_s1_enc = None
 
     test_map = {sub: i for i, sub in enumerate(test_subs)}
     y_enroll_enc = np.array([test_map[s] for s in Y_enroll])
     y_probe_enc = np.array([test_map[s] for s in Y_probe])
 
     # ====================================================
-    # 4. TRAINING LOOP
+    # 4. LOADERS & CUSTOM TRAINING LOOP
     # ====================================================
-    train_loader = _make_loader(X_train, y_train_enc, batch_size, shuffle=True)
+    # Create a Validation split from the SEEN Training subjects
+    # This gives us the smooth Cross-Entropy loss anchor for the composite metric
+    if val_split > 0.0:
+        X_tr, X_val_seen, y_tr, y_val_seen = train_test_split(
+            X_train, y_train_enc, test_size=val_split, stratify=y_train_enc, random_state=seed
+        )
+        val_loader_seen = _make_loader(X_val_seen, y_val_seen, batch_size, shuffle=False)
+    else:
+        X_tr, y_tr = X_train, y_train_enc
+        val_loader_seen = None
+
+    train_loader = _make_loader(X_tr, y_tr, batch_size, shuffle=True)
     val_loader_s1 = _make_loader(X_val_s1, y_val_s1_enc, batch_size, shuffle=False) if X_val_s1 is not None else None
-    val_loader_s2 = _make_loader(X_val_s2, y_val_s2_enc, batch_size, shuffle=False) if X_val_s2 is not None else None
+    
+    # UNSEEN Validation now strictly passes the Session 1 loader only (Intra-Session check)
+    val_loader_unseen = val_loader_s1
     
     model = model_class(in_channels=_detect_channels(x_s1), num_classes=num_train_classes, include_top=True).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr); criterion = nn.CrossEntropyLoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    criterion = nn.CrossEntropyLoss()
     
-    best_val_eer = float('inf')
-    patience_counter = 0
-    best_model_state = None
-    
-    for ep in range(epochs):
-        model.include_top = True
-        train_loss = _train_epoch(model, train_loader, optimizer, criterion, device)
-        
-        if val_loader_s1 is not None and val_loader_s2 is not None:
-            model.include_top = False # Extract features
-            
-            val_emb_s1, val_lab_s1 = _get_embeddings(model, val_loader_s1, device)
-            val_emb_s2, val_lab_s2 = _get_embeddings(model, val_loader_s2, device)
-            
-            val_scores, val_pairs = _generate_pairs(
-                embeddings1=val_emb_s2, labels1=val_lab_s2, 
-                embeddings2=val_emb_s1, labels2=val_lab_s1, 
-                num_pairs=2000, sampling_mode="balanced", matching_method=matching_method
-            )
-            
-            if len(val_pairs) > 0:
-                fpr, tpr, _ = roc_curve(val_pairs, val_scores)
-                try: val_eer = brentq(lambda x: 1. - x - interp1d(fpr, tpr)(x), 0., 1.)
-                except: val_eer = 1.0
-            else:
-                val_eer = 1.0
-                
-            print(f"Epoch {ep+1}/{epochs} | Train Loss: {train_loss:.4f} | Val Cross-Session EER: {val_eer:.4f}")
-            
-            if val_eer < best_val_eer:
-                best_val_eer = val_eer
-                best_model_state = copy.deepcopy(model.state_dict())
-                patience_counter = 0
-            else:
-                patience_counter += 1
-                
-            if patience_counter >= 10:
-                print(f"--> Early stopping triggered at epoch {ep+1}.")
-                break
-        else:
-            print(f"Epoch {ep+1}/{epochs} | Train Loss: {train_loss:.4f}")
-            best_model_state = copy.deepcopy(model.state_dict())
-            
-    if best_model_state is not None:
-        model.load_state_dict(best_model_state)
+    # Single line execution using the Composite Metric loop!
+    model = _run_train_loop_unseen_subjects(
+        model=model, 
+        train_loader=train_loader, 
+        val_loader_seen=val_loader_seen, 
+        val_loader_unseen=val_loader_unseen, 
+        optimizer=optimizer, 
+        criterion=criterion, 
+        device=device, 
+        epochs=epochs, 
+        matching_method=matching_method, 
+        patience=40,       # Max epochs to wait for composite score improvement
+        lr_patience=15     # Epochs to wait before halving Learning Rate
+    )
 
     # ====================================================
     # 5. MODEL CALIBRATION (Optional)
@@ -2474,23 +2427,28 @@ def run_subject_disjoint_cross_session_verification(
     
     if use_deployment_evaluation:
         print("\n[INFO] --- REAL-WORLD DEPLOYMENT EVALUATION ---")
-        if val_loader_s1 is None or val_loader_s2 is None:
+        if val_loader_s1 is None:
             print("[WARN] No validation set provided (val_split=0.0). Global Threshold calculation requires Validation subjects.")
-            print("[WARN] Falling back to default Threshold = 0.5")
-            global_threshold = 0.5
+            print("[WARN] Falling back to Seen Validation / Training set for threshold.")
+            print("[WARN] NOTE: This yields overly optimistic thresholds. A proper val_split is recommended!")
+            calib_loader = val_loader_seen if val_loader_seen is not None else train_loader
+            calib_name = "Seen Val/Train (Fallback)"
         else:
-            print(f"[INFO] Extracting features for Calibration (Validation Unseen Subjects)...")
-            calib_emb_s1, calib_lab_s1 = _get_embeddings(model, val_loader_s1, device)
-            calib_emb_s2, calib_lab_s2 = _get_embeddings(model, val_loader_s2, device)
+            calib_loader = val_loader_s1
+            calib_name = "Unseen Validation (Session 1)"
             
-            print(f"[INFO] Generating Calibration Pairs to find Global Threshold...")
-            calib_scores, calib_pair_labels = _generate_pairs(
-                embeddings1=calib_emb_s2, labels1=calib_lab_s2, 
-                embeddings2=calib_emb_s1, labels2=calib_lab_s1,
-                num_pairs=num_pairs, sampling_mode=sampling_mode, matching_method=matching_method
-            )
-            global_threshold = _find_optimal_threshold(calib_scores, calib_pair_labels)
-            print(f"[INFO] Optimal Global Threshold Found: {global_threshold:.4f}")
+        print(f"[INFO] Extracting features for Calibration ({calib_name})...")
+        calib_emb_s1, calib_lab_s1 = _get_embeddings(model, calib_loader, device)
+        
+        # Calibration relies entirely on Session 1 features
+        print(f"[INFO] Generating Calibration Pairs to find Global Threshold...")
+        calib_scores, calib_pair_labels = _generate_pairs(
+            embeddings1=calib_emb_s1, labels1=calib_lab_s1, 
+            embeddings2=None, labels2=None,
+            num_pairs=num_pairs, sampling_mode=sampling_mode, matching_method=matching_method
+        )
+        global_threshold = _find_optimal_threshold(calib_scores, calib_pair_labels)
+        print(f"[INFO] Optimal Global Threshold Found: {global_threshold:.4f}")
 
     # ====================================================
     # 6. EVALUATION STRATEGY ON UNSEEN TEST SUBJECTS
@@ -2533,8 +2491,9 @@ def run_subject_disjoint_cross_session_verification(
 
     eer, auc_val, dprime, tar = _compute_metrics_verification(scores, labels_pair)
 
-    # Update hyperparams dictionary dynamically using the local 'ep' variable
-    hyperparams['epochs'] = f"{epochs} (stopped at {ep + 1})" if (ep + 1) < epochs else epochs
+    # Update hyperparams dictionary dynamically using the model's tracked epochs
+    actual_ep = getattr(model, 'actual_epochs', epochs)
+    hyperparams['epochs'] = f"{epochs} (stopped at {actual_ep})" if actual_ep < epochs else epochs
 
     if _return_stats: 
         return (eer, auc_val, dprime, tar), data_stats, hyperparams
