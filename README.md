@@ -113,6 +113,8 @@ This interactive notebook will automatically:
 ## Tutorials
 * **Working with load_dataset Module**: The colab notebook shows how you can load and use different datasets for different scenarios. [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/MParvan/ecg-biometrics-bench/blob/main/load_dataset_Module.ipynb)
 * **Working with run Module**: The colab notebook shows how you can work with run.py module to evaluate your method/model in various biometric protocols. [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/MParvan/ecg-biometrics-bench/blob/main/run_Module.ipynb)
+* **Injecting Your Custom PyTorch Model**: The colab notebook shows how you can add your model to the framework. [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/MParvan/ecg-biometrics-bench/blob/main/Custom_Model.ipynb)
+* **Benchmarking Your Own Custom Dataset**: The colab notebook shows how you can evaluate methods in the framework on your own dataset. [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/MParvan/ecg-biometrics-bench/blob/main/Custom_Dataset.ipynb)
 
 ---
 
