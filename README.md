@@ -107,6 +107,13 @@ This interactive notebook will automatically:
 2. Install the necessary dependencies from `requirements.txt`.
 3. Execute the **Baseline Closed-Set Identification (Task 1)** command step-by-step so you can see the pipeline in action without setting up a local environment.
 
+
+---
+
+## Tutorials
+* **Working with load_dataset Module**: The colab notebook shows how you can load and use different datasets for different scenarios. [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/MParvan/ecg-biometrics-bench/blob/main/load_dataset_Module.ipynb)
+
+
 ---
 
 ## Citation
