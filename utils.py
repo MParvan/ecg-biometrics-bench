@@ -127,6 +127,50 @@ def _create_templates(embeddings, labels, method='mean', max_beats=None):
                 template = np.mean(subj_embs, axis=0)
             else: 
                 template = trim_mean(subj_embs, proportiontocut=0.1, axis=0)
+
+        elif method == 'soft_centrality':
+            # Zero-Shot Self-Attention: Weight beats by their similarity to the group
+            norm_embs = normalize(subj_embs, axis=1)
+            sim_matrix = cosine_similarity(norm_embs)
+            
+            # Centrality score: Sum of similarities to all other beats
+            scores = np.sum(sim_matrix, axis=1) - 1.0 
+            
+            # Apply Softmax with Temperature (T) to convert scores to weights
+            # T controls sharpness. T=0.1 heavily punishes outliers. T=1.0 is smoother.
+            T = 0.1 
+            
+            # Subtract max for numerical stability before exp
+            scores_stable = scores - np.max(scores) 
+            exp_scores = np.exp(scores_stable / T)
+            weights = exp_scores / np.sum(exp_scores)
+            
+            # Calculate the weighted average
+            template = np.average(subj_embs, axis=0, weights=weights)
+
+        elif method == 'geometric_median':
+            # True multi-dimensional median using Weiszfeld's algorithm
+            from scipy.spatial.distance import cdist
+            
+            # Initialize with the standard geometric centroid (mean)
+            template = np.mean(subj_embs, axis=0)
+            
+            # Iterate to converge on the geometric median (usually takes < 10 iterations)
+            for _ in range(20):
+                distances = cdist(subj_embs, [template])[:, 0]
+                # Avoid division by zero for identical points
+                distances = np.where(distances == 0, 1e-5, distances)
+                
+                weights = 1.0 / distances
+                weights /= weights.sum()
+                
+                new_template = np.dot(weights, subj_embs)
+                
+                # Stop early if converged
+                if np.linalg.norm(template - new_template) < 1e-4:
+                    template = new_template
+                    break
+                template = new_template
         else:
             raise ValueError(f"Unknown template method: {method}")
         
