@@ -29,6 +29,7 @@ The framework provides plug-and-play automated download and parsing for the foll
 ## 🚀 Installation & Quick Start
 
 To prevent dependency conflicts with other projects on your machine, it is highly recommended to install the framework inside a virtual environment.
+
 **Option A: Using Python's built-in `venv`**
 ```bash
 # 1. Create the virtual environment named "ecg_env"
