@@ -28,8 +28,27 @@ The framework provides plug-and-play automated download and parsing for the foll
 
 ## 🚀 Installation & Quick Start
 
-Clone the repository and install the required dependencies:
+To prevent dependency conflicts with other projects on your machine, it is highly recommended to install the framework inside a virtual environment.
+**Option A: Using Python's built-in `venv`**
+```bash
+# 1. Create the virtual environment named "ecg_env"
+python -m venv ecg_env
 
+# 2. Activate the environment
+# On Windows:
+ecg_env\Scripts\activate
+# On macOS and Linux:
+source ecg_env/bin/activate
+```
+**Option B: Using Conda (Anaconda/Miniconda)**
+```bash
+# 1. Create the conda environment (Python 3.9+ recommended)
+conda create -n ecg_env python=3.12 -y
+
+# 2. Activate the environment
+conda activate ecg_env
+```
+Once your virtual environment is activated, you can proceed with the standard installation:
 ```bash
 git clone https://github.com/MParvan/ecg-biometrics-bench.git
 cd ecg-biometrics-bench
