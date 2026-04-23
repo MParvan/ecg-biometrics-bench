@@ -438,7 +438,7 @@ class load_heartprint_dataset():
                  cleanup_zip=False, **preprocessing_params):
        
         # --- KWARGS GUARD ---
-        allowed_prep_kwargs = ["mode", "window_len", "stride", "pre_s", "post_s", "bandpass", "lowcut", "highcut", "normalize"]
+        allowed_prep_kwargs = ["mode", "window_s", "stride_s", "pre_s", "post_s", "bandpass", "lowcut", "highcut", "normalize"]
         for k in preprocessing_params.keys():
             if k not in allowed_prep_kwargs:
                 raise ValueError(
@@ -1024,7 +1024,7 @@ class load_cybhi_dataset():
                  cleanup_zip=False, **preprocessing_params):
         
         # --- KWARGS GUARD ---
-        allowed_prep_kwargs = ["mode", "window_len", "stride", "pre_s", "post_s", "bandpass", "lowcut", "highcut", "normalize"]
+        allowed_prep_kwargs = ["mode", "window_s", "stride_s", "pre_s", "post_s", "bandpass", "lowcut", "highcut", "normalize"]
         for k in preprocessing_params.keys():
             if k not in allowed_prep_kwargs:
                 raise ValueError(f"\n[ERROR] Unrecognized parameter: '{k}'. Did you misspell an argument?")
