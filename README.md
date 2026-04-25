@@ -1,14 +1,79 @@
-# 🫀 ECG-Biometrics-Bench: A Unified Framework for Reproducible Benchmarking
-
-**ECG-Biometrics-Bench** is an open-source, unified framework designed to standardize the evaluation of ECG biometric systems. It provides an end-to-end pipeline from raw signal ingestion to rigorous biometric evaluations, including subject-disjoint and cross-session scenarios.
+# ECG-Biometrics-Bench  
+### A Unified Framework for Realistic and Reproducible ECG Biometrics Evaluation
 
 ---
 
-## ✨ Core Contributions & Features
+## 🚨 The Problem
 
-* **Standardized Evaluation Matrix**: Implements 8 biometric protocols that independently isolate intra-session, cross-session (temporal robustness), closed-set, and subject-disjoint scenarios.
-* **Unified Dataset API**: Built-in, automated loaders for 7 major public ECG databases, handling complex chronological partitioning and cross-session routing natively. 
-* **Baseline Architectures**: Includes configurable deep learning models ranging from standard 1D-CNNs to Transformers.
+Most ECG biometric systems report near-perfect performance (≈99% accuracy).
+
+However, these results are often **misleading**.
+
+A large portion of the literature relies on:
+- Random intra-session train/test splits  
+- Overlapping temporal segments  
+- Closed-set evaluation protocols  
+
+These practices introduce **data leakage** and artificially inflate performance.
+
+➡️ When evaluated under realistic conditions (cross-session, unseen subjects), performance **drops dramatically**.
+
+---
+
+## 💡 Key Insight
+
+This work demonstrates what we call the:
+
+### ❗ Random Split Fallacy
+
+> High performance in ECG biometrics is often a byproduct of flawed evaluation protocols—not true identity recognition.
+
+Across multiple datasets and models, we show:
+
+- Intra-session (random split): ~95–100% accuracy  
+- Cross-session / realistic: **significant degradation (often <70%)**
+
+This suggests current methods may **not generalize to real-world deployment**.
+
+---
+
+## 🧠 What This Repository Provides
+
+ECG-Biometrics-Bench is a **modular, reproducible benchmarking framework** for ECG-based biometric systems.
+
+It standardizes the full pipeline:
+
+- Dataset ingestion across heterogeneous ECG datasets  
+- Signal preprocessing and segmentation  
+- Model training (CNN, LSTM, hybrid architectures)  
+- Evaluation under realistic biometric protocols  
+
+The framework enables **fair comparison across models, datasets, and evaluation settings**.
+
+---
+
+## ⚙️ Key Features
+
+- 🔄 **Unified Dataset Interface**
+  - Supports multiple public ECG datasets (ECG-ID, PTB, CYBHi, MIT-BIH, etc.)
+  - Handles heterogeneous formats and structures
+
+- 🧩 **Modular Pipeline**
+  - Filtering, segmentation, augmentation, modeling, evaluation
+  - Easily extensible for new methods
+
+- 📊 **Rigorous Evaluation Protocols**
+  - Closed-set vs Open-set (subject-disjoint)
+  - Intra-session vs Cross-session
+  - Long-term temporal evaluation
+
+- 🧪 **Reproducible Experiments**
+  - Config-driven pipeline
+  - Consistent preprocessing and evaluation across datasets
+
+- 📉 **Realistic Benchmarking**
+  - Explicitly avoids data leakage
+  - Highlights performance degradation under real conditions
 
 ---
 
