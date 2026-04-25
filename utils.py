@@ -12,6 +12,10 @@ from scipy.stats import trim_mean, kurtosis
 from scipy.spatial.distance import cdist, correlation
 from scipy.interpolate import interp1d
 
+import os
+import hashlib
+import json
+
 import torch
 from torch.utils.data import Dataset, DataLoader,TensorDataset
 from scipy.stats import kurtosis
@@ -804,3 +808,44 @@ def _apply_outlier_filter(x, y, sqi_scores, absolute_threshold=0.05, keep_percen
     
     print(f"[INFO] Outlier Filter: Dropped {len(x) - len(final_indices)} noisy beats. Retained {len(final_indices)}.")
     return x[final_indices], y[final_indices]
+
+
+def _generate_config_hash(config_dict):
+    """Creates a deterministic short hash from a dictionary of parameters."""
+    # Convert dict to a sorted JSON string to ensure consistent hashing
+    config_str = json.dumps(config_dict, sort_keys=True, default=str)
+    return hashlib.md5(config_str.encode('utf-8')).hexdigest()[:12]
+
+class CacheManager:
+    def __init__(self, base_dir="precomputed"):
+        self.data_dir = os.path.join(base_dir, "data")
+        self.weight_dir = os.path.join(base_dir, "weights")
+        os.makedirs(self.data_dir, exist_ok=True)
+        os.makedirs(self.weight_dir, exist_ok=True)
+
+    def get_data_cache(self, config_dict):
+        uid = _generate_config_hash(config_dict)
+        data_path = os.path.join(self.data_dir, f"{uid}.npz")
+        if os.path.exists(data_path):
+            data = np.load(data_path, allow_pickle=True)
+            return {k: data[k] for k in data.files}, uid
+        return None, uid
+
+    def save_data_cache(self, arrays_dict, config_dict, uid):
+        np.savez_compressed(os.path.join(self.data_dir, f"{uid}.npz"), **arrays_dict)
+        with open(os.path.join(self.data_dir, f"{uid}.json"), "w") as f:
+            json.dump(config_dict, f, indent=4, default=str)
+
+    def get_weight_cache(self, config_dict, model, device):
+        uid = _generate_config_hash(config_dict)
+        weight_path = os.path.join(self.weight_dir, f"{uid}.pth")
+        if os.path.exists(weight_path):
+            model.load_state_dict(torch.load(weight_path, map_location=device))
+            return model, uid
+        return None, uid
+
+    def save_weight_cache(self, model, config_dict, uid):
+        torch.save(model.state_dict(), os.path.join(self.weight_dir, f"{uid}.pth"))
+        with open(os.path.join(self.weight_dir, f"{uid}.json"), "w") as f:
+            json.dump(config_dict, f, indent=4, default=str)
+

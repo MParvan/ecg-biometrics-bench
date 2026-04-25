@@ -148,6 +148,10 @@ def get_parser():
                             help="If set, plots t-SNE / CMC / Confusion Matrices.")
     misc_group.add_argument('--device', type=str, default='auto',
                             help="Device to use ('cuda', 'cpu', or 'auto').")
+    misc_group.add_argument('--intelligent_data_loading', action='store_true',
+                            help="If set, saves/loads precomputed data arrays based on hyperparameters.")
+    misc_group.add_argument('--intelligent_weight_loading', action='store_true',
+                            help="If set, saves/loads pre-trained model weights based on hyperparameters.")
 
     return parser
 
@@ -217,32 +221,86 @@ def main():
     # ==========================================
     # 3. DATA EXTRACTION LOGIC
     # ==========================================
-    # Tasks 1 to 4: Intra-Session or Single Array operations
-    if args.task in [1, 2, 3, 4]:
-        if args.dataset in ['cybhi', 'heartprint']:
-            x, y = loader.load_session("train")
-        else:
-            # EXPLICIT ROUTING: No more try/except guessing!
-            if args.data_split_mode in ["all-available", "single-session"]:
-                x, y = loader.load_all_data()
-            else:
-                x, y = loader.load_session("train")
-
-        print(f"\n[INFO] Data Loaded: X={x.shape}, Y={y.shape}")
-        if x.shape[0] == 0:
-            print("[ERROR] No data returned from loader. Check your session configs.")
-            sys.exit(1)
-            
-    # Tasks 5 to 8: Cross-Session (Requires S1 and S2 arrays)
-    elif args.task in [5, 6, 7, 8]:
-        x_s1, y_s1 = loader.load_session("train")
-        x_s2, y_s2 = loader.load_session("test")
+    if args.intelligent_data_loading:
+        from utils import CacheManager
+        cache = CacheManager()
+        data_config = {
+            "dataset": args.dataset, "split_mode": args.data_split_mode,
+            "num_beats": args.num_beats_to_merge, "preprocessing": getattr(loader, 'prep_params', {}),
+            "train_sessions": args.train_sessions, "test_sessions": args.probe_sessions
+        }
         
-        print(f"\n[INFO] Session 1 (Enroll) Loaded: X={x_s1.shape}, Y={y_s1.shape}")
-        print(f"[INFO] Session 2 (Probe) Loaded:  X={x_s2.shape}, Y={y_s2.shape}")
-        if x_s1.shape[0] == 0 or x_s2.shape[0] == 0:
-            print("[ERROR] One or both cross-session arrays are empty. Check your parameters.")
-            sys.exit(1)
+        # Tasks 1 to 4: Intra-Session
+        if args.task in [1, 2, 3, 4]:
+            data_config["task_type"] = "intra_session"
+            cached_data, uid = cache.get_data_cache(data_config)
+            
+            if cached_data:
+                print(f"\n[INFO] Loaded precomputed data from cache (Hash: {uid})")
+                x, y = cached_data['x'], cached_data['y']
+            else:
+                if args.dataset in ['cybhi', 'heartprint']:
+                    x, y = loader.load_session("train")
+                else:
+                    if args.data_split_mode in ["all-available", "single-session"]:
+                        x, y = loader.load_all_data()
+                    else:
+                        x, y = loader.load_session("train")
+                cache.save_data_cache({'x': x, 'y': y}, data_config, uid)
+
+            print(f"\n[INFO] Data Loaded: X={x.shape}, Y={y.shape}")
+            if x.shape[0] == 0:
+                print("[ERROR] No data returned from loader. Check your session configs.")
+                sys.exit(1)
+
+        # Tasks 5 to 8: Cross-Session
+        elif args.task in [5, 6, 7, 8]:
+            data_config["task_type"] = "cross_session"
+            cached_data, uid = cache.get_data_cache(data_config)
+            
+            if cached_data:
+                print(f"\n[INFO] Loaded precomputed cross-session data from cache (Hash: {uid})")
+                x_s1, y_s1 = cached_data['x_s1'], cached_data['y_s1']
+                x_s2, y_s2 = cached_data['x_s2'], cached_data['y_s2']
+            else:
+                x_s1, y_s1 = loader.load_session("train")
+                x_s2, y_s2 = loader.load_session("test")
+                cache.save_data_cache({'x_s1': x_s1, 'y_s1': y_s1, 'x_s2': x_s2, 'y_s2': y_s2}, data_config, uid)
+
+            print(f"\n[INFO] Session 1 (Enroll) Loaded: X={x_s1.shape}, Y={y_s1.shape}")
+            print(f"[INFO] Session 2 (Probe) Loaded:  X={x_s2.shape}, Y={y_s2.shape}")
+            if x_s1.shape[0] == 0 or x_s2.shape[0] == 0:
+                print("[ERROR] One or both cross-session arrays are empty. Check your parameters.")
+                sys.exit(1)
+
+    else:
+        # Tasks 1 to 4: Intra-Session or Single Array operations
+        if args.task in [1, 2, 3, 4]:
+            if args.dataset in ['cybhi', 'heartprint']:
+                x, y = loader.load_session("train")
+            else:
+                # EXPLICIT ROUTING: No more try/except guessing!
+                if args.data_split_mode in ["all-available", "single-session"]:
+                    x, y = loader.load_all_data()
+                else:
+                    x, y = loader.load_session("train")
+
+            print(f"\n[INFO] Data Loaded: X={x.shape}, Y={y.shape}")
+            if x.shape[0] == 0:
+                print("[ERROR] No data returned from loader. Check your session configs.")
+                sys.exit(1)
+                
+        # Tasks 5 to 8: Cross-Session (Requires S1 and S2 arrays)
+        elif args.task in [5, 6, 7, 8]:
+            x_s1, y_s1 = loader.load_session("train")
+            x_s2, y_s2 = loader.load_session("test")
+            
+            print(f"\n[INFO] Session 1 (Enroll) Loaded: X={x_s1.shape}, Y={y_s1.shape}")
+            print(f"[INFO] Session 2 (Probe) Loaded:  X={x_s2.shape}, Y={y_s2.shape}")
+            if x_s1.shape[0] == 0 or x_s2.shape[0] == 0:
+                print("[ERROR] One or both cross-session arrays are empty. Check your parameters.")
+                sys.exit(1)
+
 
     # ==========================================
     # 4. SHARED EXECUTION ARGUMENTS
@@ -266,7 +324,10 @@ def main():
         'sqi_threshold': args.sqi_threshold,
         'sqi_keep_pct': args.sqi_keep_pct,
         'save_results_and_settings': args.save_results,
-        'loader': loader
+        'loader': loader,
+        'save_results_and_settings': args.save_results,
+        'loader': loader,
+        'intelligent_weight_loading': args.intelligent_weight_loading
     }
 
     # ==========================================

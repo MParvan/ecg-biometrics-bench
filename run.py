@@ -139,7 +139,8 @@ def run_closed_set_identification(x, y, model_class, epochs=150, batch_size=256,
                                   outlier_filtering_on_test=False, sqi_scores=None,
                                   sqi_threshold=0.05, sqi_keep_pct=0.8, probe_fusion_size=3,
                                   save_results_and_settings=False, loader=None, 
-                                  n_runs=1, _return_stats=False):
+                                  n_runs=1, _return_stats=False,
+                                  intelligent_weight_loading=True):
     """
     Standard Closed-Set Identification Pipeline (Intra-session).
     Determines "Who is this person?" from a known pool of subjects seen during training.
@@ -200,7 +201,7 @@ def run_closed_set_identification(x, y, model_class, epochs=150, batch_size=256,
         
         # CLEANUP: Crucial step. Remove internal variables from the dict so we don't 
         # pass 'data_stats' or 'hyperparams' as arguments to the next call.
-        for k in ['data_stats', 'hyperparams', 'call_args']: 
+        for k in ['data_stats', 'hyperparams', 'call_args', 'intelligent_weight_loading']: 
             call_args.pop(k, None)
         
         # Configure the sub-runs: 
@@ -357,9 +358,37 @@ def run_closed_set_identification(x, y, model_class, epochs=150, batch_size=256,
  
     # 3. Train (Always start with Softmax training)
     model = model_class(in_channels=_detect_channels(x), num_classes=len(classes), include_top=True).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr); criterion = nn.CrossEntropyLoss()
     
-    model = _run_training_loop(model, train_loader, val_loader, optimizer, criterion, device, epochs)
+    if intelligent_weight_loading:
+        from utils import CacheManager
+        cache = CacheManager()
+        train_config = {
+        "training_regime": "intra_session_closed_set",
+        "model": model_class.__name__,
+        "epochs": epochs,
+        "batch_size": batch_size,
+        "lr": lr,
+        "val_split": val_split,
+        "seed": seed,
+        "outlier_train": outlier_filtering_on_train,
+        "sqi_thresh": sqi_threshold,
+        "classes": len(classes),
+        "data_shape": X_tr.shape 
+        }
+        
+        cached_model, uid = cache.get_weight_cache(train_config, model, device)
+        if cached_model:
+            print(f"\n[INFO] Loaded pre-trained weights (Hash: {uid}). Skipping training!")
+            model = cached_model
+            model.actual_epochs = epochs
+        else:
+            print(f"\n[INFO] Training new model (Hash: {uid})...")
+            optimizer = torch.optim.Adam(model.parameters(), lr=lr); criterion = nn.CrossEntropyLoss()
+            model = _run_training_loop(model, train_loader, val_loader, optimizer, criterion, device, epochs)
+            cache.save_weight_cache(model, train_config, uid)
+    else:
+        optimizer = torch.optim.Adam(model.parameters(), lr=lr); criterion = nn.CrossEntropyLoss()
+        model = _run_training_loop(model, train_loader, val_loader, optimizer, criterion, device, epochs)
 
     # 4. Evaluation Logic
     if not use_template:
@@ -453,7 +482,8 @@ def run_closed_set_verification(x, y, model_class, epochs=150, batch_size=256, l
                                 outlier_filtering_on_train=False, outlier_filtering_on_test=False, 
                                 sqi_scores=None, sqi_threshold=0.05, sqi_keep_pct=0.8, 
                                 use_deployment_evaluation=False, save_results_and_settings=False, 
-                                loader=None, n_runs=1, _return_stats=False):
+                                loader=None, n_runs=1, _return_stats=False,
+                                intelligent_weight_loading=True):
     """
     Standard Closed-Set Verification Pipeline (Intra-session).
     Determines "Is this person who they claim to be?" (1:1 matching) for subjects known to the model.
@@ -516,7 +546,7 @@ def run_closed_set_verification(x, y, model_class, epochs=150, batch_size=256, l
     # --- MULTI-RUN AGGREGATOR ---
     if n_runs > 1:
         call_args = locals().copy()
-        for k in ['data_stats', 'hyperparams', 'call_args']: 
+        for k in ['data_stats', 'hyperparams', 'call_args', 'intelligent_weight_loading']: 
             call_args.pop(k, None)
         call_args.update({'n_runs': 1, '_return_stats': True, 'save_results_and_settings': False})
         base_seed = call_args.get('seed', 42)
@@ -650,10 +680,31 @@ def run_closed_set_verification(x, y, model_class, epochs=150, batch_size=256, l
     
     # 7. Train Model
     model = model_class(in_channels=_detect_channels(x), num_classes=len(classes), include_top=True).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    criterion = nn.CrossEntropyLoss()
-    model = _run_training_loop(model, train_loader, val_loader, optimizer, criterion, device, epochs)
     
+    if intelligent_weight_loading:
+        from utils import CacheManager
+        cache = CacheManager()
+        train_config = {
+            "training_regime": "intra_session_closed_set",
+            "model": model_class.__name__, "epochs": epochs, "batch_size": batch_size, "lr": lr, 
+            "val_split": val_split, "seed": seed, "outlier_train": outlier_filtering_on_train, 
+            "sqi_thresh": sqi_threshold, "classes": len(classes), "data_shape": X_tr.shape
+        }
+        cached_model, uid = cache.get_weight_cache(train_config, model, device)
+        if cached_model:
+            print(f"\n[INFO] Loaded pre-trained weights (Hash: {uid}). Skipping training!")
+            model = cached_model
+            model.actual_epochs = epochs
+        else:
+            print(f"\n[INFO] Training new model (Hash: {uid})...")
+            optimizer = torch.optim.Adam(model.parameters(), lr=lr); criterion = nn.CrossEntropyLoss()
+            model = _run_training_loop(model, train_loader, val_loader, optimizer, criterion, device, epochs)
+            cache.save_weight_cache(model, train_config, uid)
+    else:
+        optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+        criterion = nn.CrossEntropyLoss()
+        model = _run_training_loop(model, train_loader, val_loader, optimizer, criterion, device, epochs)
+        
     # Switch model to feature extractor
     model.include_top = False
 
@@ -763,7 +814,8 @@ def run_subject_disjoint_identification(x, y, model_class, epochs=150, batch_siz
                                         outlier_filtering_on_test=False, sqi_scores=None, 
                                         sqi_threshold=0.05, sqi_keep_pct=0.8, probe_fusion_size=3, 
                                         save_results_and_settings=False, loader=None, 
-                                        n_runs=1, _return_stats=False):
+                                        n_runs=1, _return_stats=False,
+                                        intelligent_weight_loading=True):
     """
     Subject-Disjoint Identification Pipeline (Open-Set).
     Evaluates identification performance on subjects entirely UNSEEN during the training phase.
@@ -830,7 +882,7 @@ def run_subject_disjoint_identification(x, y, model_class, epochs=150, batch_siz
 
     if n_runs > 1:
         call_args = locals().copy()
-        for k in ['data_stats', 'hyperparams', 'call_args']: call_args.pop(k, None)
+        for k in ['data_stats', 'hyperparams', 'call_args', 'intelligent_weight_loading']: call_args.pop(k, None)
         call_args.update({'n_runs': 1, '_return_stats': True, 'save_results_and_settings': False})
         base_seed = call_args.get('seed', 42)
         results = []
@@ -976,14 +1028,41 @@ def run_subject_disjoint_identification(x, y, model_class, epochs=150, batch_siz
     test_loader = _make_loader(X_test, y_test, batch_size, shuffle=False)
     
     model = model_class(in_channels=_detect_channels(x), num_classes=num_train_classes, include_top=True).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    criterion = nn.CrossEntropyLoss()
     
-    # Call the updated custom loop passing both validation loaders of seen and unseen subjects!
-    model = _run_train_loop_unseen_subjects(
-        model, train_loader, val_loader_seen, val_loader_unseen, optimizer, criterion, device, 
-        epochs, matching_method=matching_method, patience=40, lr_patience=15
-    )
+    if intelligent_weight_loading:
+        from utils import CacheManager
+        cache = CacheManager()
+        train_config = {
+            "training_regime": "intra_session_open_set",
+            "model": model_class.__name__, "epochs": epochs, "batch_size": batch_size, "lr": lr, 
+            "val_split": val_split, "seed": seed, "outlier_train": outlier_filtering_on_train, 
+            "sqi_thresh": sqi_threshold, "classes": num_train_classes, "data_shape": X_tr.shape,
+            "matching_method": matching_method  # Affects early stopping EER!
+        }
+        cached_model, uid = cache.get_weight_cache(train_config, model, device)
+        if cached_model:
+            print(f"\n[INFO] Loaded pre-trained weights (Hash: {uid}). Skipping training!")
+            model = cached_model
+            model.actual_epochs = epochs
+        else:
+            print(f"\n[INFO] Training new Open-Set model (Hash: {uid})...")
+            optimizer = torch.optim.Adam(model.parameters(), lr=lr); criterion = nn.CrossEntropyLoss()
+            model = _run_train_loop_unseen_subjects(
+                model=model, train_loader=train_loader, val_loader_seen=val_loader_seen, 
+                val_loader_unseen=val_loader_unseen, optimizer=optimizer, criterion=criterion, 
+                device=device, epochs=epochs, matching_method=matching_method, patience=40, lr_patience=15
+            )
+            cache.save_weight_cache(model, train_config, uid)
+    
+    else:
+        optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+        criterion = nn.CrossEntropyLoss()
+        
+        # Call the updated custom loop passing both validation loaders of seen and unseen subjects!
+        model = _run_train_loop_unseen_subjects(
+            model, train_loader, val_loader_seen, val_loader_unseen, optimizer, criterion, device, 
+            epochs, matching_method=matching_method, patience=40, lr_patience=15
+        )
 
     # ====================================================
     # 7. FINAL INFERENCE ON UNSEEN TEST SUBJECTS
@@ -1074,7 +1153,8 @@ def run_subject_disjoint_verification(x, y, model_class, epochs=150, batch_size=
                                       outlier_filtering_on_train=False, outlier_filtering_on_test=False, 
                                       sqi_scores=None, sqi_threshold=0.05, sqi_keep_pct=0.8, 
                                       use_deployment_evaluation=False, save_results_and_settings=False, 
-                                      loader=None, n_runs=1, _return_stats=False):
+                                      loader=None, n_runs=1, _return_stats=False,
+                                      intelligent_weight_loading=True):
     """
     Subject-Disjoint Verification Pipeline (Open-Set 1:1 Matching).
     Tests the system's ability to verify the identity of completely new users.
@@ -1133,7 +1213,7 @@ def run_subject_disjoint_verification(x, y, model_class, epochs=150, batch_size=
 
     if n_runs > 1:
         call_args = locals().copy()
-        for k in ['data_stats', 'hyperparams', 'call_args']: call_args.pop(k, None)
+        for k in ['data_stats', 'hyperparams', 'call_args', 'intelligent_weight_loading']: call_args.pop(k, None)
         call_args.update({'n_runs': 1, '_return_stats': True, 'save_results_and_settings': False})
         base_seed = call_args.get('seed', 42)
         results = []
@@ -1285,23 +1365,50 @@ def run_subject_disjoint_verification(x, y, model_class, epochs=150, batch_size=
     test_loader = _make_loader(X_test, y_test, batch_size, shuffle=False)
     
     model = model_class(in_channels=_detect_channels(x), num_classes=num_train_classes, include_top=True).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    criterion = nn.CrossEntropyLoss()
     
-    # Single line execution using the Composite Metric loop!
-    model = _run_train_loop_unseen_subjects(
-        model=model, 
-        train_loader=train_loader, 
-        val_loader_seen=val_loader_seen, 
-        val_loader_unseen=val_loader_unseen, 
-        optimizer=optimizer, 
-        criterion=criterion, 
-        device=device, 
-        epochs=epochs, 
-        matching_method=matching_method, 
-        patience=40,       # Max epochs to wait for composite score improvement
-        lr_patience=15     # Epochs to wait before halving Learning Rate
-    )
+    if intelligent_weight_loading:
+        from utils import CacheManager
+        cache = CacheManager()
+        train_config = {
+            "training_regime": "intra_session_open_set",
+            "model": model_class.__name__, "epochs": epochs, "batch_size": batch_size, "lr": lr, 
+            "val_split": val_split, "seed": seed, "outlier_train": outlier_filtering_on_train, 
+            "sqi_thresh": sqi_threshold, "classes": num_train_classes, "data_shape": X_tr.shape,
+            "matching_method": matching_method  # Affects early stopping EER!
+        }
+        cached_model, uid = cache.get_weight_cache(train_config, model, device)
+        if cached_model:
+            print(f"\n[INFO] Loaded pre-trained weights (Hash: {uid}). Skipping training!")
+            model = cached_model
+            model.actual_epochs = epochs
+        else:
+            print(f"\n[INFO] Training new Open-Set model (Hash: {uid})...")
+            optimizer = torch.optim.Adam(model.parameters(), lr=lr); criterion = nn.CrossEntropyLoss()
+            model = _run_train_loop_unseen_subjects(
+                model=model, train_loader=train_loader, val_loader_seen=val_loader_seen, 
+                val_loader_unseen=val_loader_unseen, optimizer=optimizer, criterion=criterion, 
+                device=device, epochs=epochs, matching_method=matching_method, patience=40, lr_patience=15
+            )
+            cache.save_weight_cache(model, train_config, uid)
+    
+    else:
+        optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+        criterion = nn.CrossEntropyLoss()
+        
+        # Single line execution using the Composite Metric loop!
+        model = _run_train_loop_unseen_subjects(
+            model=model, 
+            train_loader=train_loader, 
+            val_loader_seen=val_loader_seen, 
+            val_loader_unseen=val_loader_unseen, 
+            optimizer=optimizer, 
+            criterion=criterion, 
+            device=device, 
+            epochs=epochs, 
+            matching_method=matching_method, 
+            patience=40,       # Max epochs to wait for composite score improvement
+            lr_patience=15     # Epochs to wait before halving Learning Rate
+        )
 
     # ====================================================
     # 7. MODEL CALIBRATION (Optional)
@@ -1417,7 +1524,8 @@ def run_cross_session_identification(x_train, y_train, x_test, y_test, model_cla
                                      outlier_filtering_on_train=False, outlier_filtering_on_test=False, 
                                      sqi_train=None, sqi_test=None, sqi_threshold=0.05, 
                                      sqi_keep_pct=0.8, probe_fusion_size=3, save_results_and_settings=False, 
-                                     loader=None, n_runs=1, _return_stats=False):
+                                     loader=None, n_runs=1, _return_stats=False,
+                                     intelligent_weight_loading=True):
     """
     Cross-Session Identification Pipeline (Temporal Robustness).
     Evaluates system robustness against physiological aging and sensor variations over time.
@@ -1474,7 +1582,7 @@ def run_cross_session_identification(x_train, y_train, x_test, y_test, model_cla
 
     if n_runs > 1:
         call_args = locals().copy()
-        for k in ['data_stats', 'hyperparams', 'call_args']: call_args.pop(k, None)
+        for k in ['data_stats', 'hyperparams', 'call_args', 'intelligent_weight_loading']: call_args.pop(k, None)
         call_args.update({'n_runs': 1, '_return_stats': True, 'save_results_and_settings': False})
         base_seed = call_args.get('seed', 42)
         results = []
@@ -1590,9 +1698,29 @@ def run_cross_session_identification(x_train, y_train, x_test, y_test, model_cla
     
     # Train Model
     model = model_class(in_channels=_detect_channels(x_train_full), num_classes=len(classes), include_top=True).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr); criterion = nn.CrossEntropyLoss()
     
-    model = _run_training_loop(model, train_loader, val_loader, optimizer, criterion, device, epochs)
+    if intelligent_weight_loading:
+        from utils import CacheManager
+        cache = CacheManager()
+        train_config = {
+            "training_regime": "cross_session_closed_set",
+            "model": model_class.__name__, "epochs": epochs, "batch_size": batch_size, "lr": lr, 
+            "val_split": val_split, "seed": seed, "outlier_train": outlier_filtering_on_train, 
+            "sqi_thresh": sqi_threshold, "classes": len(classes), "data_shape": X_tr.shape
+        }
+        cached_model, uid = cache.get_weight_cache(train_config, model, device)
+        if cached_model:
+            print(f"\n[INFO] Loaded pre-trained weights (Hash: {uid}). Skipping training!")
+            model = cached_model
+            model.actual_epochs = epochs
+        else:
+            print(f"\n[INFO] Training new Cross-Session model (Hash: {uid})...")
+            optimizer = torch.optim.Adam(model.parameters(), lr=lr); criterion = nn.CrossEntropyLoss()
+            model = _run_training_loop(model, train_loader, val_loader, optimizer, criterion, device, epochs)
+            cache.save_weight_cache(model, train_config, uid)
+    else:
+        optimizer = torch.optim.Adam(model.parameters(), lr=lr); criterion = nn.CrossEntropyLoss()
+        model = _run_training_loop(model, train_loader, val_loader, optimizer, criterion, device, epochs)
     
     # ====================================================
     # 6. EVALUATION STRATEGY
@@ -1683,7 +1811,8 @@ def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class
                                    outlier_filtering_on_test=False, sqi_train=None, sqi_test=None, 
                                    sqi_threshold=0.05, sqi_keep_pct=0.8, use_deployment_evaluation=False, 
                                    save_results_and_settings=False, loader=None, 
-                                   n_runs=1, _return_stats=False):
+                                   n_runs=1, _return_stats=False,
+                                   intelligent_weight_loading=True):
     """
     Cross-Session Verification Pipeline (Temporal Robustness 1:1).
     Attempts to verify if a subject is who they claim to be across different time-separated recording sessions.
@@ -1742,7 +1871,7 @@ def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class
 
     if n_runs > 1:
         call_args = locals().copy()
-        for k in ['data_stats', 'hyperparams', 'call_args']: call_args.pop(k, None)
+        for k in ['data_stats', 'hyperparams', 'call_args', 'intelligent_weight_loading']: call_args.pop(k, None)
         call_args.update({'n_runs': 1, '_return_stats': True, 'save_results_and_settings': False})
         base_seed = call_args.get('seed', 42)
         results = []
@@ -1858,9 +1987,29 @@ def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class
     
     # Train Model
     model = model_class(in_channels=_detect_channels(x_train_full), num_classes=len(classes), include_top=True).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr); criterion = nn.CrossEntropyLoss()
     
-    model = _run_training_loop(model, train_loader, val_loader, optimizer, criterion, device, epochs)
+    if intelligent_weight_loading:
+        from utils import CacheManager
+        cache = CacheManager()
+        train_config = {
+            "training_regime": "cross_session_closed_set",
+            "model": model_class.__name__, "epochs": epochs, "batch_size": batch_size, "lr": lr, 
+            "val_split": val_split, "seed": seed, "outlier_train": outlier_filtering_on_train, 
+            "sqi_thresh": sqi_threshold, "classes": len(classes), "data_shape": X_tr.shape
+        }
+        cached_model, uid = cache.get_weight_cache(train_config, model, device)
+        if cached_model:
+            print(f"\n[INFO] Loaded pre-trained weights (Hash: {uid}). Skipping training!")
+            model = cached_model
+            model.actual_epochs = epochs
+        else:
+            print(f"\n[INFO] Training new Cross-Session model (Hash: {uid})...")
+            optimizer = torch.optim.Adam(model.parameters(), lr=lr); criterion = nn.CrossEntropyLoss()
+            model = _run_training_loop(model, train_loader, val_loader, optimizer, criterion, device, epochs)
+            cache.save_weight_cache(model, train_config, uid)
+    else:
+        optimizer = torch.optim.Adam(model.parameters(), lr=lr); criterion = nn.CrossEntropyLoss()    
+        model = _run_training_loop(model, train_loader, val_loader, optimizer, criterion, device, epochs)
     
     # Switch to Feature Extractor
     model.include_top = False
@@ -1964,7 +2113,8 @@ def run_subject_disjoint_cross_session_identification(
         seed=42, device=None, visualize=False, use_template=True, template_fusion_method='mean', template_size=None, 
         matching_method='cosine', outlier_filtering_on_train=False, outlier_filtering_on_test=False, sqi_s1=None, 
         sqi_s2=None, sqi_threshold=0.05, sqi_keep_pct=0.8, probe_fusion_size=3, save_results_and_settings=False, 
-        loader=None, n_runs=1, _return_stats=False):
+        loader=None, n_runs=1, _return_stats=False,
+        intelligent_weight_loading=True):
     """
     The Ultimate Biometric Test: Open-Set + Temporal Robustness Identification.
     1. Trains a feature extractor on Session 1 of Subject Group A.
@@ -2021,7 +2171,7 @@ def run_subject_disjoint_cross_session_identification(
 
     if n_runs > 1:
         call_args = locals().copy()
-        for k in ['data_stats', 'hyperparams', 'call_args']: call_args.pop(k, None)
+        for k in ['data_stats', 'hyperparams', 'call_args', 'intelligent_weight_loading']: call_args.pop(k, None)
         call_args.update({'n_runs': 1, '_return_stats': True, 'save_results_and_settings': False})
         base_seed = call_args.get('seed', 42)
         results = []
@@ -2144,23 +2294,49 @@ def run_subject_disjoint_cross_session_identification(
     val_loader_unseen = val_loader_s1
     
     model = model_class(in_channels=_detect_channels(x_s1), num_classes=num_train_classes, include_top=True).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    criterion = nn.CrossEntropyLoss()
     
-    # Single line execution using the Composite Metric loop!
-    model = _run_train_loop_unseen_subjects(
-        model=model, 
-        train_loader=train_loader, 
-        val_loader_seen=val_loader_seen, 
-        val_loader_unseen=val_loader_unseen, 
-        optimizer=optimizer, 
-        criterion=criterion, 
-        device=device, 
-        epochs=epochs, 
-        matching_method=matching_method, 
-        patience=40,       # Max epochs to wait for composite score improvement
-        lr_patience=15     # Epochs to wait before halving Learning Rate
-    )
+    if intelligent_weight_loading:
+        from utils import CacheManager
+        cache = CacheManager()
+        train_config = {
+            "training_regime": "cross_session_open_set",
+            "model": model_class.__name__, "epochs": epochs, "batch_size": batch_size, "lr": lr, 
+            "val_split": val_split, "seed": seed, "outlier_train": outlier_filtering_on_train, 
+            "sqi_thresh": sqi_threshold, "classes": num_train_classes, "data_shape": X_tr.shape,
+            "matching_method": matching_method # Affects early stopping EER!
+        }
+        cached_model, uid = cache.get_weight_cache(train_config, model, device)
+        if cached_model:
+            print(f"\n[INFO] Loaded pre-trained weights (Hash: {uid}). Skipping training!")
+            model = cached_model
+            model.actual_epochs = epochs
+        else:
+            print(f"\n[INFO] Training new Open-Set Cross-Session model (Hash: {uid})...")
+            optimizer = torch.optim.Adam(model.parameters(), lr=lr); criterion = nn.CrossEntropyLoss()
+            model = _run_train_loop_unseen_subjects(
+                model=model, train_loader=train_loader, val_loader_seen=val_loader_seen, 
+                val_loader_unseen=val_loader_unseen, optimizer=optimizer, criterion=criterion, 
+                device=device, epochs=epochs, matching_method=matching_method, patience=40, lr_patience=15
+            )
+            cache.save_weight_cache(model, train_config, uid)
+    else:
+        optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+        criterion = nn.CrossEntropyLoss()
+        
+        # Single line execution using the Composite Metric loop!
+        model = _run_train_loop_unseen_subjects(
+            model=model, 
+            train_loader=train_loader, 
+            val_loader_seen=val_loader_seen, 
+            val_loader_unseen=val_loader_unseen, 
+            optimizer=optimizer, 
+            criterion=criterion, 
+            device=device, 
+            epochs=epochs, 
+            matching_method=matching_method, 
+            patience=40,       # Max epochs to wait for composite score improvement
+            lr_patience=15     # Epochs to wait before halving Learning Rate
+        )
 
     # ====================================================
     # 5. FINAL INFERENCE ON UNSEEN SUBJECTS
@@ -2227,7 +2403,8 @@ def run_subject_disjoint_cross_session_verification(
         num_pairs=10000, sampling_mode="balanced", seed=42, device=None, visualize=False, use_template=False, 
         template_fusion_method='mean', template_size=None, matching_method='cosine', outlier_filtering_on_train=False, 
         outlier_filtering_on_test=False, sqi_s1=None, sqi_s2=None, sqi_threshold=0.05, sqi_keep_pct=0.8,
-        use_deployment_evaluation=False, save_results_and_settings=False, loader=None, n_runs=1, _return_stats=False):
+        use_deployment_evaluation=False, save_results_and_settings=False, loader=None, n_runs=1, _return_stats=False,
+        intelligent_weight_loading=True):
     """
     The Ultimate Biometric Test: Open-Set + Temporal Robustness 1:1 Verification.
     Verifies the identity of subjects completely excluded from representation learning, across different recording days.
@@ -2288,7 +2465,7 @@ def run_subject_disjoint_cross_session_verification(
 
     if n_runs > 1:
         call_args = locals().copy()
-        for k in ['data_stats', 'hyperparams', 'call_args']: call_args.pop(k, None)
+        for k in ['data_stats', 'hyperparams', 'call_args', 'intelligent_weight_loading']: call_args.pop(k, None)
         call_args.update({'n_runs': 1, '_return_stats': True, 'save_results_and_settings': False})
         base_seed = call_args.get('seed', 42)
         results = []
@@ -2402,23 +2579,49 @@ def run_subject_disjoint_cross_session_verification(
     val_loader_unseen = val_loader_s1
     
     model = model_class(in_channels=_detect_channels(x_s1), num_classes=num_train_classes, include_top=True).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    criterion = nn.CrossEntropyLoss()
     
-    # Single line execution using the Composite Metric loop!
-    model = _run_train_loop_unseen_subjects(
-        model=model, 
-        train_loader=train_loader, 
-        val_loader_seen=val_loader_seen, 
-        val_loader_unseen=val_loader_unseen, 
-        optimizer=optimizer, 
-        criterion=criterion, 
-        device=device, 
-        epochs=epochs, 
-        matching_method=matching_method, 
-        patience=40,       # Max epochs to wait for composite score improvement
-        lr_patience=15     # Epochs to wait before halving Learning Rate
-    )
+    if intelligent_weight_loading:
+        from utils import CacheManager
+        cache = CacheManager()
+        train_config = {
+            "training_regime": "cross_session_open_set",
+            "model": model_class.__name__, "epochs": epochs, "batch_size": batch_size, "lr": lr, 
+            "val_split": val_split, "seed": seed, "outlier_train": outlier_filtering_on_train, 
+            "sqi_thresh": sqi_threshold, "classes": num_train_classes, "data_shape": X_tr.shape,
+            "matching_method": matching_method # Affects early stopping EER!
+        }
+        cached_model, uid = cache.get_weight_cache(train_config, model, device)
+        if cached_model:
+            print(f"\n[INFO] Loaded pre-trained weights (Hash: {uid}). Skipping training!")
+            model = cached_model
+            model.actual_epochs = epochs
+        else:
+            print(f"\n[INFO] Training new Open-Set Cross-Session model (Hash: {uid})...")
+            optimizer = torch.optim.Adam(model.parameters(), lr=lr); criterion = nn.CrossEntropyLoss()
+            model = _run_train_loop_unseen_subjects(
+                model=model, train_loader=train_loader, val_loader_seen=val_loader_seen, 
+                val_loader_unseen=val_loader_unseen, optimizer=optimizer, criterion=criterion, 
+                device=device, epochs=epochs, matching_method=matching_method, patience=40, lr_patience=15
+            )
+            cache.save_weight_cache(model, train_config, uid)
+    else:
+        optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+        criterion = nn.CrossEntropyLoss()
+        
+        # Single line execution using the Composite Metric loop!
+        model = _run_train_loop_unseen_subjects(
+            model=model, 
+            train_loader=train_loader, 
+            val_loader_seen=val_loader_seen, 
+            val_loader_unseen=val_loader_unseen, 
+            optimizer=optimizer, 
+            criterion=criterion, 
+            device=device, 
+            epochs=epochs, 
+            matching_method=matching_method, 
+            patience=40,       # Max epochs to wait for composite score improvement
+            lr_patience=15     # Epochs to wait before halving Learning Rate
+        )
 
     # ====================================================
     # 5. MODEL CALIBRATION (Optional)
