@@ -804,32 +804,97 @@ def _compute_sqi(x, method):
     else:
         raise ValueError(f"[ERROR] Unknown SQI calculation method: '{method}'")
 
-def _apply_outlier_filter(x, y, sqi_scores, absolute_threshold=0.05, keep_percentage=0.8):
+def _apply_outlier_filter(
+    x,
+    y,
+    sqi_scores,
+    absolute_threshold=0.05,
+    keep_percentage=0.8,
+    apply_subject_ranking=True,
+):
     """
-    Filters out noisy ECG beats based on Signal Quality Index (SQI).
+    Filter ECG samples using a Signal Quality Index.
+
+    The absolute threshold is identity-independent and can be used for
+    training, enrollment, validation, and probe data.
+
+    When ``apply_subject_ranking=True``, the function additionally retains
+    only the highest-quality percentage of samples separately for each
+    subject. This option is appropriate for controlled training or
+    enrollment data, but must not be used for operational probe data because
+    it requires access to ground-truth subject labels.
     """
-    if sqi_scores is None or len(sqi_scores) != len(x):
-        raise ValueError("[ERROR] To use outlier_filtering=True, you must provide an 'sqi_scores' array of the same length as 'x'.")
+    x = np.asarray(x)
+    y = np.asarray(y)
+    sqi_scores = np.asarray(sqi_scores)
 
-    # Stage 1: Absolute Threshold
-    stage1_mask = sqi_scores >= absolute_threshold
-    x_stg1, y_stg1, sqi_stg1 = x[stage1_mask], y[stage1_mask], sqi_scores[stage1_mask]
-    original_indices = np.where(stage1_mask)[0]
-    
-    # Stage 2: Per-Subject Percentage
-    final_indices = []
-    for subject in np.unique(y_stg1):
-        subject_idx = np.where(y_stg1 == subject)[0]
-        num_to_keep = max(1, int(len(subject_idx) * keep_percentage))
-        
-        subj_sqi = sqi_stg1[subject_idx]
-        sorted_subj_idx = subject_idx[np.argsort(subj_sqi)[::-1]] # Highest SQI first
-        
-        final_indices.extend(original_indices[sorted_subj_idx[:num_to_keep]])
+    if len(x) != len(y):
+        raise ValueError(
+            "[ERROR] x and y must contain the same number of samples."
+        )
 
-    final_indices = sorted(final_indices) # Maintain chronological order
-    
-    print(f"[INFO] Outlier Filter: Dropped {len(x) - len(final_indices)} noisy beats. Retained {len(final_indices)}.")
+    if len(sqi_scores) != len(x):
+        raise ValueError(
+            "[ERROR] sqi_scores must contain one score per sample."
+        )
+
+    if not 0.0 <= absolute_threshold <= 1.0:
+        raise ValueError(
+            "[ERROR] absolute_threshold must be between 0.0 and 1.0."
+        )
+
+    if not 0.0 < keep_percentage <= 1.0:
+        raise ValueError(
+            "[ERROR] keep_percentage must be greater than 0.0 "
+            "and less than or equal to 1.0."
+        )
+
+    # Stage 1: identity-independent absolute SQI threshold.
+    threshold_mask = sqi_scores >= absolute_threshold
+    surviving_indices = np.flatnonzero(threshold_mask)
+
+    if not apply_subject_ranking:
+        final_indices = surviving_indices
+    else:
+        # Stage 2: controlled per-subject ranking for training/enrollment.
+        surviving_labels = y[surviving_indices]
+        surviving_scores = sqi_scores[surviving_indices]
+
+        selected_indices = []
+
+        for subject in np.unique(surviving_labels):
+            local_subject_indices = np.flatnonzero(
+                surviving_labels == subject
+            )
+
+            number_to_keep = max(
+                1,
+                int(len(local_subject_indices) * keep_percentage),
+            )
+
+            subject_scores = surviving_scores[local_subject_indices]
+
+            ranked_local_indices = local_subject_indices[
+                np.argsort(subject_scores)[::-1]
+            ]
+
+            selected_indices.extend(
+                surviving_indices[
+                    ranked_local_indices[:number_to_keep]
+                ]
+            )
+
+        final_indices = np.asarray(
+            sorted(selected_indices),
+            dtype=int,
+        )
+
+    print(
+        "[INFO] Outlier Filter: "
+        f"Dropped {len(x) - len(final_indices)} samples. "
+        f"Retained {len(final_indices)}."
+    )
+
     return x[final_indices], y[final_indices]
 
 

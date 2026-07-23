@@ -307,7 +307,7 @@ def run_closed_set_identification(x, y, model_class, epochs=150, batch_size=256,
     if outlier_filtering_on_test and sqi_test is not None:
         print("\n[INFO] Filtering Test Set (Probes)...")
         X_test, y_test = _apply_outlier_filter(
-            X_test, y_test, sqi_test, absolute_threshold=sqi_threshold, keep_percentage=sqi_keep_pct
+            X_test, y_test, sqi_test, absolute_threshold=sqi_threshold, keep_percentage=sqi_keep_pct, apply_subject_ranking=False
         )
 
     # ====================================================
@@ -634,7 +634,7 @@ def run_closed_set_verification(x, y, model_class, epochs=150, batch_size=256, l
     if outlier_filtering_on_test and sqi_test is not None:
         print("\n[INFO] Filtering Test Set (Probes)...")
         X_test, y_test = _apply_outlier_filter(
-            X_test, y_test, sqi_test, absolute_threshold=sqi_threshold, keep_percentage=sqi_keep_pct
+            X_test, y_test, sqi_test, absolute_threshold=sqi_threshold, keep_percentage=sqi_keep_pct, apply_subject_ranking=False
         )
 
     # ====================================================
@@ -978,7 +978,14 @@ def run_subject_disjoint_identification(x, y, model_class, epochs=150, batch_siz
 
     if outlier_filtering_on_test and sqi_scores is not None:
         print("\n[INFO] Filtering Test Set (Gallery & Probes)...")
-        X_test, y_test = _apply_outlier_filter(X_test, y_test, sqi_test, sqi_threshold, sqi_keep_pct)
+        X_test, y_test = _apply_outlier_filter(
+            X_test,
+            y_test,
+            sqi_test,
+            absolute_threshold=sqi_threshold,
+            keep_percentage=sqi_keep_pct,
+            apply_subject_ranking=False,
+        )
 
     # ====================================================
     # 5. POST-FILTER SYNCHRONIZATION
@@ -1316,7 +1323,14 @@ def run_subject_disjoint_verification(x, y, model_class, epochs=150, batch_size=
 
     if outlier_filtering_on_test and sqi_scores is not None:
         print("\n[INFO] Filtering Test Set (Probes)...")
-        X_test, y_test = _apply_outlier_filter(X_test, y_test, sqi_test, sqi_threshold, sqi_keep_pct)
+        X_test, y_test = _apply_outlier_filter(
+            X_test,
+            y_test,
+            sqi_test,
+            absolute_threshold=sqi_threshold,
+            keep_percentage=sqi_keep_pct,
+            apply_subject_ranking=False,
+        )
 
     # ====================================================
     # 5. POST-FILTER SYNCHRONIZATION
@@ -1637,7 +1651,14 @@ def run_cross_session_identification(x_train, y_train, x_test, y_test, model_cla
 
     if sqi_test is not None:
         print("\n[INFO] Filtering Session 2 (Probes)...")
-        x_test, y_test = _apply_outlier_filter(x_test, y_test, sqi_test, sqi_threshold, sqi_keep_pct)
+        x_test, y_test = _apply_outlier_filter(
+            x_test,
+            y_test,
+            sqi_test,
+            absolute_threshold=sqi_threshold,
+            keep_percentage=sqi_keep_pct,
+            apply_subject_ranking=False,
+        )
 
     # ====================================================
     # 3. INTERSECT SUBJECTS (Post-Filter Sync)
@@ -1929,7 +1950,14 @@ def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class
 
     if sqi_test is not None:
         print("\n[INFO] Filtering Session 2 (Probes)...")
-        x_test, y_test = _apply_outlier_filter(x_test, y_test, sqi_test, sqi_threshold, sqi_keep_pct)
+        x_test, y_test = _apply_outlier_filter(
+            x_test,
+            y_test,
+            sqi_test,
+            absolute_threshold=sqi_threshold,
+            keep_percentage=sqi_keep_pct,
+            apply_subject_ranking=False,
+        )
 
     # ====================================================
     # 3. INTERSECT SUBJECTS (Post-Filter Sync)
@@ -2220,7 +2248,14 @@ def run_subject_disjoint_cross_session_identification(
 
     if sqi_s2 is not None:
         print("\n[INFO] Filtering Session 2 (Probes)...")
-        x_s2, y_s2 = _apply_outlier_filter(x_s2, y_s2, sqi_s2, sqi_threshold, sqi_keep_pct)
+        x_s2, y_s2 = _apply_outlier_filter(
+            x_s2,
+            y_s2,
+            sqi_s2,
+            absolute_threshold=sqi_threshold,
+            keep_percentage=sqi_keep_pct,
+            apply_subject_ranking=False,
+        )
 
     # ====================================================
     # 2. INTERSECT AND SPLIT SUBJECTS (STRICTLY DISJOINT)
@@ -2514,7 +2549,14 @@ def run_subject_disjoint_cross_session_verification(
 
     if sqi_s2 is not None:
         print("\n[INFO] Filtering Session 2 (Probes)...")
-        x_s2, y_s2 = _apply_outlier_filter(x_s2, y_s2, sqi_s2, sqi_threshold, sqi_keep_pct)
+        x_s2, y_s2 = _apply_outlier_filter(
+            x_s2,
+            y_s2,
+            sqi_s2,
+            absolute_threshold=sqi_threshold,
+            keep_percentage=sqi_keep_pct,
+            apply_subject_ranking=False,
+        )
 
     # ====================================================
     # 2. INTERSECT AND SPLIT SUBJECTS
