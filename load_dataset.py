@@ -322,7 +322,6 @@ class load_ecgid_dataset():
             if not recs: continue
             
             target_recs = []
-            single_record_split = False
             
             unique_dates = sorted(list(set(r['date'] for r in recs)))
             day1_date = unique_dates[0]
@@ -330,30 +329,38 @@ class load_ecgid_dataset():
 
             # --- TASK 3: SINGLE CROSS-SESSION ---
             if self.data_split_mode == "single-cross-session":
+                if len(recs) < 2:
+                    dropped_subjects += 1
+                    continue
+
                 kept_subjects += 1
-                if len(recs) == 1:
-                    target_recs = [recs[0]]
-                    single_record_split = True
-                else:
-                    target_recs = [recs[0]] if is_enrollment else [recs[1]]
+                target_recs = [recs[0]] if is_enrollment else [recs[1]]
 
             # --- TASK 4: SINGLE-SHOT SHORT-TERM ---
             elif self.data_split_mode == "single-shot-short-term":
+                if len(day1_recs) < 2:
+                    dropped_subjects += 1
+                    continue
+
                 kept_subjects += 1
-                if len(day1_recs) == 1:
-                    target_recs = [day1_recs[0]]
-                    single_record_split = True
-                else:
-                    target_recs = [day1_recs[0]] if is_enrollment else day1_recs[1:]
+                target_recs = (
+                    [day1_recs[0]]
+                    if is_enrollment
+                    else day1_recs[1:]
+                )
 
             # --- TASK 5: LEAVE-LAST-OUT SHORT-TERM ---
             elif self.data_split_mode == "leave-last-out-short-term":
+                if len(day1_recs) < 2:
+                    dropped_subjects += 1
+                    continue
+
                 kept_subjects += 1
-                if len(day1_recs) == 1:
-                    target_recs = [day1_recs[0]]
-                    single_record_split = True
-                else:
-                    target_recs = day1_recs[:-1] if is_enrollment else [day1_recs[-1]]
+                target_recs = (
+                    day1_recs[:-1]
+                    if is_enrollment
+                    else [day1_recs[-1]]
+                )
 
             # --- TASK 6: SINGLE-SHOT LONG-TERM ---
             elif self.data_split_mode == "single-shot-long-term":
@@ -375,11 +382,6 @@ class load_ecgid_dataset():
             # --- EXTRACTION & SPLITTING ---
             for rec in target_recs:
                 segments = self._process_signal(rec['signal'], rec['fs'])
-                
-                if single_record_split and len(segments) > 1:
-                    mid = len(segments) // 2
-                    if is_enrollment: segments = segments[:mid]
-                    else: segments = segments[mid:]
                 
                 if len(segments) > 0:
                     x_list.append(segments)
