@@ -79,6 +79,79 @@ def apply_yaml_config(args, parser):
 
     return args
 
+def build_data_cache_config(args, loader, task_type):
+    """
+    Build a complete, deterministic identity for cached dataset arrays.
+
+    The cache key must include every setting that can change which records
+    are loaded or how they are preprocessed.
+    """
+    effective_preprocessing = {}
+
+    loader_cfg = getattr(loader, "cfg", {})
+
+    if isinstance(loader_cfg, dict):
+        configured_preprocessing = loader_cfg.get(
+            "preprocessing",
+            {},
+        )
+
+        if isinstance(configured_preprocessing, dict):
+            effective_preprocessing.update(
+                configured_preprocessing
+            )
+
+    preprocessing_overrides = getattr(
+        loader,
+        "prep_params",
+        {},
+    )
+
+    if isinstance(preprocessing_overrides, dict):
+        effective_preprocessing.update(
+            preprocessing_overrides
+        )
+
+    loader_settings = {}
+
+    cache_relevant_loader_attributes = [
+        "leads",
+        "beat_merge_method",
+        "single_segment_range",
+        "train_parts",
+        "enrol_parts",
+        "enroll_parts",
+        "test_parts",
+    ]
+
+    for attribute_name in cache_relevant_loader_attributes:
+        if hasattr(loader, attribute_name):
+            loader_settings[attribute_name] = getattr(
+                loader,
+                attribute_name,
+            )
+
+    return {
+        "dataset": args.dataset,
+        "loader_class": type(loader).__name__,
+        "task_type": task_type,
+        "split_mode": args.data_split_mode,
+        "num_beats_to_merge": args.num_beats_to_merge,
+        "signal_type": (
+            args.signal_type
+            if args.dataset == "ecgid"
+            else None
+        ),
+        "train_sessions": args.train_sessions,
+        "enroll_sessions": args.enroll_sessions,
+        "probe_sessions": args.probe_sessions,
+        "session_for_single_session_evaluation": (
+            args.session_for_single_session_evaluation
+        ),
+        "preprocessing": effective_preprocessing,
+        "loader_settings": loader_settings,
+    }
+
 def get_parser():
     # Use RawTextHelpFormatter to preserve beautiful line breaks in the help menu
     parser = argparse.ArgumentParser(
@@ -285,15 +358,14 @@ def main():
     if args.intelligent_data_loading:
         from utils import CacheManager
         cache = CacheManager()
-        data_config = {
-            "dataset": args.dataset, "split_mode": args.data_split_mode,
-            "num_beats": args.num_beats_to_merge, "preprocessing": getattr(loader, 'prep_params', {}),
-            "train_sessions": args.train_sessions, "test_sessions": args.probe_sessions
-        }
         
         # Tasks 1 to 4: Intra-Session
         if args.task in [1, 2, 3, 4]:
-            data_config["task_type"] = "intra_session"
+            data_config = build_data_cache_config(
+                args,
+                loader,
+                task_type="intra_session",
+            )
             cached_data, uid = cache.get_data_cache(data_config)
             
             if cached_data:
@@ -316,7 +388,11 @@ def main():
 
         # Tasks 5 to 8: Cross-Session
         elif args.task in [5, 6, 7, 8]:
-            data_config["task_type"] = "cross_session"
+            data_config = build_data_cache_config(
+                args,
+                loader,
+                task_type="cross_session",
+            )
             cached_data, uid = cache.get_data_cache(data_config)
             
             if cached_data:
