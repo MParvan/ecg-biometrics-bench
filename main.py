@@ -1,5 +1,7 @@
 import argparse
 import sys
+import traceback
+
 import numpy as np
 import yaml
 from pathlib import Path
@@ -151,6 +153,27 @@ def build_data_cache_config(args, loader, task_type):
         "preprocessing": effective_preprocessing,
         "loader_settings": loader_settings,
     }
+
+def _terminate_pipeline_with_error(error):
+    """
+    Report an unrecoverable pipeline error and exit with a failure status.
+
+    A nonzero exit code allows command-line scripts, CI systems, and batch
+    experiment managers to distinguish failed runs from successful runs.
+    """
+    print(
+        f"\n[CRITICAL ERROR] Pipeline Failed: {error}",
+        file=sys.stderr,
+    )
+
+    traceback.print_exception(
+        type(error),
+        error,
+        error.__traceback__,
+        file=sys.stderr,
+    )
+
+    raise SystemExit(1)
 
 def get_parser():
     # Use RawTextHelpFormatter to preserve beautiful line breaks in the help menu
@@ -566,10 +589,8 @@ def main():
 
         print("\n[SUCCESS] Pipeline execution complete.")
 
-    except Exception as e:
-        print(f"\n[CRITICAL ERROR] Pipeline Failed: {e}")
-        import traceback
-        traceback.print_exc()
+    except Exception as error:
+        _terminate_pipeline_with_error(error)
 
 if __name__ == "__main__":
     main()
