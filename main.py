@@ -27,6 +27,58 @@ from run import (
 # Import Models
 from models import DeepECG, ResNet1D, RNN_ECG, HybridCNNLSTM, ECGTransformer
 
+# =============================================================================
+# EXPERIMENT CONFIGURATION
+# =============================================================================
+
+CONFIG_KEY_ALIASES = {
+    # Backward-compatible name used by experiment_settings.yaml
+    "save_results_and_settings": "save_results",
+}
+
+
+def apply_yaml_config(args, parser):
+    """
+    Apply experiment settings from a YAML file.
+
+    YAML values override argparse defaults and explicitly supplied CLI values.
+    Unknown YAML keys raise an error instead of being silently ignored.
+    """
+    if not args.config:
+        return args
+
+    config_path = Path(args.config)
+
+    if not config_path.exists():
+        parser.error(f"Configuration file not found: {config_path}")
+
+    print(f"[INFO] Loading experiment parameters from YAML: {config_path.name}")
+
+    with open(config_path, "r", encoding="utf-8") as file:
+        yaml_cfg = yaml.safe_load(file) or {}
+
+    if not isinstance(yaml_cfg, dict):
+        parser.error("The YAML configuration must contain a key-value mapping.")
+
+    unknown_keys = []
+
+    for yaml_key, value in yaml_cfg.items():
+        argument_name = CONFIG_KEY_ALIASES.get(yaml_key, yaml_key)
+
+        if not hasattr(args, argument_name):
+            unknown_keys.append(yaml_key)
+            continue
+
+        setattr(args, argument_name, value)
+
+    if unknown_keys:
+        parser.error(
+            "Unknown configuration key(s): "
+            + ", ".join(sorted(unknown_keys))
+        )
+
+    return args
+
 def get_parser():
     # Use RawTextHelpFormatter to preserve beautiful line breaks in the help menu
     parser = argparse.ArgumentParser(
@@ -103,8 +155,9 @@ def get_parser():
     train_group.add_argument('--batch_size', type=int, default=256, help="Batch size (default: 256).")
     train_group.add_argument('--lr', type=float, default=1e-3, help="Learning rate (default: 0.001).")
     train_group.add_argument('--test_split', type=float, default=0.2, help="Percentage for Test set (default: 0.2).")
-    train_group.add_argument('--val_split', type=float, default=0.1, help="Percentage for Validation set (default: 0.0).")
+    train_group.add_argument('--val_split', type=float, default=0.1, help="Percentage for Validation set (default: 0.1).")
     train_group.add_argument('--seed', type=int, default=42, help="Random seed for reproducibility.")
+    train_group.add_argument('--n_runs', type=int, default=1, help="Number of independent runs using consecutive random seeds.")
 
     # ----------------------------------------------------
     # EVALUATION & TEMPLATE SETTINGS
@@ -122,6 +175,26 @@ def get_parser():
                             help="Distance metric for verification/identification.")
     eval_group.add_argument('--num_pairs', type=int, default=10000,
                             help="Number of pairs to generate for Verification Tasks (default: 10000).")
+    eval_group.add_argument(
+        '--sampling_mode',
+        type=str,
+        default='all',
+        choices=['all', 'balanced', 'random'],
+        help="Verification pair generation strategy."
+    )
+
+    eval_group.add_argument(
+        '--probe_fusion_size',
+        type=int,
+        default=3,
+        help="Number of probe scores to fuse for identification tasks."
+    )
+
+    eval_group.add_argument(
+        '--use_deployment_evaluation',
+        action='store_true',
+        help="Calibrate a verification threshold on validation data and apply it to test data."
+    )
 
     # ----------------------------------------------------
     # SQI & FILTERING SETTINGS
@@ -160,21 +233,9 @@ def main():
     args = parser.parse_args()
 
     # ==========================================
-    # 0. YAML INJECTION LOGIC
+    # 0. YAML CONFIGURATION
     # ==========================================
-    if args.config:
-        config_path = Path(args.config)
-        if config_path.exists():
-            print(f"[INFO] Loading experiment parameters from YAML: {config_path.name}")
-            with open(config_path, "r") as f:
-                yaml_cfg = yaml.safe_load(f)
-                
-            # Overwrite the default argparse args with whatever is in the YAML
-            for key, value in yaml_cfg.items():
-                if hasattr(args, key):
-                    setattr(args, key, value)
-        else:
-            print(f"[WARN] Config file '{args.config}' not found. Using CLI defaults.")
+    args = apply_yaml_config(args, parser)
 
     # ==========================================
     # 1. MODEL SELECTION
@@ -313,6 +374,7 @@ def main():
         'lr': args.lr,
         'val_split': args.val_split,
         'seed': args.seed,
+        'n_runs': args.n_runs,
         'device': args.device,
         'visualize': args.visualize,
         'use_template': args.use_template,
@@ -323,8 +385,6 @@ def main():
         'outlier_filtering_on_test': args.outlier_filtering_on_test,
         'sqi_threshold': args.sqi_threshold,
         'sqi_keep_pct': args.sqi_keep_pct,
-        'save_results_and_settings': args.save_results,
-        'loader': loader,
         'save_results_and_settings': args.save_results,
         'loader': loader,
         'intelligent_weight_loading': args.intelligent_weight_loading
@@ -343,6 +403,7 @@ def main():
             run_closed_set_identification(
                 x, y, 
                 test_split=args.test_split, 
+                probe_fusion_size=args.probe_fusion_size,
                 sqi_scores=args.sqi_method,
                 **common_args
             )
@@ -353,6 +414,8 @@ def main():
                 x, y, 
                 test_split=args.test_split,
                 num_pairs=args.num_pairs,
+                sampling_mode=args.sampling_mode,
+                use_deployment_evaluation=args.use_deployment_evaluation,
                 sqi_scores=args.sqi_method,
                 **common_args
             )
@@ -362,6 +425,7 @@ def main():
             run_subject_disjoint_identification(
                 x, y, 
                 test_split=args.test_split,
+                probe_fusion_size=args.probe_fusion_size,
                 sqi_scores=args.sqi_method,
                 **common_args
             )
@@ -372,6 +436,8 @@ def main():
                 x, y, 
                 test_split=args.test_split,
                 num_pairs=args.num_pairs,
+                sampling_mode=args.sampling_mode,
+                use_deployment_evaluation=args.use_deployment_evaluation,
                 sqi_scores=args.sqi_method,
                 **common_args
             )
@@ -380,6 +446,7 @@ def main():
         elif args.task == 5:
             run_cross_session_identification(
                 x_s1, y_s1, x_s2, y_s2, 
+                probe_fusion_size=args.probe_fusion_size,
                 sqi_train=args.sqi_method,
                 sqi_test=args.sqi_method,
                 **common_args
@@ -390,6 +457,8 @@ def main():
             run_cross_session_verification(
                 x_s1, y_s1, x_s2, y_s2, 
                 num_pairs=args.num_pairs,
+                sampling_mode=args.sampling_mode,
+                use_deployment_evaluation=args.use_deployment_evaluation,
                 sqi_train=args.sqi_method,
                 sqi_test=args.sqi_method,
                 **common_args
@@ -400,6 +469,7 @@ def main():
             run_subject_disjoint_cross_session_identification(
                 x_s1, y_s1, x_s2, y_s2, 
                 test_split=args.test_split,
+                probe_fusion_size=args.probe_fusion_size,
                 sqi_s1=args.sqi_method,
                 sqi_s2=args.sqi_method,
                 **common_args
@@ -411,6 +481,8 @@ def main():
                 x_s1, y_s1, x_s2, y_s2, 
                 test_split=args.test_split,
                 num_pairs=args.num_pairs,
+                sampling_mode=args.sampling_mode,
+                use_deployment_evaluation=args.use_deployment_evaluation,
                 sqi_s1=args.sqi_method,
                 sqi_s2=args.sqi_method,
                 **common_args
