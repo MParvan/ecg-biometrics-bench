@@ -682,20 +682,43 @@ def _generate_pairs(embeddings1, labels1, embeddings2=None, labels2=None,
         common_subs = list(set(s1_idx.keys()) & set(s2_idx.keys()))
         if len(common_subs) < 2: return np.array([]), np.array([])
 
-        # Genuine Pairs
+        # Subjects eligible for genuine comparisons.
+        # In intra-set evaluation, each subject must have at least two
+        # different samples so that self-pairs cannot be generated.
+        if match_two_sets:
+            genuine_subjects = common_subs
+        else:
+            genuine_subjects = [
+                subject
+                for subject in common_subs
+                if len(s1_idx[subject]) >= 2
+            ]
+
+        if not genuine_subjects:
+            return np.array([]), np.array([])
+
+        # Genuine pairs
         for _ in range(num_pairs // 2):
-            subj = np.random.choice(common_subs)
-            idx1 = np.random.choice(s1_idx[subj])
-            
+            subj = np.random.choice(genuine_subjects)
+
             if match_two_sets:
-                # E.g., Probe vs Template
+                # Probe versus enrollment/template.
+                idx1 = np.random.choice(s1_idx[subj])
                 idx2 = np.random.choice(s2_idx[subj])
             else:
-                # E.g., Test Beat vs Test Beat (Must ensure they are different beats)
-                if len(s1_idx[subj]) < 2: continue
-                idx2 = np.random.choice(s1_idx[subj], 2, replace=False)[1]
-                
-            score = _compute_pair_score(embeddings1[idx1], embeddings2[idx2], method=matching_method)
+                # Intra-set evaluation requires two distinct samples.
+                candidate_indices = np.asarray(s1_idx[subj])
+                idx1, idx2 = np.random.choice(
+                    candidate_indices,
+                    size=2,
+                    replace=False,
+                )
+
+            score = _compute_pair_score(
+                embeddings1[idx1],
+                embeddings2[idx2],
+                method=matching_method,
+            )
             scores.append(score)
             labels_pair.append(1)
 
