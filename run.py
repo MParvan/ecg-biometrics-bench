@@ -129,6 +129,39 @@ def _log_experiment_results(task_name, metrics_dict, data_stats, hyperparams, lo
     print(f"\n[INFO] Experiment settings and results successfully saved to: {log_file}")
 
 # =============================================================================
+# EVALUATION CONFIGURATION VALIDATION
+# =============================================================================
+def _validate_deployment_evaluation(
+    use_deployment_evaluation,
+    val_split,
+    task_name,
+):
+    """
+    Require an independent validation partition for threshold calibration.
+
+    Deployment evaluation estimates a decision threshold on validation data
+    and then freezes that threshold for final test evaluation. Calibrating on
+    training data would produce optimistically biased deployment results.
+    """
+    if not use_deployment_evaluation:
+        return
+
+    try:
+        validation_fraction = float(val_split)
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            f"{task_name}: val_split must be numeric when "
+            "deployment evaluation is enabled."
+        ) from error
+
+    if not 0.0 < validation_fraction < 1.0:
+        raise ValueError(
+            f"{task_name}: deployment evaluation requires "
+            "0 < val_split < 1. Training-data threshold calibration "
+            "is not permitted."
+        )
+
+# =============================================================================
 # TASK 1: CLOSED-SET IDENTIFICATION
 # =============================================================================
 def run_closed_set_identification(x, y, model_class, epochs=150, batch_size=256, 
@@ -528,6 +561,12 @@ def run_closed_set_verification(x, y, model_class, epochs=150, batch_size=256, l
                If n_runs > 1, returns tuples of (Mean, Std_Dev) for all four metrics.
     """
 
+    _validate_deployment_evaluation(
+        use_deployment_evaluation,
+        val_split,
+        "Closed-Set Verification",
+    )
+
     # ====================================================
     # 0. Capture Hyperparameters for Logger & MULTI-RUN AGGREGATOR
     # ====================================================
@@ -712,15 +751,9 @@ def run_closed_set_verification(x, y, model_class, epochs=150, batch_size=256, l
     # 8. MODEL CALIBRATION (Optional)
     # ====================================================
     if use_deployment_evaluation:
-        print("\n[INFO] --- REAL-WORLD DEPLOYMENT EVALUATION ---")
-        if val_split <= 0.0 or val_loader is None:
-            print("[WARN] No validation set provided (val_split=0.0). Falling back to the Training set.")
-            print("[WARN] NOTE: Using training data to find the threshold yields overly optimistic results. A separate validation set is strongly recommended!")
-            calib_loader = train_loader
-            calib_name = "Train (Fallback)"
-        else:
-            calib_loader = val_loader
-            calib_name = "Validation"
+        print("\n[INFO] --- DEPLOYMENT THRESHOLD CALIBRATION ---")
+        calib_loader = val_loader
+        calib_name = "Validation"
         
         print(f"[INFO] Extracting features for Calibration ({calib_name} Set)...")
         calib_emb, calib_lab = _get_embeddings(model, calib_loader, device)
@@ -1206,6 +1239,12 @@ def run_subject_disjoint_verification(x, y, model_class, epochs=150, batch_size=
                If n_runs > 1, returns tuples of (Mean, Std_Dev) for all four metrics.
     """
 
+    _validate_deployment_evaluation(
+        use_deployment_evaluation,
+        val_split,
+        "Subject-Disjoint Verification",
+    )
+
     # ====================================================
     # 0. Capture Hyperparameters for Logger & MULTI-RUN AGGREGATOR
     # ====================================================
@@ -1430,18 +1469,9 @@ def run_subject_disjoint_verification(x, y, model_class, epochs=150, batch_size=
     model.include_top = False
     
     if use_deployment_evaluation:
-        print("\n[INFO] --- REAL-WORLD DEPLOYMENT EVALUATION ---")
-        
-        # Check for val_loader_unseen
-        if val_split <= 0.0 or val_loader_unseen is None:
-            print("[WARN] No unseen validation subjects provided (val_split=0.0).")
-            print("[WARN] Falling back to Seen Validation / Training set for threshold.")
-            print("[WARN] NOTE: This yields overly optimistic thresholds. A proper val_split is recommended!")
-            calib_loader = val_loader_seen if val_loader_seen is not None else train_loader
-            calib_name = "Seen Val/Train (Fallback)"
-        else:
-            calib_loader = val_loader_unseen
-            calib_name = "Unseen Validation"
+        print("\n[INFO] --- DEPLOYMENT THRESHOLD CALIBRATION ---")
+        calib_loader = val_loader_unseen
+        calib_name = "Unseen Validation"
         
         print(f"[INFO] Extracting features for Calibration ({calib_name} Set)...")
         calib_emb, calib_lab = _get_embeddings(model, calib_loader, device)
@@ -1878,6 +1908,12 @@ def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class
         tuple: (EER, AUC, d-prime, TAR @ 0.1% FAR)
                If n_runs > 1, returns tuples of (Mean, Std_Dev) for all four metrics.
     """
+
+    _validate_deployment_evaluation(
+        use_deployment_evaluation,
+        val_split,
+        "Cross-Session Verification",
+    )
     
     # ====================================================
     # 0. Capture Hyperparameters for Logger & MULTI-RUN AGGREGATOR
@@ -2046,15 +2082,9 @@ def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class
     # 6. MODEL CALIBRATION (Optional)
     # ====================================================
     if use_deployment_evaluation:
-        print("\n[INFO] --- REAL-WORLD DEPLOYMENT EVALUATION ---")
-        if val_split <= 0.0 or val_loader is None:
-            print("[WARN] No validation set provided (val_split=0.0). Falling back to the Training set.")
-            print("[WARN] NOTE: Using training data to find the threshold yields overly optimistic results. A separate validation set is strongly recommended!")
-            calib_loader = train_loader
-            calib_name = "Train (Fallback)"
-        else:
-            calib_loader = val_loader
-            calib_name = "Validation"
+        print("\n[INFO] --- DEPLOYMENT THRESHOLD CALIBRATION ---")
+        calib_loader = val_loader
+        calib_name = "Validation"
         
         print(f"[INFO] Extracting features for Calibration (Session 1 {calib_name} Set)...")
         calib_emb, calib_lab = _get_embeddings(model, calib_loader, device)
@@ -2486,6 +2516,12 @@ def run_subject_disjoint_cross_session_verification(
         tuple: (EER, AUC, d-prime, TAR @ 0.1% FAR)
                If n_runs > 1, returns tuples of (Mean, Std_Dev) for all four metrics.
     """
+
+    _validate_deployment_evaluation(
+        use_deployment_evaluation,
+        val_split,
+        "Subject-Disjoint Cross-Session Verification",
+    )
     
     # ====================================================
     # 0. Capture Hyperparameters for Logger & MULTI-RUN AGGREGATOR
@@ -2671,16 +2707,9 @@ def run_subject_disjoint_cross_session_verification(
     model.include_top = False
     
     if use_deployment_evaluation:
-        print("\n[INFO] --- REAL-WORLD DEPLOYMENT EVALUATION ---")
-        if val_loader_s1 is None:
-            print("[WARN] No validation set provided (val_split=0.0). Global Threshold calculation requires Validation subjects.")
-            print("[WARN] Falling back to Seen Validation / Training set for threshold.")
-            print("[WARN] NOTE: This yields overly optimistic thresholds. A proper val_split is recommended!")
-            calib_loader = val_loader_seen if val_loader_seen is not None else train_loader
-            calib_name = "Seen Val/Train (Fallback)"
-        else:
-            calib_loader = val_loader_s1
-            calib_name = "Unseen Validation (Session 1)"
+        print("\n[INFO] --- DEPLOYMENT THRESHOLD CALIBRATION ---")
+        calib_loader = val_loader_s1
+        calib_name = "Unseen Validation (Session 1)"
             
         print(f"[INFO] Extracting features for Calibration ({calib_name})...")
         calib_emb_s1, calib_lab_s1 = _get_embeddings(model, calib_loader, device)
