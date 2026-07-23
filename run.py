@@ -132,7 +132,7 @@ def _log_experiment_results(task_name, metrics_dict, data_stats, hyperparams, lo
 # TASK 1: CLOSED-SET IDENTIFICATION
 # =============================================================================
 def run_closed_set_identification(x, y, model_class, epochs=150, batch_size=256, 
-                                  lr=1e-3, test_split=0.2, val_split=0.1, seed=42, 
+                                  lr=1e-3, test_split=0.2, val_split=0.0, seed=42, 
                                   device=None, visualize=False, use_template=False, 
                                   template_fusion_method='mean', template_size=None,
                                   matching_method='cosine', outlier_filtering_on_train=False,
@@ -807,7 +807,7 @@ def run_closed_set_verification(x, y, model_class, epochs=150, batch_size=256, l
 # TASK 3: SUBJECT-DISJOINT IDENTIFICATION (OPEN SET / TEMPLATE MATCHING)
 # =============================================================================
 def run_subject_disjoint_identification(x, y, model_class, epochs=150, batch_size=256, lr=1e-3, 
-                                        test_split=0.2, val_split=0.1, seed=42, device=None, 
+                                        test_split=0.2, val_split=0.0, seed=42, device=None, 
                                         visualize=False, use_template=True, 
                                         template_fusion_method='mean', template_size=1, 
                                         matching_method='cosine', outlier_filtering_on_train=False, 
@@ -1146,8 +1146,8 @@ def run_subject_disjoint_identification(x, y, model_class, epochs=150, batch_siz
 # TASK 4: SUBJECT-DISJOINT VERIFICATION
 # =============================================================================
 def run_subject_disjoint_verification(x, y, model_class, epochs=150, batch_size=256, lr=1e-3, 
-                                      test_split=0.2, val_split=0.1, num_pairs=10000, 
-                                      sampling_mode="balanced", seed=42, device=None, 
+                                      test_split=0.2, val_split=0.0, num_pairs=10000, 
+                                      sampling_mode="all", seed=42, device=None, 
                                       visualize=False, use_template=False, template_fusion_method='mean', 
                                       template_size=1, matching_method='cosine',
                                       outlier_filtering_on_train=False, outlier_filtering_on_test=False, 
@@ -1518,7 +1518,7 @@ def run_subject_disjoint_verification(x, y, model_class, epochs=150, batch_size=
 # TASK 5: CROSS-SESSION IDENTIFICATION
 # =============================================================================
 def run_cross_session_identification(x_train, y_train, x_test, y_test, model_class, epochs=150, 
-                                     batch_size=256, lr=1e-3, val_split=0.1, seed=42, device=None, 
+                                     batch_size=256, lr=1e-3, val_split=0.0, seed=42, device=None, 
                                      visualize=False, use_template=False, template_fusion_method='mean',
                                      template_size=None, matching_method='cosine',
                                      outlier_filtering_on_train=False, outlier_filtering_on_test=False, 
@@ -1804,8 +1804,8 @@ def run_cross_session_identification(x_train, y_train, x_test, y_test, model_cla
 # TASK 6: CROSS-SESSION VERIFICATION
 # =============================================================================
 def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class, epochs=150, 
-                                   batch_size=256, lr=1e-3, val_split=0.1, num_pairs=10000, 
-                                   sampling_mode="balanced", seed=42, device=None, visualize=False, 
+                                   batch_size=256, lr=1e-3, val_split=0.0, num_pairs=10000, 
+                                   sampling_mode="all", seed=42, device=None, visualize=False, 
                                    use_template=False, template_fusion_method='mean', template_size=None, 
                                    matching_method='cosine', outlier_filtering_on_train=False, 
                                    outlier_filtering_on_test=False, sqi_train=None, sqi_test=None, 
@@ -2109,7 +2109,7 @@ def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class
 # TASK 7: SUBJECT-DISJOINT CROSS-SESSION IDENTIFICATION
 # =============================================================================
 def run_subject_disjoint_cross_session_identification(
-        x_s1, y_s1, x_s2, y_s2, model_class, epochs=150, batch_size=256, lr=1e-3, test_split=0.2, val_split=0.1, 
+        x_s1, y_s1, x_s2, y_s2, model_class, epochs=150, batch_size=256, lr=1e-3, test_split=0.2, val_split=0.0, 
         seed=42, device=None, visualize=False, use_template=True, template_fusion_method='mean', template_size=None, 
         matching_method='cosine', outlier_filtering_on_train=False, outlier_filtering_on_test=False, sqi_s1=None, 
         sqi_s2=None, sqi_threshold=0.05, sqi_keep_pct=0.8, probe_fusion_size=3, save_results_and_settings=False, 
@@ -2399,8 +2399,8 @@ def run_subject_disjoint_cross_session_identification(
 # TASK 8: SUBJECT-DISJOINT CROSS-SESSION VERIFICATION
 # =============================================================================
 def run_subject_disjoint_cross_session_verification(
-        x_s1, y_s1, x_s2, y_s2, model_class, epochs=150, batch_size=256, lr=1e-3, test_split=0.2, val_split=0.1, 
-        num_pairs=10000, sampling_mode="balanced", seed=42, device=None, visualize=False, use_template=False, 
+        x_s1, y_s1, x_s2, y_s2, model_class, epochs=150, batch_size=256, lr=1e-3, test_split=0.2, val_split=0.0, 
+        num_pairs=10000, sampling_mode="all", seed=42, device=None, visualize=False, use_template=False, 
         template_fusion_method='mean', template_size=None, matching_method='cosine', outlier_filtering_on_train=False, 
         outlier_filtering_on_test=False, sqi_s1=None, sqi_s2=None, sqi_threshold=0.05, sqi_keep_pct=0.8,
         use_deployment_evaluation=False, save_results_and_settings=False, loader=None, n_runs=1, _return_stats=False,

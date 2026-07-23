@@ -155,7 +155,7 @@ def get_parser():
     train_group.add_argument('--batch_size', type=int, default=256, help="Batch size (default: 256).")
     train_group.add_argument('--lr', type=float, default=1e-3, help="Learning rate (default: 0.001).")
     train_group.add_argument('--test_split', type=float, default=0.2, help="Percentage for Test set (default: 0.2).")
-    train_group.add_argument('--val_split', type=float, default=0.1, help="Percentage for Validation set (default: 0.1).")
+    train_group.add_argument('--val_split', type=float, default=0.0, help="Percentage for Validation set (default: 0.0).")
     train_group.add_argument('--seed', type=int, default=42, help="Random seed for reproducibility.")
     train_group.add_argument('--n_runs', type=int, default=1, help="Number of independent runs using consecutive random seeds.")
 

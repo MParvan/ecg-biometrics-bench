@@ -108,6 +108,6 @@ training_defaults:
   batch_size: 64
   epochs: 30
   lr: 1e-3
-  val_split: 0.2
+  val_split: 0.0
   crossvalidation: false
   n_folds: 5
