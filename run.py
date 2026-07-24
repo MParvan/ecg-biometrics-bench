@@ -890,7 +890,6 @@ def run_closed_set_identification(x, y, model_class, epochs=150, batch_size=256,
         if cached_model:
             print(f"\n[INFO] Loaded pre-trained weights (Hash: {uid}). Skipping training!")
             model = cached_model
-            model.actual_epochs = epochs
         else:
             print(f"\n[INFO] Training new model (Hash: {uid})...")
             optimizer = torch.optim.Adam(model.parameters(), lr=lr); criterion = nn.CrossEntropyLoss()
@@ -1241,7 +1240,6 @@ def run_closed_set_verification(x, y, model_class, epochs=150, batch_size=256, l
         if cached_model:
             print(f"\n[INFO] Loaded pre-trained weights (Hash: {uid}). Skipping training!")
             model = cached_model
-            model.actual_epochs = epochs
         else:
             print(f"\n[INFO] Training new model (Hash: {uid})...")
             optimizer = torch.optim.Adam(model.parameters(), lr=lr); criterion = nn.CrossEntropyLoss()
@@ -1639,7 +1637,6 @@ def run_subject_disjoint_identification(x, y, model_class, epochs=150, batch_siz
         if cached_model:
             print(f"\n[INFO] Loaded pre-trained weights (Hash: {uid}). Skipping training!")
             model = cached_model
-            model.actual_epochs = epochs
         else:
             print(f"\n[INFO] Training new Subject-Disjoint model (Hash: {uid})...")
             optimizer = torch.optim.Adam(model.parameters(), lr=lr); criterion = nn.CrossEntropyLoss()
@@ -2028,7 +2025,6 @@ def run_subject_disjoint_verification(x, y, model_class, epochs=150, batch_size=
         if cached_model:
             print(f"\n[INFO] Loaded pre-trained weights (Hash: {uid}). Skipping training!")
             model = cached_model
-            model.actual_epochs = epochs
         else:
             print(f"\n[INFO] Training new Subject-Disjoint model (Hash: {uid})...")
             optimizer = torch.optim.Adam(model.parameters(), lr=lr); criterion = nn.CrossEntropyLoss()
@@ -2404,7 +2400,6 @@ def run_cross_session_identification(x_train, y_train, x_test, y_test, model_cla
         if cached_model:
             print(f"\n[INFO] Loaded pre-trained weights (Hash: {uid}). Skipping training!")
             model = cached_model
-            model.actual_epochs = epochs
         else:
             print(f"\n[INFO] Training new Cross-Session model (Hash: {uid})...")
             optimizer = torch.optim.Adam(model.parameters(), lr=lr); criterion = nn.CrossEntropyLoss()
@@ -2737,7 +2732,6 @@ def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class
         if cached_model:
             print(f"\n[INFO] Loaded pre-trained weights (Hash: {uid}). Skipping training!")
             model = cached_model
-            model.actual_epochs = epochs
         else:
             print(f"\n[INFO] Training new Cross-Session model (Hash: {uid})...")
             optimizer = torch.optim.Adam(model.parameters(), lr=lr); criterion = nn.CrossEntropyLoss()
@@ -3090,7 +3084,6 @@ def run_subject_disjoint_cross_session_identification(
         if cached_model:
             print(f"\n[INFO] Loaded pre-trained weights (Hash: {uid}). Skipping training!")
             model = cached_model
-            model.actual_epochs = epochs
         else:
             print(f"\n[INFO] Training new Subject-Disjoint Cross-Session model (Hash: {uid})...")
             optimizer = torch.optim.Adam(model.parameters(), lr=lr); criterion = nn.CrossEntropyLoss()
@@ -3421,7 +3414,6 @@ def run_subject_disjoint_cross_session_verification(
         if cached_model:
             print(f"\n[INFO] Loaded pre-trained weights (Hash: {uid}). Skipping training!")
             model = cached_model
-            model.actual_epochs = epochs
         else:
             print(f"\n[INFO] Training new Subject-Disjoint Cross-Session model (Hash: {uid})...")
             optimizer = torch.optim.Adam(model.parameters(), lr=lr); criterion = nn.CrossEntropyLoss()

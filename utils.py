@@ -1012,16 +1012,142 @@ class CacheManager:
         with open(os.path.join(self.data_dir, f"{uid}.json"), "w") as f:
             json.dump(config_dict, f, indent=4, default=str)
 
-    def get_weight_cache(self, config_dict, model, device):
-        uid = _generate_config_hash(config_dict)
-        weight_path = os.path.join(self.weight_dir, f"{uid}.pth")
-        if os.path.exists(weight_path):
-            model.load_state_dict(torch.load(weight_path, map_location=device))
-            return model, uid
-        return None, uid
+    def get_weight_cache(
+        self,
+        config_dict,
+        model,
+        device,
+    ):
+        """
+        Load cached model weights and their training metadata.
 
-    def save_weight_cache(self, model, config_dict, uid):
-        torch.save(model.state_dict(), os.path.join(self.weight_dir, f"{uid}.pth"))
-        with open(os.path.join(self.weight_dir, f"{uid}.json"), "w") as f:
-            json.dump(config_dict, f, indent=4, default=str)
+        Older cache entries without ``actual_epochs`` remain supported by
+        falling back to the configured maximum epoch count.
+        """
+        uid = _generate_config_hash(config_dict)
+
+        weight_path = os.path.join(
+            self.weight_dir,
+            f"{uid}.pth",
+        )
+
+        metadata_path = os.path.join(
+            self.weight_dir,
+            f"{uid}.json",
+        )
+
+        if not os.path.exists(weight_path):
+            return None, uid
+
+        model.load_state_dict(
+            torch.load(
+                weight_path,
+                map_location=device,
+            )
+        )
+
+        actual_epochs = config_dict.get(
+            "epochs"
+        )
+
+        if os.path.exists(metadata_path):
+            try:
+                with open(
+                    metadata_path,
+                    "r",
+                    encoding="utf-8",
+                ) as metadata_file:
+                    cache_metadata = json.load(
+                        metadata_file
+                    )
+
+                actual_epochs = cache_metadata.get(
+                    "actual_epochs",
+                    actual_epochs,
+                )
+
+            except (
+                OSError,
+                json.JSONDecodeError,
+                TypeError,
+                ValueError,
+            ) as error:
+                print(
+                    "[WARN] Could not read weight-cache "
+                    f"metadata for hash {uid}: {error}. "
+                    "Using the configured epoch count."
+                )
+
+        if actual_epochs is not None:
+            try:
+                model.actual_epochs = int(
+                    actual_epochs
+                )
+            except (TypeError, ValueError):
+                model.actual_epochs = config_dict.get(
+                    "epochs"
+                )
+
+        return model, uid
+
+    def save_weight_cache(
+        self,
+        model,
+        config_dict,
+        uid,
+    ):
+        """
+        Save model weights and training metadata.
+
+        The input configuration is copied so adding metadata does not modify
+        the dictionary used to generate the cache identity.
+        """
+        weight_path = os.path.join(
+            self.weight_dir,
+            f"{uid}.pth",
+        )
+
+        metadata_path = os.path.join(
+            self.weight_dir,
+            f"{uid}.json",
+        )
+
+        torch.save(
+            model.state_dict(),
+            weight_path,
+        )
+
+        cache_metadata = dict(
+            config_dict
+        )
+
+        actual_epochs = getattr(
+            model,
+            "actual_epochs",
+            config_dict.get("epochs"),
+        )
+
+        if actual_epochs is not None:
+            try:
+                actual_epochs = int(
+                    actual_epochs
+                )
+            except (TypeError, ValueError):
+                pass
+
+            cache_metadata[
+                "actual_epochs"
+            ] = actual_epochs
+
+        with open(
+            metadata_path,
+            "w",
+            encoding="utf-8",
+        ) as metadata_file:
+            json.dump(
+                cache_metadata,
+                metadata_file,
+                indent=4,
+                default=str,
+            )
 
