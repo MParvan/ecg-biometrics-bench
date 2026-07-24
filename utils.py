@@ -549,6 +549,72 @@ def _get_embeddings(model, loader, device):
             labels.append(yb.numpy())
     return np.vstack(embeddings), np.concatenate(labels)
 
+def _summarize_verification_pairs(
+    labels_pair,
+    target_far=0.001,
+):
+    """
+    Summarize the comparison counts supporting verification metrics.
+
+    The minimum nonzero empirical FAR is one false acceptance divided by
+    the number of impostor comparisons. A target FAR is empirically
+    resolvable when this minimum step is no larger than the target.
+    """
+    labels_pair = np.asarray(labels_pair)
+
+    if labels_pair.ndim != 1:
+        raise ValueError(
+            "labels_pair must be a one-dimensional array."
+        )
+
+    if len(labels_pair) == 0:
+        raise ValueError(
+            "labels_pair cannot be empty."
+        )
+
+    unique_labels = set(np.unique(labels_pair).tolist())
+
+    if not unique_labels.issubset({0, 1, False, True}):
+        raise ValueError(
+            "labels_pair must contain only binary labels 0 and 1."
+        )
+
+    try:
+        target_far = float(target_far)
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            "target_far must be numeric."
+        ) from error
+
+    if not 0.0 < target_far < 1.0:
+        raise ValueError(
+            "target_far must satisfy 0 < target_far < 1."
+        )
+
+    genuine_count = int(np.sum(labels_pair == 1))
+    impostor_count = int(np.sum(labels_pair == 0))
+    total_count = int(len(labels_pair))
+
+    minimum_nonzero_far = (
+        1.0 / impostor_count
+        if impostor_count > 0
+        else None
+    )
+
+    target_resolvable = (
+        minimum_nonzero_far is not None
+        and minimum_nonzero_far <= target_far
+    )
+
+    return {
+        "Total Verification Pairs": total_count,
+        "Genuine Pairs": genuine_count,
+        "Impostor Pairs": impostor_count,
+        "Target FAR": target_far,
+        "Minimum Non-Zero Empirical FAR": minimum_nonzero_far,
+        "Target FAR Empirically Resolvable": target_resolvable,
+    }
+
 # =============================================================================
 # 3. METRIC CALCULATION HELPERS
 # =============================================================================

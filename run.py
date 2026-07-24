@@ -37,7 +37,7 @@ from utils import (
     _apply_score_fusion, _make_loader, _encode_labels, _get_device, _set_seed,
     _apply_outlier_filter, _compute_sqi, _compute_score_matrix,
     _get_embeddings, _create_templates, _generate_pairs,
-    _find_optimal_threshold, _evaluate_with_global_threshold,
+    _find_optimal_threshold, _evaluate_with_global_threshold, _summarize_verification_pairs,
     _compute_metrics_identification, _compute_metrics_verification,
     _run_training_loop, _run_train_loop_unseen_subjects, _train_epoch, _detect_channels
 )
@@ -272,6 +272,41 @@ def _build_weight_cache_config(loader, training_config):
     }
 
     return complete_config
+
+def _get_verification_pair_statistics(
+    labels_pair,
+    target_far=0.001,
+):
+    """
+    Build pair-count statistics and warn when the requested FAR is below
+    the empirical resolution of the available impostor comparisons.
+    """
+    pair_statistics = _summarize_verification_pairs(
+        labels_pair,
+        target_far=target_far,
+    )
+
+    if not pair_statistics[
+        "Target FAR Empirically Resolvable"
+    ]:
+        impostor_count = pair_statistics["Impostor Pairs"]
+        minimum_far = pair_statistics[
+            "Minimum Non-Zero Empirical FAR"
+        ]
+
+        if minimum_far is None:
+            print(
+                "[WARN] Verification evaluation contains no "
+                "impostor comparisons."
+            )
+        else:
+            print(
+                "[WARN] TAR@0.1%FAR is below the empirical FAR "
+                f"resolution supported by {impostor_count} impostor "
+                f"comparisons. Minimum non-zero FAR={minimum_far:.6f}."
+            )
+
+    return pair_statistics
 
 # =============================================================================
 # TASK 1: CLOSED-SET IDENTIFICATION
@@ -955,10 +990,20 @@ def run_closed_set_verification(x, y, model_class, epochs=150, batch_size=256, l
     data_stats = {
         "Total Subjects": len(classes),
         "Train Samples": len(X_tr),
-        "Validation Samples": len(X_val) if X_val is not None else 0,
+        "Validation Samples": (
+            len(X_val)
+            if X_val is not None
+            else 0
+        ),
         "Test (Probe) Samples": len(X_test),
-        "Verification Pairs Generated": len(labels_pair),
     }
+
+    data_stats.update(
+        _get_verification_pair_statistics(
+            labels_pair,
+            target_far=0.001,
+        )
+    )
 
     if _return_stats:
         return (
@@ -1726,8 +1771,14 @@ def run_subject_disjoint_verification(x, y, model_class, epochs=150, batch_size=
         "Train Subjects": len(train_subs),
         "Train Samples": len(X_train),
         "Test Subjects": len(test_subs_final),
-        "Test Pairs Evaluated": len(labels_pair),
     }
+
+    data_stats.update(
+        _get_verification_pair_statistics(
+            labels_pair,
+            target_far=0.001,
+        )
+    )
 
     if _return_stats:
         return (
@@ -2367,8 +2418,14 @@ def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class
         "Total Cross-Session Subjects": len(classes),
         "Enrollment (S1) Samples": len(x_train_full),
         "Probe (S2) Samples": len(x_test_filtered),
-        "Pairs Evaluated": len(labels_pair),
     }
+
+    data_stats.update(
+        _get_verification_pair_statistics(
+            labels_pair,
+            target_far=0.001,
+        )
+    )
 
     if _return_stats:
         return (
@@ -3030,8 +3087,14 @@ def run_subject_disjoint_cross_session_verification(
         "Train (S1) Samples": len(X_train),
         "Enrollment (S1) Samples": len(X_enroll),
         "Probe (S2) Samples": len(X_probe),
-        "Test Pairs Evaluated": len(labels_pair),
     }
+
+    data_stats.update(
+        _get_verification_pair_statistics(
+            labels_pair,
+            target_far=0.001,
+        )
+    )
 
     if _return_stats:
         return (
