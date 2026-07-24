@@ -30,6 +30,8 @@ from typing import Dict, Any, Optional, Tuple, List, Union
 
 import time
 
+import shlex
+import subprocess
 import platform
 import sys
 from importlib import metadata
@@ -223,6 +225,74 @@ def _summarize_model_complexity(model):
     }
 
 # =============================================================================
+# SOURCE REVISION METADATA
+# =============================================================================
+
+def _run_git_command(*arguments):
+    """
+    Run a read-only Git command from the repository root.
+
+    ``None`` is returned when Git is unavailable, the directory is not a
+    repository, or the command cannot complete successfully.
+    """
+    repository_root = Path(__file__).resolve().parent
+
+    try:
+        result = subprocess.run(
+            ["git", *arguments],
+            cwd=repository_root,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+    if result.returncode != 0:
+        return None
+
+    return result.stdout.strip()
+
+
+def _collect_source_revision():
+    """
+    Collect the source-code revision and process invocation.
+
+    The dirty-state field is important because a commit hash alone cannot
+    reproduce an experiment when local uncommitted modifications were used.
+    """
+    commit = _run_git_command(
+        "rev-parse",
+        "HEAD",
+    )
+
+    branch = _run_git_command(
+        "rev-parse",
+        "--abbrev-ref",
+        "HEAD",
+    )
+
+    working_tree_status = _run_git_command(
+        "status",
+        "--porcelain",
+    )
+
+    if working_tree_status is None:
+        working_tree_dirty = "unavailable"
+    else:
+        working_tree_dirty = bool(
+            working_tree_status
+        )
+
+    return {
+        "Git Commit": commit or "unavailable",
+        "Git Branch": branch or "unavailable",
+        "Git Working Tree Dirty": working_tree_dirty,
+        "Python Invocation": shlex.join(sys.argv),
+    }
+
+# =============================================================================
 # AUTOMATED EXPERIMENT LOGGER
 # =============================================================================
 def _log_experiment_results(task_name, metrics_dict, data_stats, hyperparams, loader=None):
@@ -266,7 +336,7 @@ def _log_experiment_results(task_name, metrics_dict, data_stats, hyperparams, lo
     log_file = results_dir / f"{safe_task_name}.txt"
 
     software_environment = _collect_software_environment()
-
+    source_revision = _collect_source_revision()
     runtime_profile = _collect_runtime_profile()
     
     # 6. Format and Append
@@ -298,6 +368,12 @@ def _log_experiment_results(task_name, metrics_dict, data_stats, hyperparams, lo
         for key, value in software_environment.items():
             f.write(f"  {key:<28}: {value}\n")
 
+        f.write(f"{'-' * 70}\n")
+        f.write("[SOURCE REVISION]\n")
+
+        for key, value in source_revision.items():
+            f.write(f"  {key:<28}: {value}\n")
+            
         if runtime_profile:
             f.write(f"{'-'*70}\n")
             f.write("[COMPUTATIONAL PROFILE]\n")
@@ -3198,7 +3274,7 @@ def run_subject_disjoint_cross_session_verification(
     hyperparams.update(
         _summarize_model_complexity(model)
     )
-        
+
     if intelligent_weight_loading:
         from utils import CacheManager
         cache = CacheManager()
