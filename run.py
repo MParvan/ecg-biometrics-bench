@@ -373,7 +373,7 @@ def _log_experiment_results(task_name, metrics_dict, data_stats, hyperparams, lo
 
         for key, value in source_revision.items():
             f.write(f"  {key:<28}: {value}\n")
-            
+
         if runtime_profile:
             f.write(f"{'-'*70}\n")
             f.write("[COMPUTATIONAL PROFILE]\n")
@@ -580,6 +580,45 @@ def _get_verification_pair_statistics(
     return pair_statistics
 
 # =============================================================================
+# RANDOM-SEED METADATA
+# =============================================================================
+
+def _add_seed_metadata(
+    hyperparams,
+    base_seed,
+    n_runs,
+):
+    """
+    Add the complete random-seed schedule to experiment metadata.
+
+    Multi-run experiments use consecutive seeds beginning at ``base_seed``.
+    A copied dictionary is returned so the caller's original metadata is not
+    modified unexpectedly.
+    """
+    base_seed = int(base_seed)
+    n_runs = int(n_runs)
+
+    if n_runs < 1:
+        raise ValueError(
+            "n_runs must be greater than or equal to 1."
+        )
+
+    updated_hyperparams = dict(hyperparams)
+
+    updated_hyperparams.update(
+        {
+            "base_seed": base_seed,
+            "n_runs": n_runs,
+            "run_seeds": [
+                base_seed + run_index
+                for run_index in range(n_runs)
+            ],
+        }
+    )
+
+    return updated_hyperparams
+
+# =============================================================================
 # TASK 1: CLOSED-SET IDENTIFICATION
 # =============================================================================
 def run_closed_set_identification(x, y, model_class, epochs=150, batch_size=256, 
@@ -646,6 +685,12 @@ def run_closed_set_identification(x, y, model_class, epochs=150, batch_size=256,
         'outlier_filter_train': outlier_filtering_on_train, 'outlier_filter_test': outlier_filtering_on_test
     }
 
+    hyperparams = _add_seed_metadata(
+        hyperparams,
+        base_seed=seed,
+        n_runs=n_runs,
+    )
+
     # 2. MULTI-RUN AGGREGATOR (Handles statistical validation)
     if n_runs > 1:
         # Capture current arguments to repeat the experiment
@@ -677,6 +722,12 @@ def run_closed_set_identification(x, y, model_class, epochs=150, batch_size=256,
             # Preserve metadata from the last successful run for the final log file
             data_stats = d_stats  
             hyperparams = h_params 
+
+        hyperparams = _add_seed_metadata(
+            hyperparams,
+            base_seed=base_seed,
+            n_runs=n_runs,
+        )
                 
         # Aggregate metrics across all runs
         r1_vals = [r[0] for r in results]
@@ -688,8 +739,6 @@ def run_closed_set_identification(x, y, model_class, epochs=150, batch_size=256,
         print(f"Rank-1 Acc: {r1_mean:.4f} ± {r1_std:.4f} | Rank-5 Acc: {r5_mean:.4f} ± {r5_std:.4f}")
         
         if save_results_and_settings:
-            # Update log metadata with run count and formatted mean/std strings
-            hyperparams['n_runs'] = n_runs
             metrics_dict = {
                 "Rank-1 Accuracy": f"{r1_mean:.4f} ± {r1_std:.4f}", 
                 "Rank-5 Accuracy": f"{r5_mean:.4f} ± {r5_std:.4f}"
@@ -1020,6 +1069,12 @@ def run_closed_set_verification(x, y, model_class, epochs=150, batch_size=256, l
         'use_deployment_eval': use_deployment_evaluation
     }
 
+    hyperparams = _add_seed_metadata(
+        hyperparams,
+        base_seed=seed,
+        n_runs=n_runs,
+    )
+
     # --- MULTI-RUN AGGREGATOR ---
     if n_runs > 1:
         call_args = _prepare_multi_run_arguments(locals())
@@ -1038,12 +1093,17 @@ def run_closed_set_verification(x, y, model_class, epochs=150, batch_size=256, l
             results.append(res)
             data_stats = d_stats
             hyperparams = h_params
+
+        hyperparams = _add_seed_metadata(
+            hyperparams,
+            base_seed=base_seed,
+            n_runs=n_runs,
+        )
                 
         metrics_t = list(zip(*results))
         means, stds = [np.mean(m) for m in metrics_t], [np.std(m) for m in metrics_t]
         
         if save_results_and_settings:
-            hyperparams['n_runs'] = n_runs
             metrics_dict = {
                 "EER": f"{means[0]:.4f} ± {stds[0]:.4f}", "AUC": f"{means[1]:.4f} ± {stds[1]:.4f}", 
                 "d-prime": f"{means[2]:.4f} ± {stds[2]:.4f}", "TAR@0.1%FAR": f"{means[3]:.4f} ± {stds[3]:.4f}"
@@ -1388,6 +1448,12 @@ def run_subject_disjoint_identification(x, y, model_class, epochs=150, batch_siz
         'outlier_filter_train': outlier_filtering_on_train, 'outlier_filter_test': outlier_filtering_on_test
     }
 
+    hyperparams = _add_seed_metadata(
+        hyperparams,
+        base_seed=seed,
+        n_runs=n_runs,
+    )
+
     if n_runs > 1:
         call_args = _prepare_multi_run_arguments(locals())
         for k in ['data_stats', 'hyperparams', 'call_args', 'intelligent_weight_loading']: call_args.pop(k, None)
@@ -1402,12 +1468,17 @@ def run_subject_disjoint_identification(x, y, model_class, epochs=150, batch_siz
             print(f"\n{'='*40}\n RUN {i+1}/{n_runs} (Seed: {call_args['seed']})\n{'='*40}")
             res, d_stats, h_params = run_subject_disjoint_identification(**call_args) 
             results.append(res); data_stats = d_stats; hyperparams = h_params
+
+        hyperparams = _add_seed_metadata(
+            hyperparams,
+            base_seed=base_seed,
+            n_runs=n_runs,
+        )
                 
         r1_mean, r1_std = np.mean([r[0] for r in results]), np.std([r[0] for r in results])
         r5_mean, r5_std = np.mean([r[1] for r in results]), np.std([r[1] for r in results])
         
         if save_results_and_settings:
-            hyperparams['n_runs'] = n_runs
             metrics_dict = {"Rank-1 Accuracy": f"{r1_mean:.4f} ± {r1_std:.4f}", "Rank-5 Accuracy": f"{r5_mean:.4f} ± {r5_std:.4f}"}
             _log_experiment_results("Subject-Disjoint Identification", metrics_dict, data_stats, hyperparams, loader)
         return (r1_mean, r1_std), (r5_mean, r5_std)
@@ -1760,6 +1831,12 @@ def run_subject_disjoint_verification(x, y, model_class, epochs=150, batch_size=
         'outlier_filter_train': outlier_filtering_on_train, 'outlier_filter_test': outlier_filtering_on_test
     }
 
+    hyperparams = _add_seed_metadata(
+        hyperparams,
+        base_seed=seed,
+        n_runs=n_runs,
+    )
+
     if n_runs > 1:
         call_args = _prepare_multi_run_arguments(locals())
         for k in ['data_stats', 'hyperparams', 'call_args', 'intelligent_weight_loading']: call_args.pop(k, None)
@@ -1774,12 +1851,17 @@ def run_subject_disjoint_verification(x, y, model_class, epochs=150, batch_size=
             print(f"\n{'='*40}\n RUN {i+1}/{n_runs} (Seed: {call_args['seed']})\n{'='*40}")
             res, d_stats, h_params = run_subject_disjoint_verification(**call_args) 
             results.append(res); data_stats = d_stats; hyperparams = h_params
+
+        hyperparams = _add_seed_metadata(
+            hyperparams,
+            base_seed=base_seed,
+            n_runs=n_runs,
+        )
                 
         metrics_t = list(zip(*results))
         means, stds = [np.mean(m) for m in metrics_t], [np.std(m) for m in metrics_t]
         
         if save_results_and_settings:
-            hyperparams['n_runs'] = n_runs
             metrics_dict = {
                 "EER": f"{means[0]:.4f} ± {stds[0]:.4f}", "AUC": f"{means[1]:.4f} ± {stds[1]:.4f}", 
                 "d-prime": f"{means[2]:.4f} ± {stds[2]:.4f}", "TAR@0.1%FAR": f"{means[3]:.4f} ± {stds[3]:.4f}"
@@ -2162,6 +2244,12 @@ def run_cross_session_identification(x_train, y_train, x_test, y_test, model_cla
         'outlier_filter_train': outlier_filtering_on_train, 'outlier_filter_test': outlier_filtering_on_test
     }
 
+    hyperparams = _add_seed_metadata(
+        hyperparams,
+        base_seed=seed,
+        n_runs=n_runs,
+    )
+
     if n_runs > 1:
         call_args = _prepare_multi_run_arguments(locals())
         for k in ['data_stats', 'hyperparams', 'call_args', 'intelligent_weight_loading']: call_args.pop(k, None)
@@ -2176,12 +2264,17 @@ def run_cross_session_identification(x_train, y_train, x_test, y_test, model_cla
             print(f"\n{'='*40}\n RUN {i+1}/{n_runs} (Seed: {call_args['seed']})\n{'='*40}")
             res, d_stats, h_params = run_cross_session_identification(**call_args) 
             results.append(res); data_stats = d_stats; hyperparams = h_params
+
+        hyperparams = _add_seed_metadata(
+            hyperparams,
+            base_seed=base_seed,
+            n_runs=n_runs,
+        )
                 
         r1_mean, r1_std = np.mean([r[0] for r in results]), np.std([r[0] for r in results])
         r5_mean, r5_std = np.mean([r[1] for r in results]), np.std([r[1] for r in results])
         
         if save_results_and_settings:
-            hyperparams['n_runs'] = n_runs
             metrics_dict = {"Rank-1 Accuracy": f"{r1_mean:.4f} ± {r1_std:.4f}", "Rank-5 Accuracy": f"{r5_mean:.4f} ± {r5_std:.4f}"}
             _log_experiment_results("Cross-Session Identification", metrics_dict, data_stats, hyperparams, loader)
         return (r1_mean, r1_std), (r5_mean, r5_std)
@@ -2484,6 +2577,12 @@ def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class
         'outlier_filter_train': outlier_filtering_on_train, 'outlier_filter_test': outlier_filtering_on_test
     }
 
+    hyperparams = _add_seed_metadata(
+        hyperparams,
+        base_seed=seed,
+        n_runs=n_runs,
+    )
+
     if n_runs > 1:
         call_args = _prepare_multi_run_arguments(locals())
         for k in ['data_stats', 'hyperparams', 'call_args', 'intelligent_weight_loading']: call_args.pop(k, None)
@@ -2498,12 +2597,17 @@ def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class
             print(f"\n{'='*40}\n RUN {i+1}/{n_runs} (Seed: {call_args['seed']})\n{'='*40}")
             res, d_stats, h_params = run_cross_session_verification(**call_args) 
             results.append(res); data_stats = d_stats; hyperparams = h_params
+
+        hyperparams = _add_seed_metadata(
+            hyperparams,
+            base_seed=base_seed,
+            n_runs=n_runs,
+        )
                 
         metrics_t = list(zip(*results))
         means, stds = [np.mean(m) for m in metrics_t], [np.std(m) for m in metrics_t]
         
         if save_results_and_settings:
-            hyperparams['n_runs'] = n_runs
             metrics_dict = {
                 "EER": f"{means[0]:.4f} ± {stds[0]:.4f}", "AUC": f"{means[1]:.4f} ± {stds[1]:.4f}", 
                 "d-prime": f"{means[2]:.4f} ± {stds[2]:.4f}", "TAR@0.1%FAR": f"{means[3]:.4f} ± {stds[3]:.4f}"
@@ -2818,6 +2922,12 @@ def run_subject_disjoint_cross_session_identification(
         'outlier_filter_train': outlier_filtering_on_train, 'outlier_filter_test': outlier_filtering_on_test
     }
 
+    hyperparams = _add_seed_metadata(
+        hyperparams,
+        base_seed=seed,
+        n_runs=n_runs,
+    )
+
     if n_runs > 1:
         call_args = _prepare_multi_run_arguments(locals())
         for k in ['data_stats', 'hyperparams', 'call_args', 'intelligent_weight_loading']: call_args.pop(k, None)
@@ -2832,12 +2942,17 @@ def run_subject_disjoint_cross_session_identification(
             print(f"\n{'='*40}\n RUN {i+1}/{n_runs} (Seed: {call_args['seed']})\n{'='*40}")
             res, d_stats, h_params = run_subject_disjoint_cross_session_identification(**call_args) 
             results.append(res); data_stats = d_stats; hyperparams = h_params
+
+        hyperparams = _add_seed_metadata(
+            hyperparams,
+            base_seed=base_seed,
+            n_runs=n_runs,
+        )
                 
         r1_mean, r1_std = np.mean([r[0] for r in results]), np.std([r[0] for r in results])
         r5_mean, r5_std = np.mean([r[1] for r in results]), np.std([r[1] for r in results])
         
         if save_results_and_settings:
-            hyperparams['n_runs'] = n_runs
             metrics_dict = {"Rank-1 Accuracy": f"{r1_mean:.4f} ± {r1_std:.4f}", "Rank-5 Accuracy": f"{r5_mean:.4f} ± {r5_std:.4f}"}
             _log_experiment_results("Subject-Disjoint Cross-Session ID", metrics_dict, data_stats, hyperparams, loader)
         return (r1_mean, r1_std), (r5_mean, r5_std)
@@ -3147,6 +3262,12 @@ def run_subject_disjoint_cross_session_verification(
         'outlier_filter_test': outlier_filtering_on_test
     }
 
+    hyperparams = _add_seed_metadata(
+        hyperparams,
+        base_seed=seed,
+        n_runs=n_runs,
+    )
+
     if n_runs > 1:
         call_args = _prepare_multi_run_arguments(locals())
         for k in ['data_stats', 'hyperparams', 'call_args', 'intelligent_weight_loading']: call_args.pop(k, None)
@@ -3161,12 +3282,17 @@ def run_subject_disjoint_cross_session_verification(
             print(f"\n{'='*40}\n RUN {i+1}/{n_runs} (Seed: {call_args['seed']})\n{'='*40}")
             res, d_stats, h_params = run_subject_disjoint_cross_session_verification(**call_args) 
             results.append(res); data_stats = d_stats; hyperparams = h_params
+
+        hyperparams = _add_seed_metadata(
+            hyperparams,
+            base_seed=base_seed,
+            n_runs=n_runs,
+        )
                 
         metrics_t = list(zip(*results))
         means, stds = [np.mean(m) for m in metrics_t], [np.std(m) for m in metrics_t]
         
         if save_results_and_settings:
-            hyperparams['n_runs'] = n_runs
             metrics_dict = {
                 "EER": f"{means[0]:.4f} ± {stds[0]:.4f}", "AUC": f"{means[1]:.4f} ± {stds[1]:.4f}", 
                 "d-prime": f"{means[2]:.4f} ± {stds[2]:.4f}", "TAR@0.1%FAR": f"{means[3]:.4f} ± {stds[3]:.4f}"
