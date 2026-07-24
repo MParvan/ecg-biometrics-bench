@@ -455,8 +455,8 @@ def _run_training_loop(model, train_loader, val_loader, optimizer, criterion, de
 def _run_train_loop_unseen_subjects(model, train_loader, val_loader_seen, val_loader_unseen, optimizer, criterion, device, 
                                     epochs, matching_method='cosine', patience=40, lr_patience=15):
     """
-    Advanced Training Loop for Open-Set Tasks using a Composite Metric.
-    Score = (Normalized Seen Val Loss) + (Unseen Val EER)
+    Advanced Training Loop for Subject-Disjoint Tasks using a Composite Metric.
+    Score = (Normalized Seen Val Loss) + (Subject-Disjoint Validation EER)
     """
     best_combined_score = float('inf')
     patience_counter = 0

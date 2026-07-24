@@ -22,11 +22,18 @@ These practices introduce **data leakage** and artificially inflate performance.
 
 ## 💡 Key Insight
 
-This work demonstrates what we call the:
+### Performance Inflation Under Random Intra-Session Splitting
 
-### ❗ Random Split Fallacy
+Randomly dividing temporally adjacent ECG samples from the same recording
+session between training and testing can produce optimistic performance
+estimates. The model may exploit session-specific or near-neighbor
+similarities that are unlikely to remain stable across time or unseen
+subjects.
 
-> High performance in ECG biometrics is often a byproduct of flawed evaluation protocols—not true identity recognition.
+In this project, **Random Split Fallacy** is used as shorthand for this
+specific form of performance inflation. The term does not imply that every
+random split is invalid. Its suitability depends on the intended experimental
+claim and whether temporal or subject-level generalization is being assessed.
 
 Across multiple datasets and models, we show:
 
@@ -63,8 +70,8 @@ The framework enables **fair comparison across models, datasets, and evaluation 
   - Easily extensible for new methods
 
 - 📊 **Rigorous Evaluation Protocols**
-  - Closed-set vs Open-set (subject-disjoint)
-  - Intra-session vs Cross-session
+  - Known-subject and subject-disjoint evaluation
+  - Intra-session and cross-session evaluation
   - Long-term temporal evaluation
 
 - 🧪 **Reproducible Experiments**
@@ -74,6 +81,28 @@ The framework enables **fair comparison across models, datasets, and evaluation 
 - 📉 **Realistic Benchmarking**
   - Explicitly avoids data leakage
   - Highlights performance degradation under real conditions
+
+---
+
+## Evaluation Terminology
+
+In this repository, **subject-disjoint evaluation** means that the identities
+used for biometric evaluation are excluded from the identities used to train
+the feature extractor.
+
+This setting evaluates generalization to previously unseen subjects, but it
+should not be confused with a complete open-set identification system.
+Open-set identification additionally requires the system to detect or reject
+a probe that does not correspond to any enrolled identity.
+
+Accordingly:
+
+- Tasks 1, 2, 5, and 6 evaluate subjects represented during model training.
+- Tasks 3, 4, 7, and 8 evaluate subjects excluded from model training.
+- Identification remains a 1:N search among the identities enrolled in the
+  evaluation gallery.
+- Verification evaluates genuine and impostor comparisons for the relevant
+  evaluation cohort.
 
 ---
 
@@ -136,8 +165,9 @@ python main.py \
   --save_results
 ```
 
-Experiment 2: Open-Set Verification with Template Matching (Task 4)
-Train on Subject Group A, then test 1:1 verification on entirely unseen Subject Group B from the PTB dataset. We will use the first 5 beats to form an enrollment template.
+Experiment 2: Subject-Disjoint Verification with Template Matching (Task 4)
+Train the feature extractor on Subject Group A, then evaluate 1:1 verification
+on entirely unseen Subject Group B from the PTB dataset.
 ```bash
 python main.py \
   --dataset ptb \

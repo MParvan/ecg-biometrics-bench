@@ -5,7 +5,7 @@
 # This module handles the core deep learning and biometric evaluation logic.
 # It features advanced training loops including dynamic Learning Rate rollback,
 # strict temporal isolation, and a Composite Validation Metric (CE Loss + EER) 
-# to optimize Open-Set generalization.
+# to optimize Subject-Disjoint generalization.
 #
 # SUPPORTED TASKS:
 #   1. Closed-Set Identification           (Intra-session, Known Subjects)
@@ -1032,7 +1032,7 @@ def run_closed_set_verification(x, y, model_class, epochs=150, batch_size=256, l
     return eer, auc_val, dprime, tar
 
 # =============================================================================
-# TASK 3: SUBJECT-DISJOINT IDENTIFICATION (OPEN SET / TEMPLATE MATCHING)
+# TASK 3: SUBJECT-DISJOINT IDENTIFICATION (TEMPLATE MATCHING)
 # =============================================================================
 def run_subject_disjoint_identification(x, y, model_class, epochs=150, batch_size=256, lr=1e-3, 
                                         test_split=0.2, val_split=0.0, seed=42, device=None, 
@@ -1045,7 +1045,7 @@ def run_subject_disjoint_identification(x, y, model_class, epochs=150, batch_siz
                                         n_runs=1, _return_stats=False,
                                         intelligent_weight_loading=True):
     """
-    Subject-Disjoint Identification Pipeline (Open-Set).
+    Subject-Disjoint Identification Pipeline.
     Evaluates identification performance on subjects entirely UNSEEN during the training phase.
     The model learns generalized feature representations on Subject Group A, and builds a gallery for Subject Group B.
 
@@ -1061,7 +1061,7 @@ def run_subject_disjoint_identification(x, y, model_class, epochs=150, batch_siz
         seed (int): Random seed for reproducibility.
         device (str): Computation device ('cuda', 'cpu', or 'auto').
         visualize (bool): If True, generates t-SNE scatter plots of the unseen embeddings.
-        use_template (bool): MUST be True for Open-Set identification (requires a gallery).
+        use_template (bool): MUST be True for Subject-Disjoint identification (requires a gallery).
         template_fusion_method (str): Logic used to enroll unseen subjects into the gallery.
             Options: ['mean', 'median', 'trimmed_mean', 'representative',
             'soft_centrality', 'geometric_median', 'none']
@@ -1269,7 +1269,7 @@ def run_subject_disjoint_identification(x, y, model_class, epochs=150, batch_siz
         from utils import CacheManager
         cache = CacheManager()
         train_config = {
-            "training_regime": "intra_session_open_set",
+            "training_regime": "intra_session_subject_disjoint",
             "model": model_class.__name__, "epochs": epochs, "batch_size": batch_size, "lr": lr, 
             "val_split": val_split, "seed": seed, "outlier_train": outlier_filtering_on_train, 
             "sqi_thresh": sqi_threshold, "classes": num_train_classes, "data_shape": X_tr.shape,
@@ -1287,7 +1287,7 @@ def run_subject_disjoint_identification(x, y, model_class, epochs=150, batch_siz
             model = cached_model
             model.actual_epochs = epochs
         else:
-            print(f"\n[INFO] Training new Open-Set model (Hash: {uid})...")
+            print(f"\n[INFO] Training new Subject-Disjoint model (Hash: {uid})...")
             optimizer = torch.optim.Adam(model.parameters(), lr=lr); criterion = nn.CrossEntropyLoss()
             model = _run_train_loop_unseen_subjects(
                 model=model, train_loader=train_loader, val_loader_seen=val_loader_seen, 
@@ -1415,7 +1415,7 @@ def run_subject_disjoint_verification(x, y, model_class, epochs=150, batch_size=
                                       loader=None, n_runs=1, _return_stats=False,
                                       intelligent_weight_loading=True):
     """
-    Subject-Disjoint Verification Pipeline (Open-Set 1:1 Matching).
+    Subject-Disjoint Verification Pipeline (Subject-Disjoint 1:1 Matching).
     Tests the system's ability to verify the identity of completely new users.
     The model is trained on Subject Group A and evaluated via pairs constructed from Subject Group B.
 
@@ -1643,7 +1643,7 @@ def run_subject_disjoint_verification(x, y, model_class, epochs=150, batch_size=
         from utils import CacheManager
         cache = CacheManager()
         train_config = {
-            "training_regime": "intra_session_open_set",
+            "training_regime": "intra_session_subject_disjoint",
             "model": model_class.__name__, "epochs": epochs, "batch_size": batch_size, "lr": lr, 
             "val_split": val_split, "seed": seed, "outlier_train": outlier_filtering_on_train, 
             "sqi_thresh": sqi_threshold, "classes": num_train_classes, "data_shape": X_tr.shape,
@@ -1661,7 +1661,7 @@ def run_subject_disjoint_verification(x, y, model_class, epochs=150, batch_size=
             model = cached_model
             model.actual_epochs = epochs
         else:
-            print(f"\n[INFO] Training new Open-Set model (Hash: {uid})...")
+            print(f"\n[INFO] Training new Subject-Disjoint model (Hash: {uid})...")
             optimizer = torch.optim.Adam(model.parameters(), lr=lr); criterion = nn.CrossEntropyLoss()
             model = _run_train_loop_unseen_subjects(
                 model=model, train_loader=train_loader, val_loader_seen=val_loader_seen, 
@@ -2469,7 +2469,7 @@ def run_subject_disjoint_cross_session_identification(
         loader=None, n_runs=1, _return_stats=False,
         intelligent_weight_loading=True):
     """
-    The Ultimate Biometric Test: Open-Set + Temporal Robustness Identification.
+    The Ultimate Biometric Test: Subject-Disjoint + Temporal Robustness Identification.
     1. Trains a feature extractor on Session 1 of Subject Group A.
     2. Enrolls Unseen Subject Group B using their Session 1 recordings to build a gallery.
     3. Identifies Subject Group B using their Session 2 recordings as probes.
@@ -2660,7 +2660,7 @@ def run_subject_disjoint_cross_session_identification(
         from utils import CacheManager
         cache = CacheManager()
         train_config = {
-            "training_regime": "cross_session_open_set",
+            "training_regime": "cross_session_subject_disjoint",
             "model": model_class.__name__, "epochs": epochs, "batch_size": batch_size, "lr": lr, 
             "val_split": val_split, "seed": seed, "outlier_train": outlier_filtering_on_train, 
             "sqi_thresh": sqi_threshold, "classes": num_train_classes, "data_shape": X_tr.shape,
@@ -2678,7 +2678,7 @@ def run_subject_disjoint_cross_session_identification(
             model = cached_model
             model.actual_epochs = epochs
         else:
-            print(f"\n[INFO] Training new Open-Set Cross-Session model (Hash: {uid})...")
+            print(f"\n[INFO] Training new Subject-Disjoint Cross-Session model (Hash: {uid})...")
             optimizer = torch.optim.Adam(model.parameters(), lr=lr); criterion = nn.CrossEntropyLoss()
             model = _run_train_loop_unseen_subjects(
                 model=model, train_loader=train_loader, val_loader_seen=val_loader_seen, 
@@ -2784,7 +2784,7 @@ def run_subject_disjoint_cross_session_verification(
         use_deployment_evaluation=False, save_results_and_settings=False, loader=None, n_runs=1, _return_stats=False,
         intelligent_weight_loading=True):
     """
-    The Ultimate Biometric Test: Open-Set + Temporal Robustness 1:1 Verification.
+    The Ultimate Biometric Test: Subject-Disjoint + Temporal Robustness 1:1 Verification.
     Verifies the identity of subjects completely excluded from representation learning, across different recording days.
     The model learns generalized features on Session 1 of Subject Group A, and evaluates verification on Subject Group B.
 
@@ -2976,7 +2976,7 @@ def run_subject_disjoint_cross_session_verification(
         from utils import CacheManager
         cache = CacheManager()
         train_config = {
-            "training_regime": "cross_session_open_set",
+            "training_regime": "cross_session_subject_disjoint",
             "model": model_class.__name__, "epochs": epochs, "batch_size": batch_size, "lr": lr, 
             "val_split": val_split, "seed": seed, "outlier_train": outlier_filtering_on_train, 
             "sqi_thresh": sqi_threshold, "classes": num_train_classes, "data_shape": X_tr.shape,
@@ -2994,7 +2994,7 @@ def run_subject_disjoint_cross_session_verification(
             model = cached_model
             model.actual_epochs = epochs
         else:
-            print(f"\n[INFO] Training new Open-Set Cross-Session model (Hash: {uid})...")
+            print(f"\n[INFO] Training new Subject-Disjoint Cross-Session model (Hash: {uid})...")
             optimizer = torch.optim.Adam(model.parameters(), lr=lr); criterion = nn.CrossEntropyLoss()
             model = _run_train_loop_unseen_subjects(
                 model=model, train_loader=train_loader, val_loader_seen=val_loader_seen, 
