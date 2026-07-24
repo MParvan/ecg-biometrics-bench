@@ -192,6 +192,88 @@ def _prepare_multi_run_arguments(local_arguments):
     return call_args
 
 # =============================================================================
+# WEIGHT CACHE CONFIGURATION
+# =============================================================================
+
+def _build_weight_cache_config(loader, training_config):
+    """
+    Add dataset and loader identity to a model-weight cache configuration.
+
+    Model weights are reusable only when both the training hyperparameters
+    and the effective dataset and preprocessing configuration are equivalent.
+    """
+    complete_config = dict(training_config)
+
+    if loader is None:
+        complete_config["loader_identity"] = None
+        return complete_config
+
+    loader_cfg = getattr(loader, "cfg", {})
+    effective_preprocessing = {}
+
+    if isinstance(loader_cfg, dict):
+        configured_preprocessing = loader_cfg.get(
+            "preprocessing",
+            {},
+        )
+
+        if isinstance(configured_preprocessing, dict):
+            effective_preprocessing.update(
+                configured_preprocessing
+            )
+
+    preprocessing_overrides = getattr(
+        loader,
+        "prep_params",
+        {},
+    )
+
+    if isinstance(preprocessing_overrides, dict):
+        effective_preprocessing.update(
+            preprocessing_overrides
+        )
+
+    loader_settings = {}
+
+    cache_relevant_attributes = [
+        "data_split_mode",
+        "num_beats_to_merge",
+        "beat_merge_method",
+        "signal_type",
+        "train_sessions",
+        "enroll_sessions",
+        "enrol_sessions",
+        "probe_sessions",
+        "session_for_single_session_evaluation",
+        "leads",
+        "single_segment_range",
+        "train_parts",
+        "enrol_parts",
+        "enroll_parts",
+        "test_parts",
+    ]
+
+    for attribute_name in cache_relevant_attributes:
+        if hasattr(loader, attribute_name):
+            loader_settings[attribute_name] = getattr(
+                loader,
+                attribute_name,
+            )
+
+    complete_config["loader_identity"] = {
+        "loader_class": type(loader).__name__,
+        "root_dir": (
+            loader_cfg.get("root_dir")
+            if isinstance(loader_cfg, dict)
+            else None
+        ),
+        "preprocessing": effective_preprocessing,
+        "settings": loader_settings,
+    }
+
+    return complete_config
+
+# =============================================================================
 # TASK 1: CLOSED-SET IDENTIFICATION
 # =============================================================================
 def run_closed_set_identification(x, y, model_class, epochs=150, batch_size=256, 
@@ -438,6 +520,11 @@ def run_closed_set_identification(x, y, model_class, epochs=150, batch_size=256,
         "classes": len(classes),
         "data_shape": X_tr.shape 
         }
+
+        train_config = _build_weight_cache_config(
+            loader,
+            train_config,
+        )
         
         cached_model, uid = cache.get_weight_cache(train_config, model, device)
         if cached_model:
@@ -759,6 +846,12 @@ def run_closed_set_verification(x, y, model_class, epochs=150, batch_size=256, l
             "val_split": val_split, "seed": seed, "outlier_train": outlier_filtering_on_train, 
             "sqi_thresh": sqi_threshold, "classes": len(classes), "data_shape": X_tr.shape
         }
+
+        train_config = _build_weight_cache_config(
+            loader,
+            train_config,
+        )
+        
         cached_model, uid = cache.get_weight_cache(train_config, model, device)
         if cached_model:
             print(f"\n[INFO] Loaded pre-trained weights (Hash: {uid}). Skipping training!")
@@ -1109,6 +1202,12 @@ def run_subject_disjoint_identification(x, y, model_class, epochs=150, batch_siz
             "sqi_thresh": sqi_threshold, "classes": num_train_classes, "data_shape": X_tr.shape,
             "matching_method": matching_method  # Affects early stopping EER!
         }
+
+        train_config = _build_weight_cache_config(
+            loader,
+            train_config,
+        )
+        
         cached_model, uid = cache.get_weight_cache(train_config, model, device)
         if cached_model:
             print(f"\n[INFO] Loaded pre-trained weights (Hash: {uid}). Skipping training!")
@@ -1459,6 +1558,12 @@ def run_subject_disjoint_verification(x, y, model_class, epochs=150, batch_size=
             "sqi_thresh": sqi_threshold, "classes": num_train_classes, "data_shape": X_tr.shape,
             "matching_method": matching_method  # Affects early stopping EER!
         }
+
+        train_config = _build_weight_cache_config(
+            loader,
+            train_config,
+        )
+        
         cached_model, uid = cache.get_weight_cache(train_config, model, device)
         if cached_model:
             print(f"\n[INFO] Loaded pre-trained weights (Hash: {uid}). Skipping training!")
@@ -1789,6 +1894,12 @@ def run_cross_session_identification(x_train, y_train, x_test, y_test, model_cla
             "val_split": val_split, "seed": seed, "outlier_train": outlier_filtering_on_train, 
             "sqi_thresh": sqi_threshold, "classes": len(classes), "data_shape": X_tr.shape
         }
+
+        train_config = _build_weight_cache_config(
+            loader,
+            train_config,
+        )
+        
         cached_model, uid = cache.get_weight_cache(train_config, model, device)
         if cached_model:
             print(f"\n[INFO] Loaded pre-trained weights (Hash: {uid}). Skipping training!")
@@ -2091,6 +2202,12 @@ def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class
             "val_split": val_split, "seed": seed, "outlier_train": outlier_filtering_on_train, 
             "sqi_thresh": sqi_threshold, "classes": len(classes), "data_shape": X_tr.shape
         }
+
+        train_config = _build_weight_cache_config(
+            loader,
+            train_config,
+        )
+        
         cached_model, uid = cache.get_weight_cache(train_config, model, device)
         if cached_model:
             print(f"\n[INFO] Loaded pre-trained weights (Hash: {uid}). Skipping training!")
@@ -2400,6 +2517,12 @@ def run_subject_disjoint_cross_session_identification(
             "sqi_thresh": sqi_threshold, "classes": num_train_classes, "data_shape": X_tr.shape,
             "matching_method": matching_method # Affects early stopping EER!
         }
+
+        train_config = _build_weight_cache_config(
+            loader,
+            train_config,
+        )
+        
         cached_model, uid = cache.get_weight_cache(train_config, model, device)
         if cached_model:
             print(f"\n[INFO] Loaded pre-trained weights (Hash: {uid}). Skipping training!")
@@ -2698,6 +2821,12 @@ def run_subject_disjoint_cross_session_verification(
             "sqi_thresh": sqi_threshold, "classes": num_train_classes, "data_shape": X_tr.shape,
             "matching_method": matching_method # Affects early stopping EER!
         }
+
+        train_config = _build_weight_cache_config(
+            loader,
+            train_config,
+        )
+
         cached_model, uid = cache.get_weight_cache(train_config, model, device)
         if cached_model:
             print(f"\n[INFO] Loaded pre-trained weights (Hash: {uid}). Skipping training!")
