@@ -261,9 +261,24 @@ def get_parser():
     eval_group = parser.add_argument_group('Evaluation & Biometric Settings')
     eval_group.add_argument('--use_template', action='store_true', 
                             help="Enable Template Matching (strips Softmax). Required for Tasks 3, 4, 7, 8.")
-    eval_group.add_argument('--template_fusion_method', type=str, default='mean', 
-                            choices=['mean', 'median', 'trimmed_mean', 'representative', 'none'],
-                            help="How to aggregate multiple enrollment beats into one vector.")
+    eval_group.add_argument(
+        '--template_fusion_method',
+        type=str,
+        default='mean',
+        choices=[
+            'mean',
+            'median',
+            'trimmed_mean',
+            'representative',
+            'soft_centrality',
+            'geometric_median',
+            'none',
+        ],
+        help=(
+            "Method used to aggregate enrollment embeddings into "
+            "subject templates."
+        ),
+    )
     eval_group.add_argument('--template_size', type=int, default=None,
                             help="Max number of beats to use for enrollment (None = use all).")
     eval_group.add_argument('--matching_method', type=str, default='cosine',

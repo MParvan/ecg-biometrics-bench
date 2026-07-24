@@ -342,7 +342,8 @@ def run_closed_set_identification(x, y, model_class, epochs=150, batch_size=256,
             - True: Strips the Softmax layer and uses the network as a feature extractor. 
                     Matches Test probes against Train templates.
         template_fusion_method (str): Logic used to create the subject templates.
-            Options: ['mean', 'median', 'trimmed_mean', 'representative', 'none']
+            Options: ['mean', 'median', 'trimmed_mean', 'representative',
+            'soft_centrality', 'geometric_median', 'none']
         template_size (int, optional): Number of beats used to form the template. None uses all available.
         matching_method (str): Distance/Similarity metric for template matching.
             Options: ['cosine', 'euclidean', 'manhattan', 'correlation']
@@ -693,7 +694,7 @@ def run_closed_set_verification(x, y, model_class, epochs=150, batch_size=256, l
         val_split (float): Fraction of the training data to use for early stopping.
         num_pairs (int): Total number of Genuine and Impostor pairs to generate for evaluation.
         sampling_mode (str): Logic used to pair beats together.
-            Options: ['balanced' (50/50 split), 'all', 'random']
+            Options: ['all', 'balanced', 'random']
         seed (int): Random seed for reproducibility.
         device (str): Computation device ('cuda', 'cpu', or 'auto').
         visualize (bool): If True, generates t-SNE scatter plots of the test embeddings.
@@ -701,7 +702,8 @@ def run_closed_set_verification(x, y, model_class, epochs=150, batch_size=256, l
             - False: Evaluates raw feature space (Unseen test beats paired vs other Unseen test beats).
             - True: Simulates real-world authentication (Test probes paired against Train templates).
         template_fusion_method (str): Logic used to create the subject templates.
-            Options: ['mean', 'median', 'trimmed_mean', 'representative', 'none']
+            Options: ['mean', 'median', 'trimmed_mean', 'representative',
+            'soft_centrality', 'geometric_median', 'none']
         template_size (int, optional): Number of beats used to form the template. None uses all available.
         matching_method (str): Distance/Similarity metric used to score the pairs.
             Options: ['cosine', 'euclidean', 'manhattan', 'correlation']
@@ -1061,7 +1063,8 @@ def run_subject_disjoint_identification(x, y, model_class, epochs=150, batch_siz
         visualize (bool): If True, generates t-SNE scatter plots of the unseen embeddings.
         use_template (bool): MUST be True for Open-Set identification (requires a gallery).
         template_fusion_method (str): Logic used to enroll unseen subjects into the gallery.
-            Options: ['mean', 'median', 'trimmed_mean', 'representative', 'none']
+            Options: ['mean', 'median', 'trimmed_mean', 'representative',
+            'soft_centrality', 'geometric_median', 'none']
         template_size (int): Number of chronological beats (e.g., first 5) used to form the gallery template.
         matching_method (str): Distance/Similarity metric used to search the gallery.
             Options: ['cosine', 'euclidean', 'manhattan', 'correlation']
@@ -1427,7 +1430,7 @@ def run_subject_disjoint_verification(x, y, model_class, epochs=150, batch_size=
         val_split (float): Fraction of training subjects to use for early stopping.
         num_pairs (int): Total number of Genuine and Impostor pairs to generate.
         sampling_mode (str): Logic used to pair beats together.
-            Options: ['balanced', 'all_genuine', 'random']
+            Options: ['all', 'balanced', 'random']
         seed (int): Random seed for reproducibility.
         device (str): Computation device ('cuda', 'cpu', or 'auto').
         visualize (bool): If True, generates t-SNE scatter plots of the unseen embeddings.
@@ -1435,7 +1438,8 @@ def run_subject_disjoint_verification(x, y, model_class, epochs=150, batch_size=
             - False: "Cloud-based" matching (Random pairs formed entirely within the unseen Test group).
             - True: "Authentication" simulation (Unseen subjects' later beats matched against their initial beats).
         template_fusion_method (str): Logic used to create templates if use_template is True.
-            Options: ['mean', 'median', 'trimmed_mean', 'representative', 'none']
+            Options: ['mean', 'median', 'trimmed_mean', 'representative',
+            'soft_centrality', 'geometric_median', 'none']
         template_size (int): Number of initial beats to form the enrollment template for unseen subjects.
         matching_method (str): Distance/Similarity metric used to score the pairs.
             Options: ['cosine', 'euclidean', 'manhattan', 'correlation']
@@ -1838,7 +1842,8 @@ def run_cross_session_identification(x_train, y_train, x_test, y_test, model_cla
             - False: Uses the Session 1 Softmax classification weights to classify Session 2 data.
             - True: Uses Session 1 features to form a gallery, and metric-matches Session 2 probes.
         template_fusion_method (str): Logic used to create the Session 1 gallery template.
-            Options: ['mean', 'median', 'trimmed_mean', 'representative', 'none']
+            Options: ['mean', 'median', 'trimmed_mean', 'representative',
+            'soft_centrality', 'geometric_median', 'none']
         template_size (int, optional): Number of Session 1 beats used for enrollment. None uses all available.
         matching_method (str): Distance/Similarity metric for template matching.
             Options: ['cosine', 'euclidean', 'manhattan', 'correlation']
@@ -2141,7 +2146,7 @@ def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class
         val_split (float): Fraction of Session 1 data to use for early stopping.
         num_pairs (int): Total number of Genuine and Impostor pairs to generate.
         sampling_mode (str): Logic used to pair beats together.
-            Options: ['balanced', 'all_genuine', 'random']
+            Options: ['all', 'balanced', 'random']
         seed (int): Random seed for reproducibility.
         device (str): Computation device ('cuda', 'cpu', or 'auto').
         visualize (bool): If True, generates t-SNE scatter plots of the cross-session embeddings.
@@ -2149,7 +2154,8 @@ def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class
             - False: Evaluates raw temporal space (Session 2 beats paired vs other Session 2 beats).
             - True: Simulates Authentication (Session 2 probes paired against Session 1 enrollment templates).
         template_fusion_method (str): Logic used to create the Session 1 templates.
-            Options: ['mean', 'median', 'trimmed_mean', 'representative', 'none']
+            Options: ['mean', 'median', 'trimmed_mean', 'representative',
+            'soft_centrality', 'geometric_median', 'none']
         template_size (int, optional): Number of Session 1 beats used for enrollment. None uses all available.
         matching_method (str): Distance/Similarity metric used to score the pairs.
             Options: ['cosine', 'euclidean', 'manhattan', 'correlation']
@@ -2484,7 +2490,8 @@ def run_subject_disjoint_cross_session_identification(
         visualize (bool): If True, generates t-SNE scatter plots of the unseen temporal embeddings.
         use_template (bool): MUST be True for this task (requires a gallery to identify unseen subjects).
         template_fusion_method (str): Logic used to enroll unseen Session 1 data into the gallery.
-            Options: ['mean', 'median', 'trimmed_mean', 'representative', 'none']
+            Options: ['mean', 'median', 'trimmed_mean', 'representative',
+            'soft_centrality', 'geometric_median', 'none']
         template_size (int, optional): Number of Session 1 beats to form the gallery. None uses all available.
         matching_method (str): Distance/Similarity metric used to search the gallery.
             Options: ['cosine', 'euclidean', 'manhattan', 'correlation']
@@ -2794,7 +2801,7 @@ def run_subject_disjoint_cross_session_verification(
         val_split (float): Fraction of Group A subjects to use for early stopping validation.
         num_pairs (int): Total number of Genuine and Impostor pairs to generate for evaluation.
         sampling_mode (str): Logic used to pair beats together.
-            Options: ['balanced', 'all_genuine', 'random']
+            Options: ['all', 'balanced', 'random']
         seed (int): Random seed for reproducibility.
         device (str): Computation device ('cuda', 'cpu', or 'auto').
         visualize (bool): If True, generates t-SNE scatter plots of the unseen temporal embeddings.
@@ -2802,7 +2809,8 @@ def run_subject_disjoint_cross_session_verification(
             - False: Evaluates raw temporal space (Group B's Session 2 paired vs Group B's Session 2).
             - True: Simulates Authentication (Group B's Session 2 probes matched vs Group B's Session 1 templates).
         template_fusion_method (str): Logic used to create Session 1 templates.
-            Options: ['mean', 'median', 'trimmed_mean', 'representative', 'none']
+            Options: ['mean', 'median', 'trimmed_mean', 'representative',
+            'soft_centrality', 'geometric_median', 'none']
         template_size (int, optional): Number of Session 1 beats used for enrollment. None uses all available.
         matching_method (str): Distance/Similarity metric used to score the pairs.
             Options: ['cosine', 'euclidean', 'manhattan', 'correlation']

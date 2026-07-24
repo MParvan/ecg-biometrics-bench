@@ -67,13 +67,35 @@ def _make_loader(x, y, batch_size, shuffle=True, device='cpu'):
 
 def _create_templates(embeddings, labels, method='mean', max_beats=None):
     """
-    Aggregates embeddings into a SINGLE template vector per class.
-    
-    Args:
-        embeddings: (N, D) array.
-        labels: (N,) array.
-        method: 'mean', 'median', 'trimmed_mean', 'representative'.
-        max_beats: If set (e.g. 5), uses only the FIRST 5 beats available for the subject.
+    Aggregate enrollment embeddings into subject templates.
+
+    Parameters
+    ----------
+    embeddings : np.ndarray
+        Embedding matrix with shape ``(n_samples, feature_dim)``.
+    labels : np.ndarray
+        Subject labels corresponding to the embeddings.
+    method : str
+        Template-fusion strategy:
+
+        - ``mean``: arithmetic mean.
+        - ``median``: coordinate-wise median.
+        - ``trimmed_mean``: coordinate-wise 10% trimmed mean.
+        - ``representative``: average of the most centrally consistent
+          50% of the selected embeddings, based on cosine similarity.
+        - ``soft_centrality``: cosine-centrality-weighted average using
+          softmax weighting.
+        - ``geometric_median``: iterative geometric median.
+        - ``none``: retain all enrollment embeddings without fusion.
+    max_beats : int or None
+        Maximum number of enrollment embeddings used per subject. The
+        first ``max_beats`` samples are selected. ``None`` uses all
+        available samples.
+
+    Returns
+    -------
+    tuple[np.ndarray, np.ndarray]
+        Template embeddings and their corresponding subject labels.
     """
     if method == 'none' or method is None:
         return embeddings, labels
@@ -101,7 +123,7 @@ def _create_templates(embeddings, labels, method='mean', max_beats=None):
 
         # 3. Apply Fusion Method on the selected subset
         if method == 'representative':
-            # Logic: Calculate similarity among these beats, pick best half, average them.
+            # Average the most centrally consistent half of the embeddings.
             
             # A. Calculate Similarity Matrix
             norm_embs = normalize(subj_embs, axis=1)

@@ -24,11 +24,13 @@ n_runs: 5               # Number of independent runs (with varying seeds) for ro
 use_template: true      # true: Extract features for Gallery/Probe matching. false: Standard Softmax classification
 template_fusion_method: 'mean'
 # Available options:
-# - 'mean'          : Averages embeddings (Standard, fast)
-# - 'median'        : Median of embeddings (Robust to outliers)
-# - 'trimmed_mean'  : Removes top/bottom % before averaging
-# - 'representative': Selects the single beat closest to the class mean
-# - 'none'          : Keeps all individual beats in the gallery (no fusion)
+# - 'mean'             : Arithmetic mean of enrollment embeddings
+# - 'median'           : Coordinate-wise median
+# - 'trimmed_mean'     : Coordinate-wise 10% trimmed mean
+# - 'representative'   : Average of the most centrally consistent 50% of embeddings
+# - 'soft_centrality'  : Cosine-centrality-weighted average
+# - 'geometric_median' : Iterative geometric median
+# - 'none'             : Keep all enrollment embeddings without fusion
 
 template_size: null     # Number of beats to form the gallery template (e.g., 1, 5, or null/None to use all available)
 probe_fusion_size: 3    # Number of consecutive probe beats to average before searching the gallery (Score-Level Fusion)
