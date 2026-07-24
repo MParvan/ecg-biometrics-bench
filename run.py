@@ -606,18 +606,27 @@ def run_closed_set_identification(x, y, model_class, epochs=150, batch_size=256,
     # Update hyperparams dictionary dynamically
     hyperparams['epochs'] = f"{epochs} (stopped at {model.actual_epochs})" if model.actual_epochs < epochs else epochs
 
-    if _return_stats: 
+    data_stats = {
+        "Total Subjects": len(classes),
+        "Train Samples": len(X_tr),
+        "Validation Samples": len(X_val) if X_val is not None else 0,
+        "Test (Probe) Samples": len(X_test),
+    }
+
+    if _return_stats:
         return (rank1, rank5), data_stats, hyperparams
 
     if save_results_and_settings:
-        data_stats = {
-            "Total Subjects": len(classes),
-            "Train Samples": len(X_tr),
-            "Validation Samples": len(X_val) if X_val is not None else 0,
-            "Test (Probe) Samples": len(X_test),
-        }
-        _log_experiment_results(task_title, {"Rank-1 Accuracy": rank1, "Rank-5 Accuracy": rank5}, 
-                                data_stats, hyperparams, loader)
+        _log_experiment_results(
+            task_title,
+            {
+                "Rank-1 Accuracy": rank1,
+                "Rank-5 Accuracy": rank5,
+            },
+            data_stats,
+            hyperparams,
+            loader,
+        )
 
     return rank1, rank5
 
@@ -943,19 +952,35 @@ def run_closed_set_verification(x, y, model_class, epochs=150, batch_size=256, l
     # ====================================================
     # 10. SAVE RESULTS
     # ====================================================
-    if _return_stats: 
-        return (eer, auc_val, dprime, tar), data_stats, hyperparams
-    
+    data_stats = {
+        "Total Subjects": len(classes),
+        "Train Samples": len(X_tr),
+        "Validation Samples": len(X_val) if X_val is not None else 0,
+        "Test (Probe) Samples": len(X_test),
+        "Verification Pairs Generated": len(labels_pair),
+    }
+
+    if _return_stats:
+        return (
+            eer,
+            auc_val,
+            dprime,
+            tar,
+        ), data_stats, hyperparams
+
     if save_results_and_settings:
-        data_stats = {
-            "Total Subjects": len(classes),
-            "Train Samples": len(X_tr),
-            "Validation Samples": len(X_val) if X_val is not None else 0,
-            "Test (Probe) Samples": len(X_test),
-            "Verification Pairs Generated": len(labels_pair),
-        }
-        _log_experiment_results(task_title, {"EER": eer, "AUC": auc_val, "d-prime": dprime, "TAR@0.1%FAR": tar}, 
-                                data_stats, hyperparams, loader)
+        _log_experiment_results(
+            task_title,
+            {
+                "EER": eer,
+                "AUC": auc_val,
+                "d-prime": dprime,
+                "TAR@0.1%FAR": tar,
+            },
+            data_stats,
+            hyperparams,
+            loader,
+        )
 
     return eer, auc_val, dprime, tar
 
@@ -1292,21 +1317,38 @@ def run_subject_disjoint_identification(x, y, model_class, epochs=150, batch_siz
 
     rank1, rank5 = _compute_metrics_identification(final_scores, final_labels)
 
-    if _return_stats: 
+    data_stats = {
+        "Train Subjects": len(train_subs),
+        "Train Samples": len(X_train),
+        "Validation Subjects": (
+            len(val_subs)
+            if val_subs is not None
+            else 0
+        ),
+        "Validation Samples": (
+            len(X_val)
+            if X_val is not None
+            else 0
+        ),
+        "Test Subjects": len(test_subs_final),
+        "Gallery Size": len(gallery_emb),
+        "Probe Samples": len(emb_probe),
+    }
+
+    if _return_stats:
         return (rank1, rank5), data_stats, hyperparams
 
     if save_results_and_settings:
-        data_stats = {
-            "Train Subjects": len(train_subs),
-            "Train Samples": len(X_train),
-            "Validation Subjects": len(val_subs) if val_subs is not None else 0,
-            "Validation Samples": len(X_val) if X_val is not None else 0,
-            "Test Subjects": len(test_subs_final),
-            "Gallery Size": len(gallery_emb),
-            "Probe Samples": len(emb_probe)
-        }
-        _log_experiment_results(task_title, {"Rank-1 Accuracy": rank1, "Rank-5 Accuracy": rank5}, 
-                                data_stats, hyperparams, loader)
+        _log_experiment_results(
+            task_title,
+            {
+                "Rank-1 Accuracy": rank1,
+                "Rank-5 Accuracy": rank5,
+            },
+            data_stats,
+            hyperparams,
+            loader,
+        )
 
     # 11. Report Identification Metrics
     return rank1, rank5
@@ -1680,16 +1722,34 @@ def run_subject_disjoint_verification(x, y, model_class, epochs=150, batch_size=
     # Update hyperparams dictionary dynamically using the local 'ep' variable
     # hyperparams['epochs'] = f"{epochs} (stopped at {ep + 1})" if (ep + 1) < epochs else epochs
     
-    if _return_stats: 
-        return (eer, auc_val, dprime, tar), data_stats, hyperparams
+    data_stats = {
+        "Train Subjects": len(train_subs),
+        "Train Samples": len(X_train),
+        "Test Subjects": len(test_subs_final),
+        "Test Pairs Evaluated": len(labels_pair),
+    }
+
+    if _return_stats:
+        return (
+            eer,
+            auc_val,
+            dprime,
+            tar,
+        ), data_stats, hyperparams
 
     if save_results_and_settings:
-        data_stats = {
-            "Train Subjects": len(train_subs), "Train Samples": len(X_train),
-            "Test Subjects": len(test_subs_final), "Test Pairs Evaluated": len(labels_pair)
-        }
-        _log_experiment_results(task_title, {"EER": eer, "AUC": auc_val, "d-prime": dprime, "TAR@0.1%FAR": tar}, 
-                                data_stats, hyperparams, loader)
+        _log_experiment_results(
+            task_title,
+            {
+                "EER": eer,
+                "AUC": auc_val,
+                "d-prime": dprime,
+                "TAR@0.1%FAR": tar,
+            },
+            data_stats,
+            hyperparams,
+            loader,
+        )
 
     return eer, auc_val, dprime, tar
 
@@ -1977,17 +2037,26 @@ def run_cross_session_identification(x_train, y_train, x_test, y_test, model_cla
     # Update hyperparams dictionary dynamically
     hyperparams['epochs'] = f"{epochs} (stopped at {model.actual_epochs})" if model.actual_epochs < epochs else epochs
 
-    if _return_stats: 
+    data_stats = {
+        "Total Cross-Session Subjects": len(classes),
+        "Enrollment (S1) Samples": len(x_train_full),
+        "Probe (S2) Samples": len(x_test_filtered),
+    }
+
+    if _return_stats:
         return (rank1, rank5), data_stats, hyperparams
 
     if save_results_and_settings:
-        data_stats = {
-            "Total Cross-Session Subjects": len(classes),
-            "Enrollment (S1) Samples": len(x_train_full),
-            "Probe (S2) Samples": len(x_test_filtered)
-        }
-        _log_experiment_results(task_title, {"Rank-1 Accuracy": rank1, "Rank-5 Accuracy": rank5}, 
-                                data_stats, hyperparams, loader)
+        _log_experiment_results(
+            task_title,
+            {
+                "Rank-1 Accuracy": rank1,
+                "Rank-5 Accuracy": rank5,
+            },
+            data_stats,
+            hyperparams,
+            loader,
+        )
 
     # 8. Report Identification Metrics
     return rank1, rank5
@@ -2294,18 +2363,34 @@ def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class
     # Update hyperparams dictionary dynamically
     hyperparams['epochs'] = f"{epochs} (stopped at {model.actual_epochs})" if model.actual_epochs < epochs else epochs
 
-    if _return_stats: 
-        return (eer, auc_val, dprime, tar), data_stats, hyperparams
+    data_stats = {
+        "Total Cross-Session Subjects": len(classes),
+        "Enrollment (S1) Samples": len(x_train_full),
+        "Probe (S2) Samples": len(x_test_filtered),
+        "Pairs Evaluated": len(labels_pair),
+    }
+
+    if _return_stats:
+        return (
+            eer,
+            auc_val,
+            dprime,
+            tar,
+        ), data_stats, hyperparams
 
     if save_results_and_settings:
-        data_stats = {
-            "Total Cross-Session Subjects": len(classes),
-            "Enrollment (S1) Samples": len(x_train_full),
-            "Probe (S2) Samples": len(x_test_filtered),
-            "Pairs Evaluated": len(labels_pair)
-        }
-        _log_experiment_results(task_title, {"EER": eer, "AUC": auc_val, "d-prime": dprime, "TAR@0.1%FAR": tar}, 
-                                data_stats, hyperparams, loader)
+        _log_experiment_results(
+            task_title,
+            {
+                "EER": eer,
+                "AUC": auc_val,
+                "d-prime": dprime,
+                "TAR@0.1%FAR": tar,
+            },
+            data_stats,
+            hyperparams,
+            loader,
+        )
 
     # 9. Report Verification Metrics
     return eer, auc_val, dprime, tar
@@ -2598,17 +2683,28 @@ def run_subject_disjoint_cross_session_identification(
     actual_ep = getattr(model, 'actual_epochs', epochs)
     hyperparams['epochs'] = f"{epochs} (stopped at {actual_ep})" if actual_ep < epochs else epochs
 
-    if _return_stats: 
+    data_stats = {
+        "Train Subjects": len(train_subs),
+        "Test Subjects": len(test_subs),
+        "Train (S1) Samples": len(X_train),
+        "Enrollment (S1) Samples": len(X_enroll),
+        "Probe (S2) Samples": len(X_probe),
+    }
+
+    if _return_stats:
         return (rank1, rank5), data_stats, hyperparams
 
     if save_results_and_settings:
-        data_stats = {
-            "Train Subjects": len(train_subs), "Test Subjects": len(test_subs),
-            "Train (S1) Samples": len(X_train), "Enrollment (S1) Samples": len(X_enroll),
-            "Probe (S2) Samples": len(X_probe)
-        }
-        _log_experiment_results(task_title, {"Rank-1 Accuracy": rank1, "Rank-5 Accuracy": rank5}, 
-                                data_stats, hyperparams, loader)
+        _log_experiment_results(
+            task_title,
+            {
+                "Rank-1 Accuracy": rank1,
+                "Rank-5 Accuracy": rank5,
+            },
+            data_stats,
+            hyperparams,
+            loader,
+        )
 
     return rank1, rank5
 
@@ -2928,17 +3024,36 @@ def run_subject_disjoint_cross_session_verification(
     actual_ep = getattr(model, 'actual_epochs', epochs)
     hyperparams['epochs'] = f"{epochs} (stopped at {actual_ep})" if actual_ep < epochs else epochs
 
-    if _return_stats: 
-        return (eer, auc_val, dprime, tar), data_stats, hyperparams
+    data_stats = {
+        "Train Subjects": len(train_subs),
+        "Test Subjects": len(test_subs),
+        "Train (S1) Samples": len(X_train),
+        "Enrollment (S1) Samples": len(X_enroll),
+        "Probe (S2) Samples": len(X_probe),
+        "Test Pairs Evaluated": len(labels_pair),
+    }
+
+    if _return_stats:
+        return (
+            eer,
+            auc_val,
+            dprime,
+            tar,
+        ), data_stats, hyperparams
 
     if save_results_and_settings:
-        data_stats = {
-            "Train Subjects": len(train_subs), "Test Subjects": len(test_subs),
-            "Train (S1) Samples": len(X_train), "Enrollment (S1) Samples": len(X_enroll),
-            "Probe (S2) Samples": len(X_probe), "Test Pairs Evaluated": len(labels_pair)
-        }
-        _log_experiment_results(task_title, {"EER": eer, "AUC": auc_val, "d-prime": dprime, "TAR@0.1%FAR": tar}, 
-                                data_stats, hyperparams, loader)
+        _log_experiment_results(
+            task_title,
+            {
+                "EER": eer,
+                "AUC": auc_val,
+                "d-prime": dprime,
+                "TAR@0.1%FAR": tar,
+            },
+            data_stats,
+            hyperparams,
+            loader,
+        )
 
     return eer, auc_val, dprime, tar
 # =============================================================================
