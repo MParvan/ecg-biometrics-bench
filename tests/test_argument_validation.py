@@ -1,0 +1,216 @@
+import sys
+import unittest
+from contextlib import redirect_stderr
+from io import StringIO
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PROJECT_ROOT))
+
+import main
+
+
+def parse_basic_arguments(task="1"):
+    parser = main.get_parser()
+
+    arguments = parser.parse_args(
+        [
+            "--dataset",
+            "ecgid",
+            "--task",
+            task,
+        ]
+    )
+
+    return parser, arguments
+
+
+class ArgumentValidationTests(unittest.TestCase):
+    def assert_validation_error(
+        self,
+        parser,
+        arguments,
+        expected_message,
+    ):
+        captured_stderr = StringIO()
+
+        with redirect_stderr(captured_stderr):
+            with self.assertRaises(SystemExit) as context:
+                main.validate_experiment_arguments(
+                    arguments,
+                    parser,
+                )
+
+        self.assertEqual(context.exception.code, 2)
+        self.assertIn(
+            expected_message,
+            captured_stderr.getvalue(),
+        )
+
+    def test_default_task_one_configuration_is_valid(self):
+        parser, arguments = parse_basic_arguments()
+
+        validated = main.validate_experiment_arguments(
+            arguments,
+            parser,
+        )
+
+        self.assertIs(validated, arguments)
+
+    def test_yaml_override_cannot_bypass_parser_choices(self):
+        parser, arguments = parse_basic_arguments()
+        arguments.sampling_mode = "unsupported"
+
+        self.assert_validation_error(
+            parser,
+            arguments,
+            "Invalid value for 'sampling_mode'",
+        )
+
+    def test_positive_integer_parameters_are_enforced(self):
+        invalid_values = [
+            ("epochs", 0),
+            ("batch_size", 0),
+            ("n_runs", 0),
+            ("num_pairs", 0),
+            ("num_beats_to_merge", 0),
+            ("probe_fusion_size", 0),
+        ]
+
+        for argument_name, invalid_value in invalid_values:
+            with self.subTest(argument=argument_name):
+                parser, arguments = parse_basic_arguments()
+                setattr(
+                    arguments,
+                    argument_name,
+                    invalid_value,
+                )
+
+                self.assert_validation_error(
+                    parser,
+                    arguments,
+                    "must be greater than or equal to 1",
+                )
+
+    def test_template_size_must_be_positive_when_set(self):
+        parser, arguments = parse_basic_arguments()
+        arguments.template_size = 0
+
+        self.assert_validation_error(
+            parser,
+            arguments,
+            "'template_size' must be greater than or equal to 1",
+        )
+
+    def test_test_split_must_be_strictly_between_zero_and_one(self):
+        for invalid_value in [0.0, 1.0, -0.1, 1.1]:
+            with self.subTest(value=invalid_value):
+                parser, arguments = parse_basic_arguments()
+                arguments.test_split = invalid_value
+
+                self.assert_validation_error(
+                    parser,
+                    arguments,
+                    "'test_split'",
+                )
+
+    def test_zero_validation_split_is_allowed(self):
+        parser, arguments = parse_basic_arguments()
+        arguments.val_split = 0.0
+
+        validated = main.validate_experiment_arguments(
+            arguments,
+            parser,
+        )
+
+        self.assertEqual(validated.val_split, 0.0)
+
+    def test_validation_split_one_is_rejected(self):
+        parser, arguments = parse_basic_arguments()
+        arguments.val_split = 1.0
+
+        self.assert_validation_error(
+            parser,
+            arguments,
+            "'val_split' must satisfy 0 <= val_split < 1",
+        )
+
+    def test_sqi_ranges_are_enforced(self):
+        parser, arguments = parse_basic_arguments()
+        arguments.sqi_threshold = 1.1
+
+        self.assert_validation_error(
+            parser,
+            arguments,
+            "'sqi_threshold'",
+        )
+
+        parser, arguments = parse_basic_arguments()
+        arguments.sqi_keep_pct = 0.0
+
+        self.assert_validation_error(
+            parser,
+            arguments,
+            "'sqi_keep_pct' must satisfy",
+        )
+
+    def test_session_configuration_must_be_a_list(self):
+        parser, arguments = parse_basic_arguments()
+
+        # Simulate a YAML scalar instead of a YAML list.
+        arguments.train_sessions = "session_1"
+
+        self.assert_validation_error(
+            parser,
+            arguments,
+            "'train_sessions' must be a list",
+        )
+
+    def test_subject_disjoint_identification_requires_template_mode(self):
+        for task in ["3", "7"]:
+            with self.subTest(task=task):
+                parser, arguments = parse_basic_arguments(
+                    task=task
+                )
+
+                arguments.use_template = False
+
+                self.assert_validation_error(
+                    parser,
+                    arguments,
+                    "requires 'use_template: true'",
+                )
+
+    def test_deployment_evaluation_requires_validation_data(self):
+        parser, arguments = parse_basic_arguments(
+            task="2"
+        )
+
+        arguments.use_deployment_evaluation = True
+        arguments.val_split = 0.0
+
+        self.assert_validation_error(
+            parser,
+            arguments,
+            "Deployment evaluation requires val_split > 0",
+        )
+
+    def test_valid_subject_disjoint_configuration_passes(self):
+        parser, arguments = parse_basic_arguments(
+            task="3"
+        )
+
+        arguments.use_template = True
+        arguments.template_size = 5
+
+        validated = main.validate_experiment_arguments(
+            arguments,
+            parser,
+        )
+
+        self.assertTrue(validated.use_template)
+        self.assertEqual(validated.template_size, 5)
+
+
+if __name__ == "__main__":
+    unittest.main()

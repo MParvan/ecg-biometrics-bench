@@ -4,6 +4,7 @@ import traceback
 
 import numpy as np
 import yaml
+from numbers import Integral, Real
 from pathlib import Path
 import run
 import utils
@@ -77,6 +78,223 @@ def apply_yaml_config(args, parser):
         parser.error(
             "Unknown configuration key(s): "
             + ", ".join(sorted(unknown_keys))
+        )
+
+    return args
+
+def validate_experiment_arguments(args, parser):
+    """
+    Validate the complete experiment configuration after YAML overrides.
+
+    Argparse validates command-line inputs before the YAML file is applied.
+    This function therefore revalidates enumerated choices, numeric ranges,
+    session lists, and task-specific requirements using the final effective
+    configuration.
+    """
+
+    # ---------------------------------------------------------
+    # 1. Revalidate argparse choices after YAML overrides
+    # ---------------------------------------------------------
+    for action in parser._actions:
+        if action.dest == "help" or action.choices is None:
+            continue
+
+        value = getattr(args, action.dest, None)
+
+        if value not in action.choices:
+            parser.error(
+                f"Invalid value for '{action.dest}': {value!r}. "
+                f"Expected one of: {list(action.choices)}."
+            )
+
+    # ---------------------------------------------------------
+    # 2. Shared type and range validation helpers
+    # ---------------------------------------------------------
+    def require_integer(name, minimum=None):
+        value = getattr(args, name)
+
+        if isinstance(value, bool) or not isinstance(value, Integral):
+            parser.error(
+                f"'{name}' must be an integer, received {value!r}."
+            )
+
+        if minimum is not None and value < minimum:
+            parser.error(
+                f"'{name}' must be greater than or equal to "
+                f"{minimum}, received {value!r}."
+            )
+
+    def require_real(name, minimum=None, maximum=None):
+        value = getattr(args, name)
+
+        if isinstance(value, bool) or not isinstance(value, Real):
+            parser.error(
+                f"'{name}' must be numeric, received {value!r}."
+            )
+
+        if not np.isfinite(value):
+            parser.error(
+                f"'{name}' must be finite, received {value!r}."
+            )
+
+        if minimum is not None and value < minimum:
+            parser.error(
+                f"'{name}' must be greater than or equal to "
+                f"{minimum}, received {value!r}."
+            )
+
+        if maximum is not None and value > maximum:
+            parser.error(
+                f"'{name}' must be less than or equal to "
+                f"{maximum}, received {value!r}."
+            )
+
+    # ---------------------------------------------------------
+    # 3. Integer-valued parameters
+    # ---------------------------------------------------------
+    for argument_name in [
+        "epochs",
+        "batch_size",
+        "n_runs",
+        "num_pairs",
+        "num_beats_to_merge",
+        "probe_fusion_size",
+    ]:
+        require_integer(
+            argument_name,
+            minimum=1,
+        )
+
+    require_integer("seed")
+
+    if args.template_size is not None:
+        require_integer(
+            "template_size",
+            minimum=1,
+        )
+
+    # ---------------------------------------------------------
+    # 4. Floating-point and fraction parameters
+    # ---------------------------------------------------------
+    require_real(
+        "lr",
+        minimum=0.0,
+    )
+
+    if args.lr <= 0.0:
+        parser.error(
+            f"'lr' must be greater than 0, received {args.lr!r}."
+        )
+
+    require_real(
+        "test_split",
+        minimum=0.0,
+        maximum=1.0,
+    )
+
+    if not 0.0 < args.test_split < 1.0:
+        parser.error(
+            "'test_split' must satisfy 0 < test_split < 1, "
+            f"received {args.test_split!r}."
+        )
+
+    require_real(
+        "val_split",
+        minimum=0.0,
+        maximum=1.0,
+    )
+
+    if args.val_split >= 1.0:
+        parser.error(
+            "'val_split' must satisfy 0 <= val_split < 1, "
+            f"received {args.val_split!r}."
+        )
+
+    require_real(
+        "sqi_threshold",
+        minimum=0.0,
+        maximum=1.0,
+    )
+
+    require_real(
+        "sqi_keep_pct",
+        minimum=0.0,
+        maximum=1.0,
+    )
+
+    if args.sqi_keep_pct <= 0.0:
+        parser.error(
+            "'sqi_keep_pct' must satisfy 0 < sqi_keep_pct <= 1, "
+            f"received {args.sqi_keep_pct!r}."
+        )
+
+    # ---------------------------------------------------------
+    # 5. Session-list validation
+    # ---------------------------------------------------------
+    session_arguments = [
+        "train_sessions",
+        "enroll_sessions",
+        "probe_sessions",
+        "session_for_single_session_evaluation",
+    ]
+
+    for argument_name in session_arguments:
+        value = getattr(args, argument_name)
+
+        if value is None:
+            continue
+
+        if not isinstance(value, (list, tuple)):
+            parser.error(
+                f"'{argument_name}' must be a list of session names, "
+                f"received {value!r}."
+            )
+
+        if not value:
+            parser.error(
+                f"'{argument_name}' cannot be an empty list."
+            )
+
+        if not all(
+            isinstance(session, str) and session.strip()
+            for session in value
+        ):
+            parser.error(
+                f"'{argument_name}' must contain only non-empty strings."
+            )
+
+    # ---------------------------------------------------------
+    # 6. General string validation
+    # ---------------------------------------------------------
+    for argument_name in [
+        "data_split_mode",
+        "sqi_method",
+        "device",
+    ]:
+        value = getattr(args, argument_name)
+
+        if not isinstance(value, str) or not value.strip():
+            parser.error(
+                f"'{argument_name}' must be a non-empty string."
+            )
+
+    # ---------------------------------------------------------
+    # 7. Task-specific consistency
+    # ---------------------------------------------------------
+    if args.task in [3, 7] and not args.use_template:
+        parser.error(
+            f"Task {args.task} is an identification task for subjects "
+            "excluded from representation learning and therefore requires "
+            "'use_template: true' in YAML or '--use_template' on the CLI."
+        )
+
+    if (
+        args.use_deployment_evaluation
+        and args.val_split <= 0.0
+    ):
+        parser.error(
+            "Deployment evaluation requires val_split > 0 so that "
+            "threshold calibration uses independent validation data."
         )
 
     return args
@@ -347,6 +565,10 @@ def main():
     # 0. YAML CONFIGURATION
     # ==========================================
     args = apply_yaml_config(args, parser)
+    args = validate_experiment_arguments(
+        args,
+        parser,
+    )
 
     # ==========================================
     # 1. MODEL SELECTION
