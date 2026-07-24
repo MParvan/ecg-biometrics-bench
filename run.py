@@ -28,6 +28,8 @@ import collections
 import copy
 from typing import Dict, Any, Optional, Tuple, List, Union
 
+import time
+
 import platform
 import sys
 from importlib import metadata
@@ -110,6 +112,117 @@ def _collect_software_environment():
     return environment
 
 # =============================================================================
+# COMPUTATIONAL PROFILE
+# =============================================================================
+
+_EXPERIMENT_START_TIME = None
+
+
+def start_experiment_timer():
+    """
+    Start wall-clock and peak-memory measurement for a complete experiment.
+
+    The timer is started by the command-line entry point before dataset
+    loading, so the reported duration covers data preparation, training,
+    evaluation, and result generation.
+    """
+    global _EXPERIMENT_START_TIME
+
+    _EXPERIMENT_START_TIME = time.perf_counter()
+
+    if torch.cuda.is_available():
+        try:
+            torch.cuda.reset_peak_memory_stats()
+        except Exception:
+            pass
+
+
+def _collect_runtime_profile():
+    """
+    Return runtime and optional CUDA-memory statistics.
+
+    An empty dictionary is returned when the timer was not initialized, such
+    as when a task runner is called directly rather than through main.py.
+    """
+    if _EXPERIMENT_START_TIME is None:
+        return {}
+
+    elapsed_seconds = (
+        time.perf_counter() - _EXPERIMENT_START_TIME
+    )
+
+    profile = {
+        "Total Wall-Clock Time (seconds)": float(
+            elapsed_seconds
+        ),
+    }
+
+    if torch.cuda.is_available():
+        try:
+            peak_memory_bytes = (
+                torch.cuda.max_memory_allocated()
+            )
+
+            profile["Peak CUDA Memory (MiB)"] = (
+                peak_memory_bytes / (1024 ** 2)
+            )
+        except Exception:
+            profile["Peak CUDA Memory (MiB)"] = (
+                "unavailable"
+            )
+
+    return profile
+
+
+def _summarize_model_complexity(model):
+    """
+    Summarize parameter counts and state size for a PyTorch model.
+
+    The reported size covers model parameters and registered buffers. It does
+    not include optimizer state, activations, temporary tensors, or dataset
+    memory.
+    """
+    if model is None:
+        raise ValueError(
+            "model cannot be None when computing model complexity."
+        )
+
+    total_parameters = sum(
+        parameter.numel()
+        for parameter in model.parameters()
+    )
+
+    trainable_parameters = sum(
+        parameter.numel()
+        for parameter in model.parameters()
+        if parameter.requires_grad
+    )
+
+    parameter_bytes = sum(
+        parameter.numel() * parameter.element_size()
+        for parameter in model.parameters()
+    )
+
+    buffer_bytes = sum(
+        buffer.numel() * buffer.element_size()
+        for buffer in model.buffers()
+    )
+
+    model_state_size_mib = (
+        parameter_bytes + buffer_bytes
+    ) / (1024 ** 2)
+
+    return {
+        "Total Model Parameters": int(total_parameters),
+        "Trainable Model Parameters": int(
+            trainable_parameters
+        ),
+        "Model State Size (MiB)": float(
+            model_state_size_mib
+        ),
+    }
+
+# =============================================================================
 # AUTOMATED EXPERIMENT LOGGER
 # =============================================================================
 def _log_experiment_results(task_name, metrics_dict, data_stats, hyperparams, loader=None):
@@ -153,6 +266,8 @@ def _log_experiment_results(task_name, metrics_dict, data_stats, hyperparams, lo
     log_file = results_dir / f"{safe_task_name}.txt"
 
     software_environment = _collect_software_environment()
+
+    runtime_profile = _collect_runtime_profile()
     
     # 6. Format and Append
     with open(log_file, "a", encoding="utf-8") as f:
@@ -182,7 +297,21 @@ def _log_experiment_results(task_name, metrics_dict, data_stats, hyperparams, lo
 
         for key, value in software_environment.items():
             f.write(f"  {key:<28}: {value}\n")
-                    
+
+        if runtime_profile:
+            f.write(f"{'-'*70}\n")
+            f.write("[COMPUTATIONAL PROFILE]\n")
+
+            for key, value in runtime_profile.items():
+                if isinstance(value, float):
+                    f.write(
+                        f"  {key:<36}: {value:.4f}\n"
+                    )
+                else:
+                    f.write(
+                        f"  {key:<36}: {value}\n"
+                    )
+
         f.write(f"{'-'*70}\n")
         f.write("[RESULTS]\n")
         for k, v in metrics_dict.items():
@@ -605,7 +734,11 @@ def run_closed_set_identification(x, y, model_class, epochs=150, batch_size=256,
  
     # 3. Train (Always start with Softmax training)
     model = model_class(in_channels=_detect_channels(x), num_classes=len(classes), include_top=True).to(device)
-    
+
+    hyperparams.update(
+        _summarize_model_complexity(model)
+    )
+
     if intelligent_weight_loading:
         from utils import CacheManager
         cache = CacheManager()
@@ -948,7 +1081,11 @@ def run_closed_set_verification(x, y, model_class, epochs=150, batch_size=256, l
     
     # 7. Train Model
     model = model_class(in_channels=_detect_channels(x), num_classes=len(classes), include_top=True).to(device)
-    
+
+    hyperparams.update(
+        _summarize_model_complexity(model)
+    )
+
     if intelligent_weight_loading:
         from utils import CacheManager
         cache = CacheManager()
@@ -1330,7 +1467,11 @@ def run_subject_disjoint_identification(x, y, model_class, epochs=150, batch_siz
     test_loader = _make_loader(X_test, y_test, batch_size, shuffle=False)
     
     model = model_class(in_channels=_detect_channels(x), num_classes=num_train_classes, include_top=True).to(device)
-    
+
+    hyperparams.update(
+        _summarize_model_complexity(model)
+    )
+
     if intelligent_weight_loading:
         from utils import CacheManager
         cache = CacheManager()
@@ -1704,7 +1845,11 @@ def run_subject_disjoint_verification(x, y, model_class, epochs=150, batch_size=
     test_loader = _make_loader(X_test, y_test, batch_size, shuffle=False)
     
     model = model_class(in_channels=_detect_channels(x), num_classes=num_train_classes, include_top=True).to(device)
-    
+
+    hyperparams.update(
+        _summarize_model_complexity(model)
+    )
+
     if intelligent_weight_loading:
         from utils import CacheManager
         cache = CacheManager()
@@ -2066,7 +2211,11 @@ def run_cross_session_identification(x_train, y_train, x_test, y_test, model_cla
     
     # Train Model
     model = model_class(in_channels=_detect_channels(x_train_full), num_classes=len(classes), include_top=True).to(device)
-    
+
+    hyperparams.update(
+        _summarize_model_complexity(model)
+    )
+
     if intelligent_weight_loading:
         from utils import CacheManager
         cache = CacheManager()
@@ -2384,7 +2533,11 @@ def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class
     
     # Train Model
     model = model_class(in_channels=_detect_channels(x_train_full), num_classes=len(classes), include_top=True).to(device)
-    
+
+    hyperparams.update(
+        _summarize_model_complexity(model)
+    )
+
     if intelligent_weight_loading:
         from utils import CacheManager
         cache = CacheManager()
@@ -2721,7 +2874,11 @@ def run_subject_disjoint_cross_session_identification(
     val_loader_unseen = val_loader_s1
     
     model = model_class(in_channels=_detect_channels(x_s1), num_classes=num_train_classes, include_top=True).to(device)
-    
+
+    hyperparams.update(
+        _summarize_model_complexity(model)
+    )
+
     if intelligent_weight_loading:
         from utils import CacheManager
         cache = CacheManager()
@@ -3037,7 +3194,11 @@ def run_subject_disjoint_cross_session_verification(
     val_loader_unseen = val_loader_s1
     
     model = model_class(in_channels=_detect_channels(x_s1), num_classes=num_train_classes, include_top=True).to(device)
-    
+
+    hyperparams.update(
+        _summarize_model_complexity(model)
+    )
+        
     if intelligent_weight_loading:
         from utils import CacheManager
         cache = CacheManager()

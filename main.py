@@ -570,6 +570,10 @@ def main():
         parser,
     )
 
+    # Measure the complete pipeline, including data loading,
+    # training, evaluation, and saved-result generation.
+    run.start_experiment_timer()
+    
     # ==========================================
     # 1. MODEL SELECTION
     # ==========================================
