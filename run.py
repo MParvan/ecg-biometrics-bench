@@ -36,7 +36,7 @@ from scipy.interpolate import interp1d
 from utils import (
     _apply_score_fusion, _make_loader, _encode_labels, _get_device, _set_seed,
     _apply_outlier_filter, _compute_sqi, _compute_score_matrix,
-    _get_embeddings, _create_templates, _generate_pairs, _apply_score_fusion,
+    _get_embeddings, _create_templates, _generate_pairs,
     _find_optimal_threshold, _evaluate_with_global_threshold,
     _compute_metrics_identification, _compute_metrics_verification,
     _run_training_loop, _run_train_loop_unseen_subjects, _train_epoch, _detect_channels
@@ -532,7 +532,7 @@ def run_closed_set_identification(x, y, model_class, epochs=150, batch_size=256,
         _log_experiment_results(task_title, {"Rank-1 Accuracy": rank1, "Rank-5 Accuracy": rank5}, 
                                 data_stats, hyperparams, loader)
 
-    return _compute_metrics_identification(final_scores, final_labels)
+    return rank1, rank5
 
 # =============================================================================
 # TASK 2: CLOSED-SET VERIFICATION
@@ -864,7 +864,7 @@ def run_closed_set_verification(x, y, model_class, epochs=150, batch_size=256, l
         _log_experiment_results(task_title, {"EER": eer, "AUC": auc_val, "d-prime": dprime, "TAR@0.1%FAR": tar}, 
                                 data_stats, hyperparams, loader)
 
-    return _compute_metrics_verification(scores, labels_pair)
+    return eer, auc_val, dprime, tar
 
 # =============================================================================
 # TASK 3: SUBJECT-DISJOINT IDENTIFICATION (OPEN SET / TEMPLATE MATCHING)
@@ -1210,7 +1210,7 @@ def run_subject_disjoint_identification(x, y, model_class, epochs=150, batch_siz
                                 data_stats, hyperparams, loader)
 
     # 11. Report Identification Metrics
-    return _compute_metrics_identification(final_scores, final_labels)
+    return rank1, rank5
 
 # =============================================================================
 # TASK 4: SUBJECT-DISJOINT VERIFICATION
@@ -1586,7 +1586,7 @@ def run_subject_disjoint_verification(x, y, model_class, epochs=150, batch_size=
         _log_experiment_results(task_title, {"EER": eer, "AUC": auc_val, "d-prime": dprime, "TAR@0.1%FAR": tar}, 
                                 data_stats, hyperparams, loader)
 
-    return _compute_metrics_verification(scores, labels_pair)
+    return eer, auc_val, dprime, tar
 
 # =============================================================================
 # TASK 5: CROSS-SESSION IDENTIFICATION
@@ -1879,7 +1879,7 @@ def run_cross_session_identification(x_train, y_train, x_test, y_test, model_cla
                                 data_stats, hyperparams, loader)
 
     # 8. Report Identification Metrics
-    return _compute_metrics_identification(final_scores, final_labels)
+    return rank1, rank5
 
 # =============================================================================
 # TASK 6: CROSS-SESSION VERIFICATION
@@ -2191,7 +2191,7 @@ def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class
                                 data_stats, hyperparams, loader)
 
     # 9. Report Verification Metrics
-    return _compute_metrics_verification(scores, labels_pair)
+    return eer, auc_val, dprime, tar
 
 # =============================================================================
 # TASK 7: SUBJECT-DISJOINT CROSS-SESSION IDENTIFICATION
@@ -2487,7 +2487,7 @@ def run_subject_disjoint_cross_session_identification(
         _log_experiment_results(task_title, {"Rank-1 Accuracy": rank1, "Rank-5 Accuracy": rank5}, 
                                 data_stats, hyperparams, loader)
 
-    return _compute_metrics_identification(final_scores, final_labels)
+    return rank1, rank5
 
 
 # =============================================================================
@@ -2811,5 +2811,5 @@ def run_subject_disjoint_cross_session_verification(
         _log_experiment_results(task_title, {"EER": eer, "AUC": auc_val, "d-prime": dprime, "TAR@0.1%FAR": tar}, 
                                 data_stats, hyperparams, loader)
 
-    return _compute_metrics_verification(scores, labels_pair)
+    return eer, auc_val, dprime, tar
 # =============================================================================
