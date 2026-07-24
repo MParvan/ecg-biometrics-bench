@@ -28,6 +28,10 @@ import collections
 import copy
 from typing import Dict, Any, Optional, Tuple, List, Union
 
+import platform
+import sys
+from importlib import metadata
+
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import roc_curve, auc
 from scipy.optimize import brentq
@@ -50,6 +54,60 @@ import datetime
 from pathlib import Path
 
 from visualizations import Visualizer
+
+# =============================================================================
+# REPRODUCIBILITY ENVIRONMENT
+# =============================================================================
+
+def _get_installed_package_version(distribution_name):
+    """
+    Return the installed version of a Python distribution.
+
+    Missing optional dependencies are reported explicitly rather than
+    causing experiment logging to fail.
+    """
+    try:
+        return metadata.version(distribution_name)
+    except metadata.PackageNotFoundError:
+        return "not installed"
+
+
+def _collect_software_environment():
+    """
+    Collect the software and hardware environment used by an experiment.
+    """
+    environment = {
+        "Python": platform.python_version(),
+        "Operating System": platform.platform(),
+        "PyTorch": str(torch.__version__),
+        "CUDA Available": bool(torch.cuda.is_available()),
+        "CUDA Runtime": (
+            str(torch.version.cuda)
+            if torch.version.cuda is not None
+            else "not available"
+        ),
+        "NumPy": _get_installed_package_version("numpy"),
+        "SciPy": _get_installed_package_version("scipy"),
+        "scikit-learn": _get_installed_package_version(
+            "scikit-learn"
+        ),
+        "pandas": _get_installed_package_version("pandas"),
+        "NeuroKit2": _get_installed_package_version(
+            "neurokit2"
+        ),
+        "WFDB": _get_installed_package_version("wfdb"),
+        "PyYAML": _get_installed_package_version("PyYAML"),
+    }
+
+    if torch.cuda.is_available():
+        try:
+            environment["CUDA Device"] = (
+                torch.cuda.get_device_name(0)
+            )
+        except Exception:
+            environment["CUDA Device"] = "unavailable"
+
+    return environment
 
 # =============================================================================
 # AUTOMATED EXPERIMENT LOGGER
@@ -93,6 +151,8 @@ def _log_experiment_results(task_name, metrics_dict, data_stats, hyperparams, lo
     # (e.g., "Closed-Set Identification" -> "Closed-Set_Identification.txt")
     safe_task_name = str(task_name).replace(" ", "_").replace("/", "_").replace("\\", "_")
     log_file = results_dir / f"{safe_task_name}.txt"
+
+    software_environment = _collect_software_environment()
     
     # 6. Format and Append
     with open(log_file, "a", encoding="utf-8") as f:
@@ -116,7 +176,13 @@ def _log_experiment_results(task_name, metrics_dict, data_stats, hyperparams, lo
             f.write("[DATASET & PREPROCESSING SETTINGS]\n")
             for k, v in dataset_kwargs.items():
                 f.write(f"  {k:<28}: {v}\n")
-                
+
+        f.write(f"{'-'*70}\n")
+        f.write("[SOFTWARE & HARDWARE ENVIRONMENT]\n")
+
+        for key, value in software_environment.items():
+            f.write(f"  {key:<28}: {value}\n")
+                    
         f.write(f"{'-'*70}\n")
         f.write("[RESULTS]\n")
         for k, v in metrics_dict.items():
