@@ -12,13 +12,16 @@ from scipy.stats import trim_mean, kurtosis
 from scipy.spatial.distance import cdist, correlation
 from scipy.interpolate import interp1d
 
+import pickle
+import tempfile
+import zipfile
+
 import os
 import hashlib
 import json
 
 import torch
 from torch.utils.data import Dataset, DataLoader,TensorDataset
-from scipy.stats import kurtosis
 from sklearn.metrics import roc_curve, auc
 
 # =============================================================================
@@ -992,6 +995,61 @@ def _generate_config_hash(config_dict):
     config_str = json.dumps(config_dict, sort_keys=True, default=str)
     return hashlib.md5(config_str.encode('utf-8')).hexdigest()[:12]
 
+def _atomic_write_file(final_path, writer):
+    """
+    Write a file through a temporary path and atomically replace the target.
+
+    The temporary file is created in the destination directory so
+    ``os.replace`` remains atomic on the same filesystem.
+    """
+    final_path = os.fspath(final_path)
+    directory = os.path.dirname(final_path) or "."
+
+    os.makedirs(
+        directory,
+        exist_ok=True,
+    )
+
+    suffix = os.path.splitext(final_path)[1]
+
+    file_descriptor, temporary_path = tempfile.mkstemp(
+        dir=directory,
+        prefix=f".{os.path.basename(final_path)}.",
+        suffix=suffix,
+    )
+
+    os.close(file_descriptor)
+
+    try:
+        writer(temporary_path)
+        os.replace(
+            temporary_path,
+            final_path,
+        )
+
+    finally:
+        if os.path.exists(temporary_path):
+            try:
+                os.remove(temporary_path)
+            except OSError:
+                pass
+
+
+def _remove_cache_files(*paths):
+    """
+    Remove unusable cache files without masking the original cache failure.
+    """
+    for path in paths:
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+        except OSError as error:
+            print(
+                "[WARN] Could not remove unusable cache file "
+                f"'{path}': {error}"
+            )
+
 class CacheManager:
     def __init__(self, base_dir="precomputed"):
         self.data_dir = os.path.join(base_dir, "data")
@@ -1000,17 +1058,112 @@ class CacheManager:
         os.makedirs(self.weight_dir, exist_ok=True)
 
     def get_data_cache(self, config_dict):
-        uid = _generate_config_hash(config_dict)
-        data_path = os.path.join(self.data_dir, f"{uid}.npz")
-        if os.path.exists(data_path):
-            data = np.load(data_path, allow_pickle=True)
-            return {k: data[k] for k in data.files}, uid
-        return None, uid
+        """
+        Load a cached array collection.
 
-    def save_data_cache(self, arrays_dict, config_dict, uid):
-        np.savez_compressed(os.path.join(self.data_dir, f"{uid}.npz"), **arrays_dict)
-        with open(os.path.join(self.data_dir, f"{uid}.json"), "w") as f:
-            json.dump(config_dict, f, indent=4, default=str)
+        Corrupted or incomplete cache entries are removed and treated as cache
+        misses, allowing the calling pipeline to regenerate them.
+        """
+        uid = _generate_config_hash(
+            config_dict
+        )
+
+        data_path = os.path.join(
+            self.data_dir,
+            f"{uid}.npz",
+        )
+
+        metadata_path = os.path.join(
+            self.data_dir,
+            f"{uid}.json",
+        )
+
+        if not os.path.exists(data_path):
+            return None, uid
+
+        try:
+            # The context manager is important on Windows because it closes
+            # the underlying ZIP file before this method returns.
+            with np.load(
+                data_path,
+                allow_pickle=True,
+            ) as cached_data:
+                arrays = {
+                    key: cached_data[key]
+                    for key in cached_data.files
+                }
+
+        except (
+            OSError,
+            ValueError,
+            EOFError,
+            pickle.UnpicklingError,
+            zipfile.BadZipFile,
+        ) as error:
+            print(
+                "[WARN] Data cache entry "
+                f"{uid} is unreadable and will be regenerated: "
+                f"{error}"
+            )
+
+            _remove_cache_files(
+                data_path,
+                metadata_path,
+            )
+
+            return None, uid
+
+        return arrays, uid
+
+    def save_data_cache(
+        self,
+        arrays_dict,
+        config_dict,
+        uid,
+    ):
+        """
+        Save data-cache arrays and metadata using atomic file replacement.
+        """
+        data_path = os.path.join(
+            self.data_dir,
+            f"{uid}.npz",
+        )
+
+        metadata_path = os.path.join(
+            self.data_dir,
+            f"{uid}.json",
+        )
+
+        def write_metadata(temporary_path):
+            with open(
+                temporary_path,
+                "w",
+                encoding="utf-8",
+            ) as metadata_file:
+                json.dump(
+                    config_dict,
+                    metadata_file,
+                    indent=4,
+                    default=str,
+                )
+
+        def write_arrays(temporary_path):
+            np.savez_compressed(
+                temporary_path,
+                **arrays_dict,
+            )
+
+        # The payload is written last because its existence is used as the
+        # cache-hit indicator by get_data_cache().
+        _atomic_write_file(
+            metadata_path,
+            write_metadata,
+        )
+
+        _atomic_write_file(
+            data_path,
+            write_arrays,
+        )
 
     def get_weight_cache(
         self,
@@ -1019,12 +1172,15 @@ class CacheManager:
         device,
     ):
         """
-        Load cached model weights and their training metadata.
+        Load cached model weights and associated training metadata.
 
-        Older cache entries without ``actual_epochs`` remain supported by
-        falling back to the configured maximum epoch count.
+        Unreadable or incompatible cache entries are removed and treated
+        as cache misses. If loading fails after partially modifying the
+        model, its original initialization is restored.
         """
-        uid = _generate_config_hash(config_dict)
+        uid = _generate_config_hash(
+            config_dict
+        )
 
         weight_path = os.path.join(
             self.weight_dir,
@@ -1039,13 +1195,49 @@ class CacheManager:
         if not os.path.exists(weight_path):
             return None, uid
 
-        model.load_state_dict(
-            torch.load(
+        # Preserve the model's initial state because load_state_dict()
+        # can partially modify a model before reporting an error.
+        original_model_state = copy.deepcopy(
+            model.state_dict()
+        )
+
+        try:
+            cached_state = torch.load(
                 weight_path,
                 map_location=device,
             )
-        )
 
+            model.load_state_dict(
+                cached_state
+            )
+
+        except (
+            OSError,
+            EOFError,
+            RuntimeError,
+            ValueError,
+            TypeError,
+            pickle.UnpicklingError,
+        ) as error:
+            model.load_state_dict(
+                original_model_state
+            )
+
+            print(
+                "[WARN] Weight cache entry "
+                f"{uid} is unreadable or incompatible and "
+                f"will be regenerated: {error}"
+            )
+
+            _remove_cache_files(
+                weight_path,
+                metadata_path,
+            )
+
+            return None, uid
+
+        # Use the configured maximum epoch count as a fallback for older
+        # cache entries that do not contain actual_epochs metadata.
         actual_epochs = config_dict.get(
             "epochs"
         )
@@ -1097,10 +1289,10 @@ class CacheManager:
         uid,
     ):
         """
-        Save model weights and training metadata.
+        Save model weights and training metadata atomically.
 
-        The input configuration is copied so adding metadata does not modify
-        the dictionary used to generate the cache identity.
+        The configuration is copied before actual_epochs is added, so the
+        dictionary used to generate the cache identity remains unchanged.
         """
         weight_path = os.path.join(
             self.weight_dir,
@@ -1110,11 +1302,6 @@ class CacheManager:
         metadata_path = os.path.join(
             self.weight_dir,
             f"{uid}.json",
-        )
-
-        torch.save(
-            model.state_dict(),
-            weight_path,
         )
 
         cache_metadata = dict(
@@ -1139,15 +1326,34 @@ class CacheManager:
                 "actual_epochs"
             ] = actual_epochs
 
-        with open(
-            metadata_path,
-            "w",
-            encoding="utf-8",
-        ) as metadata_file:
-            json.dump(
-                cache_metadata,
-                metadata_file,
-                indent=4,
-                default=str,
+        def write_metadata(temporary_path):
+            with open(
+                temporary_path,
+                "w",
+                encoding="utf-8",
+            ) as metadata_file:
+                json.dump(
+                    cache_metadata,
+                    metadata_file,
+                    indent=4,
+                    default=str,
+                )
+
+        def write_weights(temporary_path):
+            torch.save(
+                model.state_dict(),
+                temporary_path,
             )
+
+        # Metadata is written first. The weight file is written last
+        # because its existence indicates that the cache entry is ready.
+        _atomic_write_file(
+            metadata_path,
+            write_metadata,
+        )
+
+        _atomic_write_file(
+            weight_path,
+            write_weights,
+        )
 
