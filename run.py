@@ -952,6 +952,172 @@ def _partition_subject_disjoint_cross_session_samples(
         "probe": probe_partition,
     }
 
+def _split_enrollment_probe_embeddings(
+    embeddings,
+    labels,
+    subjects,
+    template_size,
+):
+    """
+    Split each subject's ordered embeddings into enrollment and probe sets.
+
+    The first ``template_size`` embeddings of every subject are assigned to
+    enrollment. All remaining embeddings from that subject are assigned to
+    the probe set. Input order is preserved within every subject.
+    """
+    embeddings = np.asarray(
+        embeddings
+    )
+
+    labels = np.asarray(
+        labels
+    )
+
+    subjects = np.asarray(
+        subjects
+    )
+
+    if embeddings.ndim != 2:
+        raise ValueError(
+            "embeddings must be a two-dimensional array."
+        )
+
+    if labels.ndim != 1:
+        raise ValueError(
+            "labels must be a one-dimensional array."
+        )
+
+    if subjects.ndim != 1:
+        raise ValueError(
+            "subjects must be a one-dimensional array."
+        )
+
+    if len(embeddings) != len(labels):
+        raise ValueError(
+            "embeddings and labels must contain the "
+            "same number of samples."
+        )
+
+    if isinstance(
+        template_size,
+        (
+            bool,
+            np.bool_,
+        ),
+    ) or not isinstance(
+        template_size,
+        (
+            int,
+            np.integer,
+        ),
+    ):
+        raise ValueError(
+            "template_size must be a positive integer."
+        )
+
+    template_size = int(
+        template_size
+    )
+
+    if template_size < 1:
+        raise ValueError(
+            "template_size must be a positive integer."
+        )
+
+    if len(subjects) == 0:
+        raise ValueError(
+            "At least one subject is required."
+        )
+
+    if len(np.unique(subjects)) != len(subjects):
+        raise ValueError(
+            "subjects must not contain duplicate entries."
+        )
+
+    available_subjects = set(
+        np.unique(labels).tolist()
+    )
+
+    requested_subjects = set(
+        subjects.tolist()
+    )
+
+    if requested_subjects != available_subjects:
+        raise ValueError(
+            "subjects must match exactly the subjects "
+            "present in labels."
+        )
+
+    enrollment_embeddings = []
+    enrollment_labels = []
+
+    probe_embeddings = []
+    probe_labels = []
+
+    for subject in subjects:
+        subject_indices = np.flatnonzero(
+            labels == subject
+        )
+
+        if len(subject_indices) <= template_size:
+            raise ValueError(
+                f"Subject {subject!r} has "
+                f"{len(subject_indices)} samples, but "
+                f"template_size={template_size} requires "
+                "at least one additional probe sample."
+            )
+
+        enrollment_indices = subject_indices[
+            :template_size
+        ]
+
+        probe_indices = subject_indices[
+            template_size:
+        ]
+
+        enrollment_embeddings.append(
+            embeddings[
+                enrollment_indices
+            ]
+        )
+
+        enrollment_labels.append(
+            labels[
+                enrollment_indices
+            ]
+        )
+
+        probe_embeddings.append(
+            embeddings[
+                probe_indices
+            ]
+        )
+
+        probe_labels.append(
+            labels[
+                probe_indices
+            ]
+        )
+
+    return {
+        "enrollment": (
+            np.vstack(
+                enrollment_embeddings
+            ),
+            np.concatenate(
+                enrollment_labels
+            ),
+        ),
+        "probe": (
+            np.vstack(
+                probe_embeddings
+            ),
+            np.concatenate(
+                probe_labels
+            ),
+        ),
+    }
+
 # =============================================================================
 # MULTI-RUN ARGUMENT HANDLING
 # =============================================================================
@@ -2199,28 +2365,43 @@ def run_subject_disjoint_identification(x, y, model_class, epochs=150, batch_siz
     model.include_top = False
     test_emb, test_lab = _get_embeddings(model, test_loader, device)
 
-    print(f"[INFO] Splitting Test Data: First {template_size} beats = Gallery, Rest = Probe")
-    enroll_embs_list, enroll_y_list = [], []
-    probe_embs_list, probe_y_list = [], []
-    
-    # Map disjoint test subject IDs to 0..N_test-1 for the identification metric array
-    test_sub_map = {sub: i for i, sub in enumerate(test_subs_final)}
-    
-    for sub in test_subs_final:
-        sub_idxs = np.where(test_lab == sub)[0]
-        # We already guaranteed sub_idxs > template_size in Step 5!
-        enroll_idx = sub_idxs[:template_size]
-        probe_idx = sub_idxs[template_size:]
-        
-        enroll_embs_list.append(test_emb[enroll_idx])
-        enroll_y_list.append(test_lab[enroll_idx])
-        probe_embs_list.append(test_emb[probe_idx])
-        probe_y_list.append(test_lab[probe_idx])
+    print(
+        "[INFO] Splitting Test Data: "
+        f"First {template_size} beats = Gallery, "
+        "Rest = Probe"
+    )
 
-    emb_enroll = np.vstack(enroll_embs_list)
-    lab_enroll = np.concatenate(enroll_y_list)
-    emb_probe = np.vstack(probe_embs_list)
-    lab_probe = np.concatenate(probe_y_list)
+    # Map disjoint test subject IDs to 0..N_test-1
+    # for the identification metric array.
+    test_sub_map = {
+        subject: index
+        for index, subject in enumerate(
+            test_subs_final
+        )
+    }
+
+    enrollment_probe_partitions = (
+        _split_enrollment_probe_embeddings(
+            test_emb,
+            test_lab,
+            subjects=test_subs_final,
+            template_size=template_size,
+        )
+    )
+
+    (
+        emb_enroll,
+        lab_enroll,
+    ) = enrollment_probe_partitions[
+        "enrollment"
+    ]
+
+    (
+        emb_probe,
+        lab_probe,
+    ) = enrollment_probe_partitions[
+        "probe"
+    ]
     
     # 8. Apply Template Fusion Strategy to the Gallery
     gallery_emb, gallery_lab = _create_templates(
@@ -2654,30 +2835,34 @@ def run_subject_disjoint_verification(x, y, model_class, epochs=150, batch_size=
             num_pairs=num_pairs, sampling_mode=sampling_mode, matching_method=matching_method
         )
     else:
-        print(f"[INFO] Splitting Test Data: First {template_size} beats = Enroll, Rest = Probe")
-        enroll_embs_list, enroll_y_list = [], []
-        probe_embs_list, probe_y_list = [], []
-        
-        # Use test_subs_final to guarantee valid indexing
-        for sub in test_subs_final:
-            sub_idxs = np.where(test_lab == sub)[0]
-            
-            enroll_idx = sub_idxs[:template_size]
-            probe_idx = sub_idxs[template_size:]
-            
-            enroll_embs_list.append(test_emb[enroll_idx])
-            enroll_y_list.append(test_lab[enroll_idx])
-            probe_embs_list.append(test_emb[probe_idx])
-            probe_y_list.append(test_lab[probe_idx])
-            
-        if len(enroll_embs_list) == 0:
-            print("[WARN] Not enough beats per subject for this template size.")
-            return 0.0, 0.0, 0.0, 0.0
+        print(
+            "[INFO] Splitting Test Data: "
+            f"First {template_size} beats = Enroll, "
+            "Rest = Probe"
+        )
 
-        emb_enroll = np.vstack(enroll_embs_list)
-        lab_enroll = np.concatenate(enroll_y_list)
-        emb_probe = np.vstack(probe_embs_list)
-        lab_probe = np.concatenate(probe_y_list)
+        enrollment_probe_partitions = (
+            _split_enrollment_probe_embeddings(
+                test_emb,
+                test_lab,
+                subjects=test_subs_final,
+                template_size=template_size,
+            )
+        )
+
+        (
+            emb_enroll,
+            lab_enroll,
+        ) = enrollment_probe_partitions[
+            "enrollment"
+        ]
+
+        (
+            emb_probe,
+            lab_probe,
+        ) = enrollment_probe_partitions[
+            "probe"
+        ]
         
         templates, temp_labels = _create_templates(
             emb_enroll, lab_enroll, method=template_fusion_method, max_beats=None
