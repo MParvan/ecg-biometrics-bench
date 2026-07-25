@@ -640,6 +640,318 @@ def _split_subject_cohorts(
         test_subjects,
     )
 
+def _partition_subject_disjoint_samples(
+    x,
+    y,
+    train_subjects,
+    validation_subjects,
+    test_subjects,
+    sqi_scores=None,
+):
+    """
+    Assign intra-session samples to disjoint subject cohorts.
+
+    Training and validation samples are used for representation learning.
+    Test-subject samples are reserved for gallery/enrollment and probe
+    construction inside the subject-disjoint task runner.
+    """
+    x = np.asarray(x)
+    y = np.asarray(y)
+
+    if y.ndim != 1:
+        raise ValueError(
+            "y must be a one-dimensional label array."
+        )
+
+    if len(x) != len(y):
+        raise ValueError(
+            "x and y must contain the same number of samples."
+        )
+
+    if sqi_scores is not None:
+        sqi_scores = np.asarray(
+            sqi_scores
+        )
+
+        if len(sqi_scores) != len(y):
+            raise ValueError(
+                "sqi_scores must contain one value per sample."
+            )
+
+    train_subjects = np.asarray(
+        train_subjects
+    )
+    validation_subjects = np.asarray(
+        validation_subjects
+    )
+    test_subjects = np.asarray(
+        test_subjects
+    )
+
+    for cohort_name, cohort in [
+        ("train_subjects", train_subjects),
+        (
+            "validation_subjects",
+            validation_subjects,
+        ),
+        ("test_subjects", test_subjects),
+    ]:
+        if cohort.ndim != 1:
+            raise ValueError(
+                f"{cohort_name} must be one-dimensional."
+            )
+
+    train_set = set(
+        train_subjects.tolist()
+    )
+
+    validation_set = set(
+        validation_subjects.tolist()
+    )
+
+    test_set = set(
+        test_subjects.tolist()
+    )
+
+    if train_set & validation_set:
+        raise ValueError(
+            "Train and validation subjects overlap."
+        )
+
+    if train_set & test_set:
+        raise ValueError(
+            "Train and test subjects overlap."
+        )
+
+    if validation_set & test_set:
+        raise ValueError(
+            "Validation and test subjects overlap."
+        )
+
+    available_subjects = set(
+        np.unique(y).tolist()
+    )
+
+    assigned_subjects = (
+        train_set
+        | validation_set
+        | test_set
+    )
+
+    if assigned_subjects != available_subjects:
+        raise ValueError(
+            "The subject cohorts must cover exactly all "
+            "subjects present in y."
+        )
+
+    def select_samples(subjects):
+        mask = np.isin(
+            y,
+            subjects,
+        )
+
+        selected_sqi = (
+            sqi_scores[mask]
+            if sqi_scores is not None
+            else None
+        )
+
+        return (
+            x[mask],
+            y[mask],
+            selected_sqi,
+        )
+
+    train_partition = select_samples(
+        train_subjects
+    )
+
+    if len(validation_subjects) > 0:
+        validation_partition = select_samples(
+            validation_subjects
+        )
+    else:
+        validation_partition = (
+            None,
+            None,
+            None,
+        )
+
+    test_partition = select_samples(
+        test_subjects
+    )
+
+    return {
+        "train": train_partition,
+        "validation": validation_partition,
+        "test": test_partition,
+    }
+
+
+def _partition_subject_disjoint_cross_session_samples(
+    x_s1,
+    y_s1,
+    x_s2,
+    y_s2,
+    train_subjects,
+    validation_subjects,
+    test_subjects,
+):
+    """
+    Assign cross-session samples while enforcing temporal isolation.
+
+    Session 1 supplies:
+        - representation-learning samples;
+        - unseen-subject validation samples;
+        - held-out-subject enrollment samples.
+
+    Session 2 supplies:
+        - held-out-subject probe samples.
+    """
+    x_s1 = np.asarray(x_s1)
+    y_s1 = np.asarray(y_s1)
+    x_s2 = np.asarray(x_s2)
+    y_s2 = np.asarray(y_s2)
+
+    if y_s1.ndim != 1 or y_s2.ndim != 1:
+        raise ValueError(
+            "Session labels must be one-dimensional."
+        )
+
+    if len(x_s1) != len(y_s1):
+        raise ValueError(
+            "Session 1 samples and labels are misaligned."
+        )
+
+    if len(x_s2) != len(y_s2):
+        raise ValueError(
+            "Session 2 samples and labels are misaligned."
+        )
+
+    train_subjects = np.asarray(
+        train_subjects
+    )
+    validation_subjects = np.asarray(
+        validation_subjects
+    )
+    test_subjects = np.asarray(
+        test_subjects
+    )
+
+    for cohort_name, cohort in [
+        ("train_subjects", train_subjects),
+        (
+            "validation_subjects",
+            validation_subjects,
+        ),
+        ("test_subjects", test_subjects),
+    ]:
+        if cohort.ndim != 1:
+            raise ValueError(
+                f"{cohort_name} must be one-dimensional."
+            )
+
+    train_set = set(
+        train_subjects.tolist()
+    )
+
+    validation_set = set(
+        validation_subjects.tolist()
+    )
+
+    test_set = set(
+        test_subjects.tolist()
+    )
+
+    if train_set & validation_set:
+        raise ValueError(
+            "Train and validation subjects overlap."
+        )
+
+    if train_set & test_set:
+        raise ValueError(
+            "Train and test subjects overlap."
+        )
+
+    if validation_set & test_set:
+        raise ValueError(
+            "Validation and test subjects overlap."
+        )
+
+    common_subjects = (
+        set(
+            np.unique(y_s1).tolist()
+        )
+        & set(
+            np.unique(y_s2).tolist()
+        )
+    )
+
+    assigned_subjects = (
+        train_set
+        | validation_set
+        | test_set
+    )
+
+    if assigned_subjects != common_subjects:
+        raise ValueError(
+            "The subject cohorts must cover exactly the "
+            "subjects shared by Session 1 and Session 2."
+        )
+
+    train_mask_s1 = np.isin(
+        y_s1,
+        train_subjects,
+    )
+
+    validation_mask_s1 = np.isin(
+        y_s1,
+        validation_subjects,
+    )
+
+    enrollment_mask_s1 = np.isin(
+        y_s1,
+        test_subjects,
+    )
+
+    probe_mask_s2 = np.isin(
+        y_s2,
+        test_subjects,
+    )
+
+    train_partition = (
+        x_s1[train_mask_s1],
+        y_s1[train_mask_s1],
+    )
+
+    if len(validation_subjects) > 0:
+        validation_partition = (
+            x_s1[validation_mask_s1],
+            y_s1[validation_mask_s1],
+        )
+    else:
+        validation_partition = (
+            None,
+            None,
+        )
+
+    enrollment_partition = (
+        x_s1[enrollment_mask_s1],
+        y_s1[enrollment_mask_s1],
+    )
+
+    probe_partition = (
+        x_s2[probe_mask_s2],
+        y_s2[probe_mask_s2],
+    )
+
+    return {
+        "train": train_partition,
+        "validation": validation_partition,
+        "enrollment": enrollment_partition,
+        "probe": probe_partition,
+    }
+
 # =============================================================================
 # MULTI-RUN ARGUMENT HANDLING
 # =============================================================================
@@ -1733,45 +2045,41 @@ def run_subject_disjoint_identification(x, y, model_class, epochs=150, batch_siz
         seed=seed,
     )
 
-    if len(val_subs) > 0:
-        val_mask = np.isin(
+    partitions = (
+        _partition_subject_disjoint_samples(
+            x,
             y_enc,
-            val_subs,
+            train_subjects=train_subs,
+            validation_subjects=val_subs,
+            test_subjects=test_subs,
+            sqi_scores=sqi_scores,
         )
+    )
 
-        X_val = x[val_mask]
-        y_val = y_enc[val_mask]
+    (
+        X_train,
+        y_train,
+        sqi_train,
+    ) = partitions["train"]
 
-        if sqi_scores is not None:
-            sqi_val = sqi_scores[
-                val_mask
-            ]
+    (
+        X_val,
+        y_val,
+        sqi_val,
+    ) = partitions["validation"]
 
-        print(
-            "Subject Split: "
-            f"Train={len(train_subs)}, "
-            f"Val={len(val_subs)}, "
-            f"Test={len(test_subs)}"
-        )
-    else:
-        X_val = None
-        y_val = None
-        sqi_val = None
+    (
+        X_test,
+        y_test,
+        sqi_test,
+    ) = partitions["test"]
 
-        print(
-            "Subject Split: "
-            f"Train={len(train_subs)}, "
-            "Val=0, "
-            f"Test={len(test_subs)}"
-        )
-
-    train_mask = np.isin(y_enc, train_subs)
-    X_train, y_train = x[train_mask], y_enc[train_mask]
-    if sqi_scores is not None: sqi_train = sqi_scores[train_mask]
-    
-    test_mask = np.isin(y_enc, test_subs)
-    X_test, y_test = x[test_mask], y_enc[test_mask]
-    if sqi_scores is not None: sqi_test = sqi_scores[test_mask]
+    print(
+        "Subject Split: "
+        f"Train={len(train_subs)}, "
+        f"Val={len(val_subs)}, "
+        f"Test={len(test_subs)}"
+    )
 
     # ====================================================
     # 4. APPLY SQI FILTERS
@@ -2156,25 +2464,34 @@ def run_subject_disjoint_verification(x, y, model_class, epochs=150, batch_size=
         seed=seed,
     )
 
-    if len(val_subs) > 0:
-        val_mask = np.isin(
+    partitions = (
+        _partition_subject_disjoint_samples(
+            x,
             y_enc,
-            val_subs,
+            train_subjects=train_subs,
+            validation_subjects=val_subs,
+            test_subjects=test_subs,
+            sqi_scores=sqi_scores,
         )
+    )
 
-        X_val = x[val_mask]
-        y_val = y_enc[val_mask]
+    (
+        X_train,
+        y_train,
+        sqi_train,
+    ) = partitions["train"]
 
-        if sqi_scores is not None:
-            sqi_val = sqi_scores[
-                val_mask
-            ]
-        else:
-            sqi_val = None
-    else:
-        X_val = None
-        y_val = None
-        sqi_val = None
+    (
+        X_val,
+        y_val,
+        sqi_val,
+    ) = partitions["validation"]
+
+    (
+        X_test,
+        y_test,
+        sqi_test,
+    ) = partitions["test"]
 
     print(
         "Subject Split: "
@@ -2182,14 +2499,6 @@ def run_subject_disjoint_verification(x, y, model_class, epochs=150, batch_size=
         f"Val={len(val_subs)}, "
         f"Test={len(test_subs)}"
     )
-
-    train_mask = np.isin(y_enc, train_subs)
-    X_train, y_train = x[train_mask], y_enc[train_mask]
-    if sqi_scores is not None: sqi_train = sqi_scores[train_mask]
-    
-    test_mask = np.isin(y_enc, test_subs)
-    X_test, y_test = x[test_mask], y_enc[test_mask]
-    if sqi_scores is not None: sqi_test = sqi_scores[test_mask]
 
     # ====================================================
     # 4. APPLY SQI FILTERS
@@ -3286,14 +3595,37 @@ def run_subject_disjoint_cross_session_identification(
         f"Test={len(test_subs)}"
     )
 
-    # Extract respective datasets based on the disjoint subject split
-    X_train, Y_train = x_s1[np.isin(y_s1, train_subs)], y_s1[np.isin(y_s1, train_subs)]
-    
-    # STRICT TEMPORAL ISOLATION: Validation uses ONLY Session 1 data
-    X_val_s1, Y_val_s1 = (x_s1[np.isin(y_s1, val_subs)], y_s1[np.isin(y_s1, val_subs)]) if len(val_subs) > 0 else (None, None)
-    
-    X_enroll, Y_enroll = x_s1[np.isin(y_s1, test_subs)], y_s1[np.isin(y_s1, test_subs)]
-    X_probe, Y_probe = x_s2[np.isin(y_s2, test_subs)], y_s2[np.isin(y_s2, test_subs)]
+    partitions = (
+        _partition_subject_disjoint_cross_session_samples(
+            x_s1,
+            y_s1,
+            x_s2,
+            y_s2,
+            train_subjects=train_subs,
+            validation_subjects=val_subs,
+            test_subjects=test_subs,
+        )
+    )
+
+    (
+        X_train,
+        Y_train,
+    ) = partitions["train"]
+
+    (
+        X_val_s1,
+        Y_val_s1,
+    ) = partitions["validation"]
+
+    (
+        X_enroll,
+        Y_enroll,
+    ) = partitions["enrollment"]
+
+    (
+        X_probe,
+        Y_probe,
+    ) = partitions["probe"]
 
     # ====================================================
     # 3. ENCODE LABELS (CRITICAL FIX FOR PYTORCH TENSORS)
@@ -3629,13 +3961,37 @@ def run_subject_disjoint_cross_session_verification(
         f"Test={len(test_subs)}"
     )
 
-    X_train, Y_train = x_s1[np.isin(y_s1, train_subs)], y_s1[np.isin(y_s1, train_subs)]
-    
-    # STRICT TEMPORAL ISOLATION: Validation uses ONLY Session 1 data
-    X_val_s1, Y_val_s1 = (x_s1[np.isin(y_s1, val_subs)], y_s1[np.isin(y_s1, val_subs)]) if len(val_subs) > 0 else (None, None)
-    
-    X_enroll, Y_enroll = x_s1[np.isin(y_s1, test_subs)], y_s1[np.isin(y_s1, test_subs)]
-    X_probe, Y_probe = x_s2[np.isin(y_s2, test_subs)], y_s2[np.isin(y_s2, test_subs)]
+    partitions = (
+        _partition_subject_disjoint_cross_session_samples(
+            x_s1,
+            y_s1,
+            x_s2,
+            y_s2,
+            train_subjects=train_subs,
+            validation_subjects=val_subs,
+            test_subjects=test_subs,
+        )
+    )
+
+    (
+        X_train,
+        Y_train,
+    ) = partitions["train"]
+
+    (
+        X_val_s1,
+        Y_val_s1,
+    ) = partitions["validation"]
+
+    (
+        X_enroll,
+        Y_enroll,
+    ) = partitions["enrollment"]
+
+    (
+        X_probe,
+        Y_probe,
+    ) = partitions["probe"]
 
     # ====================================================
     # 3. ENCODE LABELS (CRITICAL FIX FOR PYTORCH TENSORS)
