@@ -26,6 +26,8 @@ import numpy as np
 import random
 import collections
 import copy
+from collections.abc import Mapping
+from inspect import signature
 from typing import Dict, Any, Optional, Tuple, List, Union
 
 import time
@@ -58,6 +60,7 @@ import datetime
 from pathlib import Path
 
 from visualizations import Visualizer
+from data_augmentation import ECGAugmentation
 
 # =============================================================================
 # REPRODUCIBILITY ENVIRONMENT
@@ -1118,6 +1121,393 @@ def _split_enrollment_probe_embeddings(
         ),
     }
 
+
+def _normalize_augmentation_config(
+    augmentation_config,
+):
+    """
+    Validate and normalize training-only augmentation settings.
+
+    The returned mapping is safe to record in experiment metadata and model
+    weight-cache identities.
+    """
+    normalized = {
+        "enabled": False,
+        "method": "gaussian",
+        "copies": 1,
+        "parameters": {},
+    }
+
+    if augmentation_config is None:
+        return normalized
+
+    if not isinstance(
+        augmentation_config,
+        Mapping,
+    ):
+        raise ValueError(
+            "augmentation_config must be a mapping or None."
+        )
+
+    allowed_keys = set(
+        normalized
+    )
+
+    unknown_keys = (
+        set(augmentation_config)
+        - allowed_keys
+    )
+
+    if unknown_keys:
+        raise ValueError(
+            "Unknown augmentation_config key(s): "
+            + ", ".join(
+                sorted(
+                    str(key)
+                    for key in unknown_keys
+                )
+            )
+        )
+
+    normalized.update(
+        dict(augmentation_config)
+    )
+
+    if not isinstance(
+        normalized["enabled"],
+        (
+            bool,
+            np.bool_,
+        ),
+    ):
+        raise ValueError(
+            "augmentation_config['enabled'] must be Boolean."
+        )
+
+    method = normalized["method"]
+
+    if not isinstance(
+        method,
+        str,
+    ) or not method.strip():
+        raise ValueError(
+            "augmentation_config['method'] must be a "
+            "non-empty string."
+        )
+
+    method = (
+        method
+        .strip()
+        .lower()
+        .replace("-", "_")
+        .replace(" ", "_")
+    )
+
+    method_aliases = {
+        "time_shift": "timeshift",
+        "baseline": "baseline_wander",
+        "warp": "time_warp",
+        "emg": "emg_noise",
+        "istft": "istft_augment",
+    }
+
+    method = method_aliases.get(
+        method,
+        method,
+    )
+
+    if method not in (
+        ECGAugmentation.SUPPORTED_METHODS
+    ):
+        raise ValueError(
+            "Unknown augmentation method "
+            f"{normalized['method']!r}. Supported methods are: "
+            f"{', '.join(ECGAugmentation.SUPPORTED_METHODS)}."
+        )
+
+    copies = normalized["copies"]
+
+    if isinstance(
+        copies,
+        (
+            bool,
+            np.bool_,
+        ),
+    ) or not isinstance(
+        copies,
+        (
+            int,
+            np.integer,
+        ),
+    ):
+        raise ValueError(
+            "augmentation_config['copies'] must be a "
+            "positive integer."
+        )
+
+    copies = int(
+        copies
+    )
+
+    if copies < 1:
+        raise ValueError(
+            "augmentation_config['copies'] must be a "
+            "positive integer."
+        )
+
+    parameters = normalized["parameters"]
+
+    if parameters is None:
+        parameters = {}
+
+    if not isinstance(
+        parameters,
+        Mapping,
+    ):
+        raise ValueError(
+            "augmentation_config['parameters'] must be "
+            "a mapping."
+        )
+
+    parameters = dict(
+        parameters
+    )
+
+    method_parameters = set(
+        signature(
+            getattr(
+                ECGAugmentation,
+                method,
+            )
+        ).parameters
+    )
+
+    method_parameters.discard(
+        "self"
+    )
+
+    method_parameters.discard(
+        "beats"
+    )
+
+    unknown_parameters = (
+        set(parameters)
+        - method_parameters
+    )
+
+    if unknown_parameters:
+        raise ValueError(
+            f"Unsupported parameter(s) for augmentation "
+            f"method {method!r}: "
+            + ", ".join(
+                sorted(
+                    str(key)
+                    for key in unknown_parameters
+                )
+            )
+        )
+
+    return {
+        "enabled": bool(
+            normalized["enabled"]
+        ),
+        "method": method,
+        "copies": copies,
+        "parameters": parameters,
+    }
+
+
+def _augment_training_partition(
+    x_train,
+    y_train,
+    augmentation_config,
+    seed,
+):
+    """
+    Append deterministic augmented copies of the optimisation partition.
+
+    Only the array passed as ``x_train`` is augmented. Validation, enrollment,
+    gallery, calibration, test, and probe arrays must never be passed to this
+    helper.
+
+    Both univariate arrays ``(samples, length)`` and channel-first multilead
+    arrays ``(samples, channels, length)`` are supported. Morphological
+    transformations are synchronised across leads to preserve lead alignment.
+    """
+    config = _normalize_augmentation_config(
+        augmentation_config
+    )
+
+    x_train = np.asarray(
+        x_train
+    )
+
+    y_train = np.asarray(
+        y_train
+    )
+
+    if y_train.ndim != 1:
+        raise ValueError(
+            "Training labels must be one-dimensional."
+        )
+
+    if len(x_train) != len(y_train):
+        raise ValueError(
+            "Training samples and labels must contain the "
+            "same number of entries."
+        )
+
+    if x_train.ndim not in {
+        2,
+        3,
+    }:
+        raise ValueError(
+            "Training augmentation expects shape "
+            "(samples, length) or "
+            "(samples, channels, length)."
+        )
+
+    if not config["enabled"]:
+        return (
+            x_train,
+            y_train,
+        )
+
+    if len(x_train) == 0:
+        raise ValueError(
+            "Training augmentation cannot be applied to "
+            "an empty training partition."
+        )
+
+    if isinstance(
+        seed,
+        (
+            bool,
+            np.bool_,
+        ),
+    ) or not isinstance(
+        seed,
+        (
+            int,
+            np.integer,
+        ),
+    ):
+        raise ValueError(
+            "seed must be an integer for deterministic "
+            "training augmentation."
+        )
+
+    seed = int(
+        seed
+    )
+
+    method = config["method"]
+    parameters = config["parameters"]
+
+    synchronised_multilead_methods = {
+        "amplitude",
+        "timeshift",
+        "baseline_wander",
+        "time_warp",
+        "cutout",
+    }
+
+    augmented_batches = []
+
+    for copy_index in range(
+        config["copies"]
+    ):
+        copy_seed = (
+            seed + copy_index
+        )
+
+        if x_train.ndim == 2:
+            augmented_copy = (
+                ECGAugmentation(
+                    seed=copy_seed
+                ).apply(
+                    x_train,
+                    method,
+                    **parameters,
+                )
+            )
+        else:
+            augmented_copy = np.empty(
+                x_train.shape,
+                dtype=np.float32,
+            )
+
+            for channel_index in range(
+                x_train.shape[1]
+            ):
+                if (
+                    method
+                    in synchronised_multilead_methods
+                ):
+                    channel_seed = copy_seed
+                else:
+                    channel_seed = (
+                        copy_seed
+                        + 1000 * channel_index
+                    )
+
+                augmented_copy[
+                    :,
+                    channel_index,
+                    :,
+                ] = ECGAugmentation(
+                    seed=channel_seed
+                ).apply(
+                    x_train[
+                        :,
+                        channel_index,
+                        :,
+                    ],
+                    method,
+                    **parameters,
+                )
+
+        augmented_batches.append(
+            augmented_copy
+        )
+
+    original_batch = x_train.astype(
+        np.float32,
+        copy=False,
+    )
+
+    augmented_x = np.concatenate(
+        [
+            original_batch,
+            *augmented_batches,
+        ],
+        axis=0,
+    )
+
+    augmented_y = np.concatenate(
+        [
+            y_train
+            for _ in range(
+                config["copies"] + 1
+            )
+        ],
+        axis=0,
+    )
+
+    print(
+        "[INFO] Training-only augmentation applied: "
+        f"method={method}, "
+        f"copies={config['copies']}, "
+        f"samples={len(x_train)} -> "
+        f"{len(augmented_x)}"
+    )
+
+    return (
+        augmented_x,
+        augmented_y,
+    )
+
+
 # =============================================================================
 # MULTI-RUN ARGUMENT HANDLING
 # =============================================================================
@@ -1316,7 +1706,8 @@ def run_closed_set_identification(x, y, model_class, epochs=150, batch_size=256,
                                   sqi_threshold=0.05, sqi_keep_pct=0.8, probe_fusion_size=3,
                                   save_results_and_settings=False, loader=None, 
                                   n_runs=1, _return_stats=False,
-                                  intelligent_weight_loading=True):
+                                  intelligent_weight_loading=True,
+                                  augmentation_config=None):
     """
     Standard Closed-Set Identification Pipeline (Intra-session).
     Determines "Who is this person?" from a known pool of subjects seen during training.
@@ -1424,6 +1815,16 @@ def run_closed_set_identification(x, y, model_class, epochs=150, batch_size=256,
         # Return the aggregated statistics
         return (r1_mean, r1_std), (r5_mean, r5_std)
 
+    augmentation_config = (
+        _normalize_augmentation_config(
+            augmentation_config
+        )
+    )
+
+    hyperparams[
+        "augmentation"
+    ] = augmentation_config
+
     _set_seed(seed); device = _get_device(device)
     task_title = "Closed-Set Identification"
     mode_str = f"Template ({template_fusion_method}, {matching_method})" if use_template else "Softmax"
@@ -1530,7 +1931,21 @@ def run_closed_set_identification(x, y, model_class, epochs=150, batch_size=256,
         X_val, val_loader = None, None
         print(f"Data Split: Train={len(X_tr)}, Val=0, Test={len(X_test)}")
 
-    train_loader = _make_loader(X_tr, y_tr, batch_size, shuffle=True)
+    X_tr, y_tr = (
+        _augment_training_partition(
+            X_tr,
+            y_tr,
+            augmentation_config,
+            seed,
+        )
+    )
+
+    train_loader = _make_loader(
+        X_tr,
+        y_tr,
+        batch_size,
+        shuffle=True,
+    )
     test_loader = _make_loader(X_test, y_test_enc, batch_size, shuffle=False)
  
     # 3. Train (Always start with Softmax training)
@@ -1554,7 +1969,8 @@ def run_closed_set_identification(x, y, model_class, epochs=150, batch_size=256,
         "outlier_train": outlier_filtering_on_train,
         "sqi_thresh": sqi_threshold,
         "classes": len(classes),
-        "data_shape": X_tr.shape 
+        "data_shape": X_tr.shape,
+        "augmentation": augmentation_config,
         }
 
         train_config = _build_weight_cache_config(
@@ -1677,7 +2093,8 @@ def run_closed_set_verification(x, y, model_class, epochs=150, batch_size=256, l
                                 sqi_scores=None, sqi_threshold=0.05, sqi_keep_pct=0.8, 
                                 use_deployment_evaluation=False, save_results_and_settings=False, 
                                 loader=None, n_runs=1, _return_stats=False,
-                                intelligent_weight_loading=True):
+                                intelligent_weight_loading=True,
+                                augmentation_config=None):
     """
     Standard Closed-Set Verification Pipeline (Intra-session).
     Determines "Is this person who they claim to be?" (1:1 matching) for subjects known to the model.
@@ -1784,6 +2201,16 @@ def run_closed_set_verification(x, y, model_class, epochs=150, batch_size=256, l
         return tuple(zip(means, stds))
     # ----------------------------
 
+    augmentation_config = (
+        _normalize_augmentation_config(
+            augmentation_config
+        )
+    )
+
+    hyperparams[
+        "augmentation"
+    ] = augmentation_config
+
     _set_seed(seed); device = _get_device(device)
     task_title = "Closed-Set Verification"
     mode_str = f"Template ({template_fusion_method}, size={template_size})" if use_template else "Cloud Pairs (Test Only)"
@@ -1884,7 +2311,21 @@ def run_closed_set_verification(x, y, model_class, epochs=150, batch_size=256, l
         X_val, val_loader = None, None
         print(f"Data Split: Train={len(X_tr)}, Val=0, Test={len(X_test)}")
 
-    train_loader = _make_loader(X_tr, y_tr, batch_size, shuffle=True)
+    X_tr, y_tr = (
+        _augment_training_partition(
+            X_tr,
+            y_tr,
+            augmentation_config,
+            seed,
+        )
+    )
+
+    train_loader = _make_loader(
+        X_tr,
+        y_tr,
+        batch_size,
+        shuffle=True,
+    )
     test_loader = _make_loader(X_test, y_test_enc, batch_size, shuffle=False)
     
     # 7. Train Model
@@ -1901,7 +2342,8 @@ def run_closed_set_verification(x, y, model_class, epochs=150, batch_size=256, l
             "training_regime": "intra_session_closed_set",
             "model": model_class.__name__, "epochs": epochs, "batch_size": batch_size, "lr": lr, 
             "val_split": val_split, "seed": seed, "outlier_train": outlier_filtering_on_train, 
-            "sqi_thresh": sqi_threshold, "classes": len(classes), "data_shape": X_tr.shape
+            "sqi_thresh": sqi_threshold, "classes": len(classes), "data_shape": X_tr.shape,
+            "augmentation": augmentation_config,
         }
 
         train_config = _build_weight_cache_config(
@@ -2053,7 +2495,8 @@ def run_subject_disjoint_identification(x, y, model_class, epochs=150, batch_siz
                                         sqi_threshold=0.05, sqi_keep_pct=0.8, probe_fusion_size=3, 
                                         save_results_and_settings=False, loader=None, 
                                         n_runs=1, _return_stats=False,
-                                        intelligent_weight_loading=True):
+                                        intelligent_weight_loading=True,
+                                        augmentation_config=None):
     """
     Subject-Disjoint Identification Pipeline.
     Evaluates identification performance on subjects entirely UNSEEN during the training phase.
@@ -2152,6 +2595,16 @@ def run_subject_disjoint_identification(x, y, model_class, epochs=150, batch_siz
             _log_experiment_results("Subject-Disjoint Identification", metrics_dict, data_stats, hyperparams, loader)
         return (r1_mean, r1_std), (r5_mean, r5_std)
     # ----------------------------
+
+    augmentation_config = (
+        _normalize_augmentation_config(
+            augmentation_config
+        )
+    )
+
+    hyperparams[
+        "augmentation"
+    ] = augmentation_config
 
     _set_seed(seed); device = _get_device(device)
     task_title = "Subject-Disjoint Identification"
@@ -2306,7 +2759,21 @@ def run_subject_disjoint_identification(x, y, model_class, epochs=150, batch_siz
         # Gracefully assign None without calling _make_loader
         val_loader_seen = None
     
-    train_loader = _make_loader(X_tr, y_tr, batch_size, shuffle=True)
+    X_tr, y_tr = (
+        _augment_training_partition(
+            X_tr,
+            y_tr,
+            augmentation_config,
+            seed,
+        )
+    )
+
+    train_loader = _make_loader(
+        X_tr,
+        y_tr,
+        batch_size,
+        shuffle=True,
+    )
     
     # This remains the UNSEEN Validation subjects loader
     val_loader_unseen = _make_loader(X_val, y_val, batch_size, shuffle=False) if X_val is not None else None
@@ -2327,6 +2794,7 @@ def run_subject_disjoint_identification(x, y, model_class, epochs=150, batch_siz
             "model": model_class.__name__, "epochs": epochs, "batch_size": batch_size, "lr": lr, 
             "val_split": val_split, "seed": seed, "outlier_train": outlier_filtering_on_train, 
             "sqi_thresh": sqi_threshold, "classes": num_train_classes, "data_shape": X_tr.shape,
+            "augmentation": augmentation_config,
             "matching_method": matching_method  # Affects early stopping EER!
         }
 
@@ -2481,7 +2949,8 @@ def run_subject_disjoint_verification(x, y, model_class, epochs=150, batch_size=
                                       sqi_scores=None, sqi_threshold=0.05, sqi_keep_pct=0.8, 
                                       use_deployment_evaluation=False, save_results_and_settings=False, 
                                       loader=None, n_runs=1, _return_stats=False,
-                                      intelligent_weight_loading=True):
+                                      intelligent_weight_loading=True,
+                                      augmentation_config=None):
     """
     Subject-Disjoint Verification Pipeline (Subject-Disjoint 1:1 Matching).
     Tests the system's ability to verify the identity of completely new users.
@@ -2585,7 +3054,17 @@ def run_subject_disjoint_verification(x, y, model_class, epochs=150, batch_size=
     if use_template and template_size is None:
         template_size = 1
 
-    _set_seed(seed); device = _get_device(device)       
+    augmentation_config = (
+        _normalize_augmentation_config(
+            augmentation_config
+        )
+    )
+
+    hyperparams[
+        "augmentation"
+    ] = augmentation_config
+
+    _set_seed(seed); device = _get_device(device)
     task_title = "Subject-Disjoint Verification"        
     mode_str = f"Template ({template_fusion_method}, First {template_size})" if use_template else "Cloud Pairs (Test Only)"
     print(f"\n[TASK] {task_title} | Mode: {mode_str} | Match: {matching_method}")
@@ -2738,7 +3217,21 @@ def run_subject_disjoint_verification(x, y, model_class, epochs=150, batch_size=
         # Gracefully assign None without calling _make_loader
         val_loader_seen = None
     
-    train_loader = _make_loader(X_tr, y_tr, batch_size, shuffle=True)
+    X_tr, y_tr = (
+        _augment_training_partition(
+            X_tr,
+            y_tr,
+            augmentation_config,
+            seed,
+        )
+    )
+
+    train_loader = _make_loader(
+        X_tr,
+        y_tr,
+        batch_size,
+        shuffle=True,
+    )
     
     # This remains the UNSEEN Validation subjects loader (used for EER)
     val_loader_unseen = _make_loader(X_val, y_val, batch_size, shuffle=False) if X_val is not None else None
@@ -2759,6 +3252,7 @@ def run_subject_disjoint_verification(x, y, model_class, epochs=150, batch_size=
             "model": model_class.__name__, "epochs": epochs, "batch_size": batch_size, "lr": lr, 
             "val_split": val_split, "seed": seed, "outlier_train": outlier_filtering_on_train, 
             "sqi_thresh": sqi_threshold, "classes": num_train_classes, "data_shape": X_tr.shape,
+            "augmentation": augmentation_config,
             "matching_method": matching_method  # Affects early stopping EER!
         }
 
@@ -2945,7 +3439,8 @@ def run_cross_session_identification(x_train, y_train, x_test, y_test, model_cla
                                      sqi_train=None, sqi_test=None, sqi_threshold=0.05, 
                                      sqi_keep_pct=0.8, probe_fusion_size=3, save_results_and_settings=False, 
                                      loader=None, n_runs=1, _return_stats=False,
-                                     intelligent_weight_loading=True):
+                                     intelligent_weight_loading=True,
+                                     augmentation_config=None):
     """
     Cross-Session Identification Pipeline (Temporal Robustness).
     Evaluates system robustness against physiological aging and sensor variations over time.
@@ -3034,6 +3529,16 @@ def run_cross_session_identification(x_train, y_train, x_test, y_test, model_cla
             _log_experiment_results("Cross-Session Identification", metrics_dict, data_stats, hyperparams, loader)
         return (r1_mean, r1_std), (r5_mean, r5_std)
     # ----------------------------
+
+    augmentation_config = (
+        _normalize_augmentation_config(
+            augmentation_config
+        )
+    )
+
+    hyperparams[
+        "augmentation"
+    ] = augmentation_config
 
     _set_seed(seed); device = _get_device(device)
     task_title = "Cross-Session Identification"
@@ -3130,7 +3635,21 @@ def run_cross_session_identification(x_train, y_train, x_test, y_test, model_cla
         X_val, val_loader = None, None
         print(f"Session 1 Split: Train={len(X_tr)}, Val=0 | Session 2 Probes={len(x_test_filtered)}")
 
-    train_loader = _make_loader(X_tr, y_tr, batch_size, shuffle=True)
+    X_tr, y_tr = (
+        _augment_training_partition(
+            X_tr,
+            y_tr,
+            augmentation_config,
+            seed,
+        )
+    )
+
+    train_loader = _make_loader(
+        X_tr,
+        y_tr,
+        batch_size,
+        shuffle=True,
+    )
     probe_loader = _make_loader(x_test_filtered, y_test_enc, batch_size, shuffle=False)
     
     # Train Model
@@ -3147,7 +3666,8 @@ def run_cross_session_identification(x_train, y_train, x_test, y_test, model_cla
             "training_regime": "cross_session_closed_set",
             "model": model_class.__name__, "epochs": epochs, "batch_size": batch_size, "lr": lr, 
             "val_split": val_split, "seed": seed, "outlier_train": outlier_filtering_on_train, 
-            "sqi_thresh": sqi_threshold, "classes": len(classes), "data_shape": X_tr.shape
+            "sqi_thresh": sqi_threshold, "classes": len(classes), "data_shape": X_tr.shape,
+            "augmentation": augmentation_config,
         }
 
         train_config = _build_weight_cache_config(
@@ -3267,7 +3787,8 @@ def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class
                                    sqi_threshold=0.05, sqi_keep_pct=0.8, use_deployment_evaluation=False, 
                                    save_results_and_settings=False, loader=None, 
                                    n_runs=1, _return_stats=False,
-                                   intelligent_weight_loading=True):
+                                   intelligent_weight_loading=True,
+                                   augmentation_config=None):
     """
     Cross-Session Verification Pipeline (Temporal Robustness 1:1).
     Attempts to verify if a subject is who they claim to be across different time-separated recording sessions.
@@ -3368,6 +3889,16 @@ def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class
         return tuple(zip(means, stds))
     # ----------------------------
 
+    augmentation_config = (
+        _normalize_augmentation_config(
+            augmentation_config
+        )
+    )
+
+    hyperparams[
+        "augmentation"
+    ] = augmentation_config
+
     _set_seed(seed); device = _get_device(device)
     task_title = "Cross-Session Verification"
     mode_str = f"Template ({template_fusion_method}, size={template_size or 'All'})" if use_template else "Cloud Pairs (Session 2 Only)"
@@ -3460,7 +3991,21 @@ def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class
         X_val, val_loader = None, None
         print(f"Session 1 Split: Train={len(X_tr)}, Val=0 | Session 2 Probes={len(x_test_filtered)}")
 
-    train_loader = _make_loader(X_tr, y_tr, batch_size, shuffle=True)
+    X_tr, y_tr = (
+        _augment_training_partition(
+            X_tr,
+            y_tr,
+            augmentation_config,
+            seed,
+        )
+    )
+
+    train_loader = _make_loader(
+        X_tr,
+        y_tr,
+        batch_size,
+        shuffle=True,
+    )
     probe_loader = _make_loader(x_test_filtered, y_test_enc, batch_size, shuffle=False)
     
     # Train Model
@@ -3477,7 +4022,8 @@ def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class
             "training_regime": "cross_session_closed_set",
             "model": model_class.__name__, "epochs": epochs, "batch_size": batch_size, "lr": lr, 
             "val_split": val_split, "seed": seed, "outlier_train": outlier_filtering_on_train, 
-            "sqi_thresh": sqi_threshold, "classes": len(classes), "data_shape": X_tr.shape
+            "sqi_thresh": sqi_threshold, "classes": len(classes), "data_shape": X_tr.shape,
+            "augmentation": augmentation_config,
         }
 
         train_config = _build_weight_cache_config(
@@ -3627,7 +4173,8 @@ def run_subject_disjoint_cross_session_identification(
         matching_method='cosine', outlier_filtering_on_train=False, outlier_filtering_on_test=False, sqi_s1=None, 
         sqi_s2=None, sqi_threshold=0.05, sqi_keep_pct=0.8, probe_fusion_size=3, save_results_and_settings=False, 
         loader=None, n_runs=1, _return_stats=False,
-        intelligent_weight_loading=True):
+        intelligent_weight_loading=True,
+        augmentation_config=None):
     """
     The Ultimate Biometric Test: Subject-Disjoint + Temporal Robustness Identification.
     1. Trains a feature extractor on Session 1 of Subject Group A.
@@ -3720,6 +4267,16 @@ def run_subject_disjoint_cross_session_identification(
     if not use_template:
         raise ValueError("[ERROR] use_template=False is invalid for Identification. Must use templates to build a gallery.")
         
+    augmentation_config = (
+        _normalize_augmentation_config(
+            augmentation_config
+        )
+    )
+
+    hyperparams[
+        "augmentation"
+    ] = augmentation_config
+
     _set_seed(seed); device = _get_device(device)
     task_title = "Subject-Disjoint Cross-Session ID"
     mode_str = f"Gallery: Session 1 ({template_fusion_method}, size={template_size or 'All'})"
@@ -3848,7 +4405,21 @@ def run_subject_disjoint_cross_session_identification(
         X_tr, y_tr = X_train, y_train_enc
         val_loader_seen = None
 
-    train_loader = _make_loader(X_tr, y_tr, batch_size, shuffle=True)
+    X_tr, y_tr = (
+        _augment_training_partition(
+            X_tr,
+            y_tr,
+            augmentation_config,
+            seed,
+        )
+    )
+
+    train_loader = _make_loader(
+        X_tr,
+        y_tr,
+        batch_size,
+        shuffle=True,
+    )
     val_loader_s1 = _make_loader(X_val_s1, y_val_s1_enc, batch_size, shuffle=False) if X_val_s1 is not None else None
     
     # UNSEEN Validation now strictly passes the Session 1 loader only (Intra-Session check)
@@ -3868,6 +4439,7 @@ def run_subject_disjoint_cross_session_identification(
             "model": model_class.__name__, "epochs": epochs, "batch_size": batch_size, "lr": lr, 
             "val_split": val_split, "seed": seed, "outlier_train": outlier_filtering_on_train, 
             "sqi_thresh": sqi_threshold, "classes": num_train_classes, "data_shape": X_tr.shape,
+            "augmentation": augmentation_config,
             "matching_method": matching_method # Affects early stopping EER!
         }
 
@@ -3985,7 +4557,8 @@ def run_subject_disjoint_cross_session_verification(
         template_fusion_method='mean', template_size=None, matching_method='cosine', outlier_filtering_on_train=False, 
         outlier_filtering_on_test=False, sqi_s1=None, sqi_s2=None, sqi_threshold=0.05, sqi_keep_pct=0.8,
         use_deployment_evaluation=False, save_results_and_settings=False, loader=None, n_runs=1, _return_stats=False,
-        intelligent_weight_loading=True):
+        intelligent_weight_loading=True,
+        augmentation_config=None):
     """
     The Ultimate Biometric Test: Subject-Disjoint + Temporal Robustness 1:1 Verification.
     Verifies the identity of subjects completely excluded from representation learning, across different recording days.
@@ -4087,6 +4660,16 @@ def run_subject_disjoint_cross_session_verification(
             _log_experiment_results("Subject-Disjoint Cross-Session Verification", metrics_dict, data_stats, hyperparams, loader)
         return tuple(zip(means, stds))
     # ----------------------------
+
+    augmentation_config = (
+        _normalize_augmentation_config(
+            augmentation_config
+        )
+    )
+
+    hyperparams[
+        "augmentation"
+    ] = augmentation_config
 
     _set_seed(seed); device = _get_device(device)
     task_title = "Subject-Disjoint Cross-Session Verification"
@@ -4208,7 +4791,21 @@ def run_subject_disjoint_cross_session_verification(
         X_tr, y_tr = X_train, y_train_enc
         val_loader_seen = None
 
-    train_loader = _make_loader(X_tr, y_tr, batch_size, shuffle=True)
+    X_tr, y_tr = (
+        _augment_training_partition(
+            X_tr,
+            y_tr,
+            augmentation_config,
+            seed,
+        )
+    )
+
+    train_loader = _make_loader(
+        X_tr,
+        y_tr,
+        batch_size,
+        shuffle=True,
+    )
     val_loader_s1 = _make_loader(X_val_s1, y_val_s1_enc, batch_size, shuffle=False) if X_val_s1 is not None else None
     
     # UNSEEN Validation now strictly passes the Session 1 loader only (Intra-Session check)
@@ -4228,6 +4825,7 @@ def run_subject_disjoint_cross_session_verification(
             "model": model_class.__name__, "epochs": epochs, "batch_size": batch_size, "lr": lr, 
             "val_split": val_split, "seed": seed, "outlier_train": outlier_filtering_on_train, 
             "sqi_thresh": sqi_threshold, "classes": num_train_classes, "data_shape": X_tr.shape,
+            "augmentation": augmentation_config,
             "matching_method": matching_method # Affects early stopping EER!
         }
 

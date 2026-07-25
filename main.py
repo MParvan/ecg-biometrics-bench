@@ -1,4 +1,5 @@
 import argparse
+import json
 import sys
 import traceback
 
@@ -38,6 +39,34 @@ CONFIG_KEY_ALIASES = {
     # Backward-compatible name used by experiment_settings.yaml
     "save_results_and_settings": "save_results",
 }
+
+
+def _parse_json_mapping(value):
+    """
+    Parse one command-line JSON object into a Python dictionary.
+    """
+    if isinstance(value, dict):
+        return value
+
+    try:
+        parsed_value = json.loads(value)
+    except (
+        TypeError,
+        json.JSONDecodeError,
+    ) as error:
+        raise argparse.ArgumentTypeError(
+            "Expected a valid JSON object."
+        ) from error
+
+    if not isinstance(
+        parsed_value,
+        dict,
+    ):
+        raise argparse.ArgumentTypeError(
+            "Expected a JSON object."
+        )
+
+    return parsed_value
 
 
 def apply_yaml_config(args, parser):
@@ -281,6 +310,7 @@ def validate_experiment_arguments(args, parser):
         "num_pairs",
         "num_beats_to_merge",
         "probe_fusion_size",
+        "augmentation_copies",
     ]:
         require_integer(
             argument_name,
@@ -351,7 +381,52 @@ def validate_experiment_arguments(args, parser):
         )
 
     # ---------------------------------------------------------
-    # 5. Session-list validation
+    # 5. Training-only augmentation configuration
+    # ---------------------------------------------------------
+    if not isinstance(
+        args.augmentation_parameters,
+        dict,
+    ):
+        parser.error(
+            "'augmentation_parameters' must be a mapping."
+        )
+
+    try:
+        normalized_augmentation = (
+            run._normalize_augmentation_config(
+                {
+                    "enabled": args.use_augmentation,
+                    "method": args.augmentation_method,
+                    "copies": args.augmentation_copies,
+                    "parameters": (
+                        args.augmentation_parameters
+                    ),
+                }
+            )
+        )
+    except ValueError as error:
+        parser.error(
+            str(error)
+        )
+
+    args.use_augmentation = (
+        normalized_augmentation["enabled"]
+    )
+
+    args.augmentation_method = (
+        normalized_augmentation["method"]
+    )
+
+    args.augmentation_copies = (
+        normalized_augmentation["copies"]
+    )
+
+    args.augmentation_parameters = (
+        normalized_augmentation["parameters"]
+    )
+
+    # ---------------------------------------------------------
+    # 6. Session-list validation
     # ---------------------------------------------------------
     session_arguments = [
         "train_sessions",
@@ -386,7 +461,7 @@ def validate_experiment_arguments(args, parser):
             )
 
     # ---------------------------------------------------------
-    # 6. Continuous-recording minute ranges
+    # 7. Continuous-recording minute ranges
     # ---------------------------------------------------------
     continuous_datasets = {
         "mitbih",
@@ -520,7 +595,7 @@ def validate_experiment_arguments(args, parser):
             )
 
     # ---------------------------------------------------------
-    # 7. General string validation
+    # 8. General string validation
     # ---------------------------------------------------------
     for argument_name in [
         "data_split_mode",
@@ -535,7 +610,7 @@ def validate_experiment_arguments(args, parser):
             )
 
     # ---------------------------------------------------------
-    # 8. Task-specific consistency
+    # 9. Task-specific consistency
     # ---------------------------------------------------------
     if args.task in [3, 7] and not args.use_template:
         parser.error(
@@ -795,6 +870,61 @@ def get_parser():
     train_group.add_argument('--val_split', type=float, default=0.0, help="Percentage for Validation set (default: 0.0).")
     train_group.add_argument('--seed', type=int, default=42, help="Random seed for reproducibility.")
     train_group.add_argument('--n_runs', type=int, default=1, help="Number of independent runs using consecutive random seeds.")
+
+    # ----------------------------------------------------
+    # TRAINING-ONLY DATA AUGMENTATION
+    # ----------------------------------------------------
+    augmentation_group = parser.add_argument_group(
+        'Training-Only Data Augmentation'
+    )
+
+    augmentation_group.add_argument(
+        '--use_augmentation',
+        action='store_true',
+        help=(
+            "Append augmented copies only to the final "
+            "representation-learning partition."
+        ),
+    )
+
+    augmentation_group.add_argument(
+        '--augmentation_method',
+        type=str,
+        default='gaussian',
+        choices=[
+            'gaussian',
+            'amplitude',
+            'timeshift',
+            'baseline_wander',
+            'time_warp',
+            'cutout',
+            'emg_noise',
+            'istft_augment',
+        ],
+        help="Training augmentation method.",
+    )
+
+    augmentation_group.add_argument(
+        '--augmentation_copies',
+        type=int,
+        default=1,
+        help=(
+            "Number of augmented copies appended for every "
+            "original training sample."
+        ),
+    )
+
+    augmentation_group.add_argument(
+        '--augmentation_parameters',
+        type=_parse_json_mapping,
+        default={},
+        metavar='JSON_OBJECT',
+        help=(
+            "Method-specific parameters as a JSON object. "
+            "Example: '{\"std\": 0.02, "
+            "\"relative\": true}'."
+        ),
+    )
 
     # ----------------------------------------------------
     # EVALUATION & TEMPLATE SETTINGS
@@ -1098,7 +1228,13 @@ def main():
         'sqi_keep_pct': args.sqi_keep_pct,
         'save_results_and_settings': args.save_results,
         'loader': loader,
-        'intelligent_weight_loading': args.intelligent_weight_loading
+        'intelligent_weight_loading': args.intelligent_weight_loading,
+        'augmentation_config': {
+            'enabled': args.use_augmentation,
+            'method': args.augmentation_method,
+            'copies': args.augmentation_copies,
+            'parameters': args.augmentation_parameters,
+        },
     }
 
     # ==========================================
