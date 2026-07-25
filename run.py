@@ -2122,7 +2122,18 @@ def run_subject_disjoint_verification(x, y, model_class, epochs=150, batch_size=
     data_stats = {
         "Train Subjects": len(train_subs),
         "Train Samples": len(X_train),
+        "Validation Subjects": (
+            len(val_subs)
+            if val_subs is not None
+            else 0
+        ),
+        "Validation Samples": (
+            len(X_val)
+            if X_val is not None
+            else 0
+        ),
         "Test Subjects": len(test_subs_final),
+        "Test Pairs Evaluated": len(labels_pair),
     }
 
     data_stats.update(
@@ -2794,8 +2805,18 @@ def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class
 
     data_stats = {
         "Total Cross-Session Subjects": len(classes),
-        "Enrollment (S1) Samples": len(x_train_full),
-        "Probe (S2) Samples": len(x_test_filtered),
+        "Training (S1) Samples": len(X_tr),
+        "Validation (S1) Samples": (
+            len(X_val)
+            if X_val is not None
+            else 0
+        ),
+        "Enrollment (S1) Samples": len(
+            x_train_full
+        ),
+        "Probe (S2) Samples": len(
+            x_test_filtered
+        ),
     }
 
     data_stats.update(
@@ -3487,10 +3508,22 @@ def run_subject_disjoint_cross_session_verification(
 
     data_stats = {
         "Train Subjects": len(train_subs),
+        "Train Samples": len(X_train),
+        "Validation Subjects": len(
+            val_subs
+        ),
+        "Validation (S1) Samples": (
+            len(X_val_s1)
+            if X_val_s1 is not None
+            else 0
+        ),
         "Test Subjects": len(test_subs),
-        "Train (S1) Samples": len(X_train),
-        "Enrollment (S1) Samples": len(X_enroll),
-        "Probe (S2) Samples": len(X_probe),
+        "Enrollment (S1) Samples": len(
+            X_enroll
+        ),
+        "Probe (S2) Samples": len(
+            X_probe
+        ),
     }
 
     data_stats.update(
