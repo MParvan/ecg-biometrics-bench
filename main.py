@@ -82,6 +82,128 @@ def apply_yaml_config(args, parser):
 
     return args
 
+def _normalize_minute_range(
+    value,
+    argument_name,
+    parser,
+):
+    """
+    Validate and normalize one continuous-recording minute range.
+
+    A range is represented as ``(start_minute, end_minute)`` and must
+    satisfy ``0 <= start_minute < end_minute``.
+    """
+    if not isinstance(
+        value,
+        (list, tuple),
+    ) or len(value) != 2:
+        parser.error(
+            f"'{argument_name}' must contain exactly two "
+            "numeric values: START_MINUTE END_MINUTE."
+        )
+
+    start_minute, end_minute = value
+
+    for field_name, field_value in [
+        ("start", start_minute),
+        ("end", end_minute),
+    ]:
+        if (
+            isinstance(field_value, bool)
+            or not isinstance(field_value, Real)
+            or not np.isfinite(field_value)
+        ):
+            parser.error(
+                f"'{argument_name}' {field_name} minute must be "
+                f"a finite number, received {field_value!r}."
+            )
+
+    start_minute = float(
+        start_minute
+    )
+    end_minute = float(
+        end_minute
+    )
+
+    if start_minute < 0.0:
+        parser.error(
+            f"'{argument_name}' start minute cannot be negative, "
+            f"received {start_minute!r}."
+        )
+
+    if end_minute <= start_minute:
+        parser.error(
+            f"'{argument_name}' must satisfy START_MINUTE < "
+            f"END_MINUTE, received "
+            f"({start_minute}, {end_minute})."
+        )
+
+    return (
+        start_minute,
+        end_minute,
+    )
+
+
+def _normalize_minute_range_list(
+    value,
+    argument_name,
+    parser,
+):
+    """
+    Validate and normalize one or more minute ranges.
+
+    Both a single YAML range such as ``[0, 5]`` and a collection such as
+    ``[[0, 5], [10, 15]]`` are accepted.
+    """
+    if value is None:
+        return None
+
+    if not isinstance(
+        value,
+        (list, tuple),
+    ) or not value:
+        parser.error(
+            f"'{argument_name}' must contain at least one "
+            "minute range."
+        )
+
+    # Support the convenient YAML form:
+    #
+    # train_parts: [0, 5]
+    #
+    # in addition to:
+    #
+    # train_parts:
+    #   - [0, 5]
+    #   - [10, 15]
+    if (
+        len(value) == 2
+        and all(
+            isinstance(item, Real)
+            and not isinstance(item, bool)
+            for item in value
+        )
+    ):
+        value = [value]
+
+    normalized_ranges = []
+
+    for range_index, minute_range in enumerate(
+        value
+    ):
+        normalized_ranges.append(
+            _normalize_minute_range(
+                minute_range,
+                (
+                    f"{argument_name}"
+                    f"[{range_index}]"
+                ),
+                parser,
+            )
+        )
+
+    return normalized_ranges
+
 def validate_experiment_arguments(args, parser):
     """
     Validate the complete experiment configuration after YAML overrides.
@@ -264,7 +386,141 @@ def validate_experiment_arguments(args, parser):
             )
 
     # ---------------------------------------------------------
-    # 6. General string validation
+    # 6. Continuous-recording minute ranges
+    # ---------------------------------------------------------
+    continuous_datasets = {
+        "mitbih",
+        "nsrdb",
+    }
+
+    range_arguments = {
+        "single_segment_range": (
+            args.single_segment_range
+        ),
+        "train_parts": args.train_parts,
+        "enrol_parts": args.enrol_parts,
+        "test_parts": args.test_parts,
+    }
+
+    if (
+        args.dataset not in continuous_datasets
+        and any(
+            value is not None
+            for value in range_arguments.values()
+        )
+    ):
+        parser.error(
+            "Minute-range arguments are supported only for "
+            "the MIT-BIH and NSRDB datasets."
+        )
+
+    if args.single_segment_range is not None:
+        args.single_segment_range = (
+            _normalize_minute_range(
+                args.single_segment_range,
+                "single_segment_range",
+                parser,
+            )
+        )
+
+    args.train_parts = (
+        _normalize_minute_range_list(
+            args.train_parts,
+            "train_parts",
+            parser,
+        )
+    )
+
+    args.enrol_parts = (
+        _normalize_minute_range_list(
+            args.enrol_parts,
+            "enrol_parts",
+            parser,
+        )
+    )
+
+    args.test_parts = (
+        _normalize_minute_range_list(
+            args.test_parts,
+            "test_parts",
+            parser,
+        )
+    )
+
+    if args.dataset in continuous_datasets:
+        supported_continuous_modes = {
+            "all-available",
+            "single-segment",
+            "custom-split",
+        }
+
+        if (
+            args.data_split_mode
+            not in supported_continuous_modes
+        ):
+            parser.error(
+                f"Dataset '{args.dataset}' supports only "
+                f"these data_split_mode values: "
+                f"{sorted(supported_continuous_modes)}."
+            )
+
+        if (
+            args.single_segment_range is not None
+            and args.data_split_mode
+            != "single-segment"
+        ):
+            parser.error(
+                "'single_segment_range' can be used only when "
+                "data_split_mode='single-segment'."
+            )
+
+        custom_range_values = [
+            args.train_parts,
+            args.enrol_parts,
+            args.test_parts,
+        ]
+
+        if (
+            any(
+                value is not None
+                for value in custom_range_values
+            )
+            and args.data_split_mode
+            != "custom-split"
+        ):
+            parser.error(
+                "'train_parts', 'enrol_parts', and "
+                "'test_parts' can be used only when "
+                "data_split_mode='custom-split'."
+            )
+
+        if args.data_split_mode == "custom-split":
+            if not args.train_parts:
+                parser.error(
+                    "MIT-BIH and NSRDB custom splits require "
+                    "at least one 'train_parts' range."
+                )
+
+            if not args.test_parts:
+                parser.error(
+                    "MIT-BIH and NSRDB custom splits require "
+                    "at least one 'test_parts' range."
+                )
+
+        if (
+            args.task in [5, 6, 7, 8]
+            and args.data_split_mode
+            != "custom-split"
+        ):
+            parser.error(
+                f"Cross-session Task {args.task} on "
+                f"'{args.dataset}' requires "
+                "data_split_mode='custom-split' with "
+                "explicit train_parts and test_parts."
+            )
+
+    # ---------------------------------------------------------
+    # 7. General string validation
     # ---------------------------------------------------------
     for argument_name in [
         "data_split_mode",
@@ -279,7 +535,7 @@ def validate_experiment_arguments(args, parser):
             )
 
     # ---------------------------------------------------------
-    # 7. Task-specific consistency
+    # 8. Task-specific consistency
     # ---------------------------------------------------------
     if args.task in [3, 7] and not args.use_template:
         parser.error(
@@ -460,6 +716,73 @@ def get_parser():
                             help="Consecutive beats to fuse natively in the loader (default: 1).")
     data_group.add_argument('--signal_type', type=str, default='raw', choices=['raw', 'filtered'],
                             help="For ECG-ID (raw vs filtered channel).")
+    data_group.add_argument(
+        "--single_segment_range",
+        type=float,
+        nargs=2,
+        metavar=(
+            "START_MINUTE",
+            "END_MINUTE",
+        ),
+        default=None,
+        help=(
+            "Minute range used by MIT-BIH or NSRDB when "
+            "data_split_mode='single-segment'."
+        ),
+    )
+
+    data_group.add_argument(
+        "--train_parts",
+        type=float,
+        nargs=2,
+        action="append",
+        metavar=(
+            "START_MINUTE",
+            "END_MINUTE",
+        ),
+        default=None,
+        help=(
+            "Training minute range for MIT-BIH or NSRDB "
+            "custom splits. Repeat the option to provide "
+            "multiple ranges."
+        ),
+    )
+
+    data_group.add_argument(
+        "--enrol_parts",
+        "--enroll_parts",
+        dest="enrol_parts",
+        type=float,
+        nargs=2,
+        action="append",
+        metavar=(
+            "START_MINUTE",
+            "END_MINUTE",
+        ),
+        default=None,
+        help=(
+            "Optional enrollment minute range for MIT-BIH "
+            "or NSRDB custom splits. Both British and "
+            "American spellings are accepted."
+        ),
+    )
+
+    data_group.add_argument(
+        "--test_parts",
+        type=float,
+        nargs=2,
+        action="append",
+        metavar=(
+            "START_MINUTE",
+            "END_MINUTE",
+        ),
+        default=None,
+        help=(
+            "Probe/test minute range for MIT-BIH or NSRDB "
+            "custom splits. Repeat the option to provide "
+            "multiple ranges."
+        ),
+    )
 
     # ----------------------------------------------------
     # TRAINING HYPERPARAMETERS
@@ -601,7 +924,34 @@ def main():
     if args.session_for_single_session_evaluation: 
         loader_kwargs['session_for_single_session_evaluation'] = args.session_for_single_session_evaluation
         
-    if args.dataset == 'ecgid': loader_kwargs['signal_type'] = args.signal_type
+    if args.dataset == "ecgid":
+        loader_kwargs[
+            "signal_type"
+        ] = args.signal_type
+
+    if args.dataset in {
+        "mitbih",
+        "nsrdb",
+    }:
+        if args.single_segment_range is not None:
+            loader_kwargs[
+                "single_segment_range"
+            ] = args.single_segment_range
+
+        if args.train_parts is not None:
+            loader_kwargs[
+                "train_parts"
+            ] = args.train_parts
+
+        if args.enrol_parts is not None:
+            loader_kwargs[
+                "enrol_parts"
+            ] = args.enrol_parts
+
+        if args.test_parts is not None:
+            loader_kwargs[
+                "test_parts"
+            ] = args.test_parts
 
     print(f"\n[INFO] Initializing {args.dataset.upper()} Dataset...")
     
@@ -636,13 +986,24 @@ def main():
                 print(f"\n[INFO] Loaded precomputed data from cache (Hash: {uid})")
                 x, y = cached_data['x'], cached_data['y']
             else:
-                if args.dataset in ['cybhi', 'heartprint']:
-                    x, y = loader.load_session("train")
+                if args.dataset in [
+                    "cybhi",
+                    "heartprint",
+                ]:
+                    x, y = loader.load_session(
+                        "train"
+                    )
                 else:
-                    if args.data_split_mode in ["all-available", "single-session"]:
+                    if args.data_split_mode in [
+                        "all-available",
+                        "single-session",
+                        "single-segment",
+                    ]:
                         x, y = loader.load_all_data()
                     else:
-                        x, y = loader.load_session("train")
+                        x, y = loader.load_session(
+                            "train"
+                        )
                 cache.save_data_cache({'x': x, 'y': y}, data_config, uid)
 
             print(f"\n[INFO] Data Loaded: X={x.shape}, Y={y.shape}")
@@ -677,14 +1038,24 @@ def main():
     else:
         # Tasks 1 to 4: Intra-Session or Single Array operations
         if args.task in [1, 2, 3, 4]:
-            if args.dataset in ['cybhi', 'heartprint']:
-                x, y = loader.load_session("train")
+            if args.dataset in [
+                "cybhi",
+                "heartprint",
+            ]:
+                x, y = loader.load_session(
+                    "train"
+                )
             else:
-                # EXPLICIT ROUTING: No more try/except guessing!
-                if args.data_split_mode in ["all-available", "single-session"]:
+                if args.data_split_mode in [
+                    "all-available",
+                    "single-session",
+                    "single-segment",
+                ]:
                     x, y = loader.load_all_data()
                 else:
-                    x, y = loader.load_session("train")
+                    x, y = loader.load_session(
+                        "train"
+                    )
 
             print(f"\n[INFO] Data Loaded: X={x.shape}, Y={y.shape}")
             if x.shape[0] == 0:
