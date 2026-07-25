@@ -643,6 +643,258 @@ def _split_subject_cohorts(
         test_subjects,
     )
 
+def _split_closed_set_samples(
+    x,
+    y,
+    holdout_split,
+    seed,
+    aligned_values=None,
+):
+    """
+    Create a stratified closed-set sample partition.
+
+    The retained and holdout partitions contain the same identities but
+    mutually exclusive samples. Optional aligned values, such as SQI scores,
+    are partitioned using exactly the same sample indices.
+
+    A zero holdout fraction returns the complete input as the retained
+    partition and a disabled holdout represented by ``(None, None, None)``.
+    """
+    x = np.asarray(
+        x
+    )
+
+    y = np.asarray(
+        y
+    )
+
+    if x.ndim < 1:
+        raise ValueError(
+            "x must contain a sample dimension."
+        )
+
+    if y.ndim != 1:
+        raise ValueError(
+            "y must be a one-dimensional label array."
+        )
+
+    if len(x) != len(y):
+        raise ValueError(
+            "x and y must contain the same number of samples."
+        )
+
+    if aligned_values is not None:
+        aligned_values = np.asarray(
+            aligned_values
+        )
+
+        if (
+            aligned_values.ndim == 0
+            or len(aligned_values) != len(y)
+        ):
+            raise ValueError(
+                "aligned_values must contain one value "
+                "per sample."
+            )
+
+    if isinstance(
+        holdout_split,
+        (
+            bool,
+            np.bool_,
+        ),
+    ):
+        raise ValueError(
+            "holdout_split must be numeric, not Boolean."
+        )
+
+    try:
+        holdout_fraction = float(
+            holdout_split
+        )
+    except (
+        TypeError,
+        ValueError,
+    ) as error:
+        raise ValueError(
+            "holdout_split must be numeric."
+        ) from error
+
+    if not np.isfinite(
+        holdout_fraction
+    ):
+        raise ValueError(
+            "holdout_split must be finite."
+        )
+
+    if not 0.0 <= holdout_fraction < 1.0:
+        raise ValueError(
+            "holdout_split must satisfy "
+            "0 <= holdout_split < 1."
+        )
+
+    all_indices = np.arange(
+        len(y),
+        dtype=np.int64,
+    )
+
+    if holdout_fraction == 0.0:
+        return {
+            "retained": (
+                x,
+                y,
+                aligned_values,
+            ),
+            "holdout": (
+                None,
+                None,
+                None,
+            ),
+            "indices": {
+                "retained": all_indices,
+                "holdout": np.asarray(
+                    [],
+                    dtype=np.int64,
+                ),
+            },
+        }
+
+    identities, identity_counts = np.unique(
+        y,
+        return_counts=True,
+    )
+
+    identities_with_too_few_samples = (
+        identities[
+            identity_counts < 2
+        ]
+    )
+
+    if len(
+        identities_with_too_few_samples
+    ) > 0:
+        raise ValueError(
+            "Every closed-set identity must contain at "
+            "least two samples before splitting. "
+            "Insufficient identities: "
+            f"{identities_with_too_few_samples.tolist()}."
+        )
+
+    try:
+        (
+            retained_indices,
+            holdout_indices,
+        ) = train_test_split(
+            all_indices,
+            test_size=holdout_fraction,
+            stratify=y,
+            random_state=seed,
+        )
+    except ValueError as error:
+        raise ValueError(
+            "Unable to create a stratified closed-set "
+            "sample split with the requested fraction."
+        ) from error
+
+    retained_indices = np.asarray(
+        retained_indices,
+        dtype=np.int64,
+    )
+
+    holdout_indices = np.asarray(
+        holdout_indices,
+        dtype=np.int64,
+    )
+
+    retained_index_set = set(
+        retained_indices.tolist()
+    )
+
+    holdout_index_set = set(
+        holdout_indices.tolist()
+    )
+
+    all_index_set = set(
+        all_indices.tolist()
+    )
+
+    if retained_index_set & holdout_index_set:
+        raise RuntimeError(
+            "Closed-set retained and holdout samples overlap."
+        )
+
+    assigned_indices = (
+        retained_index_set
+        | holdout_index_set
+    )
+
+    if assigned_indices != all_index_set:
+        raise RuntimeError(
+            "Closed-set splitting did not preserve exactly "
+            "all source samples."
+        )
+
+    all_identities = set(
+        identities.tolist()
+    )
+
+    retained_identities = set(
+        np.unique(
+            y[retained_indices]
+        ).tolist()
+    )
+
+    holdout_identities = set(
+        np.unique(
+            y[holdout_indices]
+        ).tolist()
+    )
+
+    if retained_identities != all_identities:
+        raise RuntimeError(
+            "The retained closed-set partition does not "
+            "contain every identity."
+        )
+
+    if holdout_identities != all_identities:
+        raise RuntimeError(
+            "The holdout closed-set partition does not "
+            "contain every identity."
+        )
+
+    retained_aligned_values = (
+        aligned_values[
+            retained_indices
+        ]
+        if aligned_values is not None
+        else None
+    )
+
+    holdout_aligned_values = (
+        aligned_values[
+            holdout_indices
+        ]
+        if aligned_values is not None
+        else None
+    )
+
+    return {
+        "retained": (
+            x[retained_indices],
+            y[retained_indices],
+            retained_aligned_values,
+        ),
+        "holdout": (
+            x[holdout_indices],
+            y[holdout_indices],
+            holdout_aligned_values,
+        ),
+        "indices": {
+            "retained": retained_indices,
+            "holdout": holdout_indices,
+        },
+    }
+
 def _partition_subject_disjoint_samples(
     x,
     y,
@@ -1863,15 +2115,31 @@ def run_closed_set_identification(x, y, model_class, epochs=150, batch_size=256,
     # ====================================================
     # 3. SPLIT DATA & SQI SCORES
     # ====================================================
-    if sqi_scores is not None:
-        X_train, X_test, y_train, y_test, sqi_train, sqi_test = train_test_split(
-            x, y, sqi_scores, test_size=test_split, stratify=y, random_state=seed
+    train_test_partitions = (
+        _split_closed_set_samples(
+            x,
+            y,
+            holdout_split=test_split,
+            seed=seed,
+            aligned_values=sqi_scores,
         )
-    else:
-        X_train, X_test, y_train, y_test = train_test_split(
-            x, y, test_size=test_split, stratify=y, random_state=seed
-        )
-        sqi_train, sqi_test = None, None
+    )
+
+    (
+        X_train,
+        y_train,
+        sqi_train,
+    ) = train_test_partitions[
+        "retained"
+    ]
+
+    (
+        X_test,
+        y_test,
+        sqi_test,
+    ) = train_test_partitions[
+        "holdout"
+    ]
 
     # ====================================================
     # 4. APPLY FILTERS INDEPENDENTLY
@@ -1920,16 +2188,47 @@ def run_closed_set_identification(x, y, model_class, epochs=150, batch_size=256,
     # ====================================================
     # 6. RESUME STANDARD PIPELINE
     # ====================================================
-    if val_split > 0.0:
-        X_tr, X_val, y_tr, y_val = train_test_split(
-            X_train, y_train_enc, test_size=val_split, stratify=y_train_enc, random_state=seed
+    validation_partitions = (
+        _split_closed_set_samples(
+            X_train,
+            y_train_enc,
+            holdout_split=val_split,
+            seed=seed,
         )
-        val_loader = _make_loader(X_val, y_val, batch_size, shuffle=False)
-        print(f"Data Split: Train={len(X_tr)}, Val={len(X_val)}, Test={len(X_test)}")
+    )
+
+    (
+        X_tr,
+        y_tr,
+        _,
+    ) = validation_partitions[
+        "retained"
+    ]
+
+    (
+        X_val,
+        y_val,
+        _,
+    ) = validation_partitions[
+        "holdout"
+    ]
+
+    if X_val is not None:
+        val_loader = _make_loader(
+            X_val,
+            y_val,
+            batch_size,
+            shuffle=False,
+        )
     else:
-        X_tr, y_tr = X_train, y_train_enc
-        X_val, val_loader = None, None
-        print(f"Data Split: Train={len(X_tr)}, Val=0, Test={len(X_test)}")
+        val_loader = None
+
+    print(
+        "Data Split: "
+        f"Train={len(X_tr)}, "
+        f"Val={len(X_val) if X_val is not None else 0}, "
+        f"Test={len(X_test)}"
+    )
 
     X_tr, y_tr = (
         _augment_training_partition(
@@ -2248,15 +2547,31 @@ def run_closed_set_verification(x, y, model_class, epochs=150, batch_size=256, l
     # ====================================================
     # 3. SPLIT DATA & SQI SCORES
     # ====================================================
-    if sqi_scores is not None:
-        X_train, X_test, y_train, y_test, sqi_train, sqi_test = train_test_split(
-            x, y, sqi_scores, test_size=test_split, stratify=y, random_state=seed
+    train_test_partitions = (
+        _split_closed_set_samples(
+            x,
+            y,
+            holdout_split=test_split,
+            seed=seed,
+            aligned_values=sqi_scores,
         )
-    else:
-        X_train, X_test, y_train, y_test = train_test_split(
-            x, y, test_size=test_split, stratify=y, random_state=seed
-        )
-        sqi_train, sqi_test = None, None
+    )
+
+    (
+        X_train,
+        y_train,
+        sqi_train,
+    ) = train_test_partitions[
+        "retained"
+    ]
+
+    (
+        X_test,
+        y_test,
+        sqi_test,
+    ) = train_test_partitions[
+        "holdout"
+    ]
 
     # ====================================================
     # 4. APPLY FILTERS INDEPENDENTLY
@@ -2300,16 +2615,47 @@ def run_closed_set_verification(x, y, model_class, epochs=150, batch_size=256, l
     # ====================================================
     # 6. RESUME STANDARD PIPELINE
     # ====================================================
-    if val_split > 0.0:
-        X_tr, X_val, y_tr, y_val = train_test_split(
-            X_train, y_train_enc, test_size=val_split, stratify=y_train_enc, random_state=seed
+    validation_partitions = (
+        _split_closed_set_samples(
+            X_train,
+            y_train_enc,
+            holdout_split=val_split,
+            seed=seed,
         )
-        val_loader = _make_loader(X_val, y_val, batch_size, shuffle=False)
-        print(f"Data Split: Train={len(X_tr)}, Val={len(X_val)}, Test={len(X_test)}")
+    )
+
+    (
+        X_tr,
+        y_tr,
+        _,
+    ) = validation_partitions[
+        "retained"
+    ]
+
+    (
+        X_val,
+        y_val,
+        _,
+    ) = validation_partitions[
+        "holdout"
+    ]
+
+    if X_val is not None:
+        val_loader = _make_loader(
+            X_val,
+            y_val,
+            batch_size,
+            shuffle=False,
+        )
     else:
-        X_tr, y_tr = X_train, y_train_enc
-        X_val, val_loader = None, None
-        print(f"Data Split: Train={len(X_tr)}, Val=0, Test={len(X_test)}")
+        val_loader = None
+
+    print(
+        "Data Split: "
+        f"Train={len(X_tr)}, "
+        f"Val={len(X_val) if X_val is not None else 0}, "
+        f"Test={len(X_test)}"
+    )
 
     X_tr, y_tr = (
         _augment_training_partition(
