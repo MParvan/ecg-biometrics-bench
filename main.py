@@ -737,7 +737,7 @@ def get_parser():
     parser = argparse.ArgumentParser(
         description=(
             "========================================================================\n"
-            "🫀 DEEP LEARNING ECG BIOMETRICS FRAMEWORK\n"
+            " DEEP LEARNING ECG BIOMETRICS FRAMEWORK\n"
             "========================================================================\n"
             "Unified Command-Line Interface to evaluate ECG signals across multiple \n"
             "datasets, biometric tasks, and neural network architectures.\n\n"
@@ -754,7 +754,7 @@ def get_parser():
         formatter_class=argparse.RawTextHelpFormatter,
         epilog=(
             "------------------------------------------------------------------------\n"
-            "📖 EXAMPLES OF USAGE:\n"
+            " EXAMPLES OF USAGE:\n"
             "------------------------------------------------------------------------\n"
             "1. Simple Closed-Set ID on ECG-ID using DeepECG Softmax:\n"
             "   python main.py --dataset ecgid --task 1 --data_split_mode single-shot-short-term --epochs 20\n\n"
@@ -1263,7 +1263,7 @@ def main():
     # 5. EXECUTE THE SELECTED TASK
     # ==========================================
     print("=" * 70)
-    print(f"🚀 EXECUTING TASK {args.task} ON {args.dataset.upper()} USING {args.model.upper()}")
+    print(f" EXECUTING TASK {args.task} ON {args.dataset.upper()} USING {args.model.upper()}")
     print("=" * 70)
 
     try:
