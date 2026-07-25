@@ -895,6 +895,300 @@ def _split_closed_set_samples(
         },
     }
 
+def _partition_closed_set_cross_session_samples(
+    x_session_1,
+    y_session_1,
+    x_session_2,
+    y_session_2,
+    minimum_session_1_samples=2,
+    minimum_session_2_samples=1,
+):
+    """
+    Synchronise known-subject samples across two sessions.
+
+    Only identities present in both sessions and satisfying the configured
+    per-session sample requirements are retained. Original sample order is
+    preserved within each session.
+
+    Session 1 normally supplies representation-learning and enrollment
+    samples. Session 2 supplies probe samples.
+    """
+    x_session_1 = np.asarray(
+        x_session_1
+    )
+
+    y_session_1 = np.asarray(
+        y_session_1
+    )
+
+    x_session_2 = np.asarray(
+        x_session_2
+    )
+
+    y_session_2 = np.asarray(
+        y_session_2
+    )
+
+    if x_session_1.ndim < 1:
+        raise ValueError(
+            "Session 1 samples must contain a sample dimension."
+        )
+
+    if x_session_2.ndim < 1:
+        raise ValueError(
+            "Session 2 samples must contain a sample dimension."
+        )
+
+    if y_session_1.ndim != 1:
+        raise ValueError(
+            "Session 1 labels must be one-dimensional."
+        )
+
+    if y_session_2.ndim != 1:
+        raise ValueError(
+            "Session 2 labels must be one-dimensional."
+        )
+
+    if len(x_session_1) != len(y_session_1):
+        raise ValueError(
+            "Session 1 samples and labels are misaligned."
+        )
+
+    if len(x_session_2) != len(y_session_2):
+        raise ValueError(
+            "Session 2 samples and labels are misaligned."
+        )
+
+    minimum_values = {
+        "minimum_session_1_samples": (
+            minimum_session_1_samples
+        ),
+        "minimum_session_2_samples": (
+            minimum_session_2_samples
+        ),
+    }
+
+    normalised_minimums = {}
+
+    for parameter_name, value in (
+        minimum_values.items()
+    ):
+        if isinstance(
+            value,
+            (
+                bool,
+                np.bool_,
+            ),
+        ) or not isinstance(
+            value,
+            (
+                int,
+                np.integer,
+            ),
+        ):
+            raise ValueError(
+                f"{parameter_name} must be a positive integer."
+            )
+
+        value = int(
+            value
+        )
+
+        if value < 1:
+            raise ValueError(
+                f"{parameter_name} must be a positive integer."
+            )
+
+        normalised_minimums[
+            parameter_name
+        ] = value
+
+    minimum_session_1_samples = (
+        normalised_minimums[
+            "minimum_session_1_samples"
+        ]
+    )
+
+    minimum_session_2_samples = (
+        normalised_minimums[
+            "minimum_session_2_samples"
+        ]
+    )
+
+    session_1_subjects = np.unique(
+        y_session_1
+    )
+
+    session_2_subjects = np.unique(
+        y_session_2
+    )
+
+    common_subjects = np.intersect1d(
+        session_1_subjects,
+        session_2_subjects,
+    )
+
+    if len(common_subjects) < 2:
+        raise ValueError(
+            "At least two identities must be shared by "
+            "Session 1 and Session 2."
+        )
+
+    session_1_counts = {
+        subject: int(
+            np.sum(
+                y_session_1 == subject
+            )
+        )
+        for subject in common_subjects
+    }
+
+    session_2_counts = {
+        subject: int(
+            np.sum(
+                y_session_2 == subject
+            )
+        )
+        for subject in common_subjects
+    }
+
+    insufficient_session_1 = np.asarray(
+        [
+            subject
+            for subject in common_subjects
+            if session_1_counts[subject]
+            < minimum_session_1_samples
+        ],
+        dtype=common_subjects.dtype,
+    )
+
+    insufficient_session_2 = np.asarray(
+        [
+            subject
+            for subject in common_subjects
+            if session_2_counts[subject]
+            < minimum_session_2_samples
+        ],
+        dtype=common_subjects.dtype,
+    )
+
+    eligible_subjects = np.asarray(
+        [
+            subject
+            for subject in common_subjects
+            if (
+                session_1_counts[subject]
+                >= minimum_session_1_samples
+                and session_2_counts[subject]
+                >= minimum_session_2_samples
+            )
+        ],
+        dtype=common_subjects.dtype,
+    )
+
+    if len(eligible_subjects) < 2:
+        raise ValueError(
+            "At least two shared identities must satisfy "
+            "the required Session 1 and Session 2 "
+            "sample counts."
+        )
+
+    session_1_mask = np.isin(
+        y_session_1,
+        eligible_subjects,
+    )
+
+    session_2_mask = np.isin(
+        y_session_2,
+        eligible_subjects,
+    )
+
+    filtered_x_session_1 = (
+        x_session_1[
+            session_1_mask
+        ]
+    )
+
+    filtered_y_session_1 = (
+        y_session_1[
+            session_1_mask
+        ]
+    )
+
+    filtered_x_session_2 = (
+        x_session_2[
+            session_2_mask
+        ]
+    )
+
+    filtered_y_session_2 = (
+        y_session_2[
+            session_2_mask
+        ]
+    )
+
+    expected_subjects = set(
+        eligible_subjects.tolist()
+    )
+
+    retained_session_1_subjects = set(
+        np.unique(
+            filtered_y_session_1
+        ).tolist()
+    )
+
+    retained_session_2_subjects = set(
+        np.unique(
+            filtered_y_session_2
+        ).tolist()
+    )
+
+    if (
+        retained_session_1_subjects
+        != expected_subjects
+    ):
+        raise RuntimeError(
+            "Session 1 partitioning did not preserve "
+            "exactly the eligible identities."
+        )
+
+    if (
+        retained_session_2_subjects
+        != expected_subjects
+    ):
+        raise RuntimeError(
+            "Session 2 partitioning did not preserve "
+            "exactly the eligible identities."
+        )
+
+    return {
+        "session_1": (
+            filtered_x_session_1,
+            filtered_y_session_1,
+        ),
+        "session_2": (
+            filtered_x_session_2,
+            filtered_y_session_2,
+        ),
+        "subjects": eligible_subjects,
+        "dropped_subjects": {
+            "session_1_only": np.setdiff1d(
+                session_1_subjects,
+                session_2_subjects,
+            ),
+            "session_2_only": np.setdiff1d(
+                session_2_subjects,
+                session_1_subjects,
+            ),
+            "insufficient_session_1": (
+                insufficient_session_1
+            ),
+            "insufficient_session_2": (
+                insufficient_session_2
+            ),
+        },
+    }
+
 def _partition_subject_disjoint_samples(
     x,
     y,
@@ -3928,35 +4222,50 @@ def run_cross_session_identification(x_train, y_train, x_test, y_test, model_cla
         )
 
     # ====================================================
-    # 3. INTERSECT SUBJECTS (Post-Filter Sync)
+    # 3. SYNCHRONISE KNOWN SUBJECTS ACROSS SESSIONS
     # ====================================================
-    train_subs = set(y_train)
-    test_subs = set(y_test)
-    common_subs = sorted(list(train_subs.intersection(test_subs)))
-    
-    if len(common_subs) < 2: 
-        print("[WARN] Not enough common subjects between sessions after filtering.")
-        return 0.0, 0.0
-    
-    train_mask = np.isin(y_train, common_subs)
-    test_mask = np.isin(y_test, common_subs)
-    
-    x_train_full, y_train_full = x_train[train_mask], y_train[train_mask]
-    x_test_filtered, y_test_filtered = x_test[test_mask], y_test[test_mask]
+    cross_session_partitions = (
+        _partition_closed_set_cross_session_samples(
+            x_train,
+            y_train,
+            x_test,
+            y_test,
+            minimum_session_1_samples=2,
+            minimum_session_2_samples=1,
+        )
+    )
 
-    # Pre-split cleanup: Ensure Train classes have >= 2 beats so stratify doesn't crash
-    unique_classes, counts = np.unique(y_train_full, return_counts=True)
-    valid_classes = unique_classes[counts >= 2]
-    
-    if len(valid_classes) < len(common_subs):
-        dropped = len(common_subs) - len(valid_classes)
-        print(f"[WARN] Dropping {dropped} subjects who have fewer than 2 beats left in Session 1.")
-        
-    final_train_mask = np.isin(y_train_full, valid_classes)
-    final_test_mask = np.isin(y_test_filtered, valid_classes) # Sync Session 2 again!
-    
-    x_train_full, y_train_full = x_train_full[final_train_mask], y_train_full[final_train_mask]
-    x_test_filtered, y_test_filtered = x_test_filtered[final_test_mask], y_test_filtered[final_test_mask]
+    (
+        x_train_full,
+        y_train_full,
+    ) = cross_session_partitions[
+        "session_1"
+    ]
+
+    (
+        x_test_filtered,
+        y_test_filtered,
+    ) = cross_session_partitions[
+        "session_2"
+    ]
+
+    dropped_subjects = (
+        cross_session_partitions[
+            "dropped_subjects"
+        ]
+    )
+
+    if len(
+        dropped_subjects[
+            "insufficient_session_1"
+        ]
+    ) > 0:
+        print(
+            "[WARN] Dropping "
+            f"{len(dropped_subjects['insufficient_session_1'])} "
+            "subjects with fewer than 2 surviving "
+            "Session 1 samples."
+        )
 
     # ====================================================
     # 4. ENCODE LABELS
@@ -4287,35 +4596,72 @@ def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class
         )
 
     # ====================================================
-    # 3. INTERSECT SUBJECTS (Post-Filter Sync)
+    # 3. SYNCHRONISE KNOWN SUBJECTS ACROSS SESSIONS
     # ====================================================
-    train_subs = set(y_train)
-    test_subs = set(y_test)
-    common_subs = sorted(list(train_subs.intersection(test_subs)))
-    
-    if len(common_subs) < 2: 
-        print("[WARN] Not enough common subjects between sessions after filtering.")
-        return 0.0, 0.0, 0.0, 0.0
-    
-    train_mask = np.isin(y_train, common_subs)
-    test_mask = np.isin(y_test, common_subs)
-    
-    x_train_full, y_train_full = x_train[train_mask], y_train[train_mask]
-    x_test_filtered, y_test_filtered = x_test[test_mask], y_test[test_mask]
+    minimum_probe_samples = (
+        1
+        if use_template
+        else 2
+    )
 
-    unique_classes, counts = np.unique(y_train_full, return_counts=True)
-    valid_classes = unique_classes[counts >= 2]
-    
-    if len(valid_classes) < len(common_subs):
-        dropped = len(common_subs) - len(valid_classes)
-        print(f"[WARN] Dropping {dropped} subjects who have fewer than 2 beats left in Session 1.")
+    cross_session_partitions = (
+        _partition_closed_set_cross_session_samples(
+            x_train,
+            y_train,
+            x_test,
+            y_test,
+            minimum_session_1_samples=2,
+            minimum_session_2_samples=(
+                minimum_probe_samples
+            ),
+        )
+    )
+
+    (
+        x_train_full,
+        y_train_full,
+    ) = cross_session_partitions[
+        "session_1"
+    ]
+
+    (
+        x_test_filtered,
+        y_test_filtered,
+    ) = cross_session_partitions[
+        "session_2"
+    ]
+
+    dropped_subjects = (
+        cross_session_partitions[
+            "dropped_subjects"
+        ]
+    )
+
+    if len(
+        dropped_subjects[
+            "insufficient_session_1"
+        ]
+    ) > 0:
+        print(
+            "[WARN] Dropping "
+            f"{len(dropped_subjects['insufficient_session_1'])} "
+            "subjects with fewer than 2 surviving "
+            "Session 1 samples."
+        )
+
+    if len(
+        dropped_subjects[
+            "insufficient_session_2"
+        ]
+    ) > 0:
+        print(
+            "[WARN] Dropping "
+            f"{len(dropped_subjects['insufficient_session_2'])} "
+            "subjects with fewer than "
+            f"{minimum_probe_samples} surviving "
+            "Session 2 probe samples."
+        )
         
-    final_train_mask = np.isin(y_train_full, valid_classes)
-    final_test_mask = np.isin(y_test_filtered, valid_classes) # Sync Session 2 again!
-    
-    x_train_full, y_train_full = x_train_full[final_train_mask], y_train_full[final_train_mask]
-    x_test_filtered, y_test_filtered = x_test_filtered[final_test_mask], y_test_filtered[final_test_mask]
-
     # ====================================================
     # 4. ENCODE LABELS
     # ====================================================
