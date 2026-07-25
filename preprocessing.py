@@ -185,15 +185,22 @@ class Preprocessing:
             return sig
         return resample(sig, target_len)
 
-    def preprocess_ecg(self, ecg: np.ndarray, fs: int, 
-                       mode: str = "beat", # 'beat' or 'blind'
-                       # Beat-based params
-                       pre_s: float = 0.2, post_s: float = 0.4, resample_len: int = None,
-                       # Blind params
-                       window_s: float = 5.0, stride_s: float = 1.0,
-                       # Common params
-                       filter_method: str = "butter", filter_kwargs: dict = {},
-                       norm_method: str = "zscore") -> np.ndarray:
+    def preprocess_ecg(
+        self,
+        ecg: np.ndarray,
+        fs: int,
+        mode: str = "beat",
+        pre_s: float = 0.2,
+        post_s: float = 0.4,
+        resample_len: int = None,
+        window_s: float = 5.0,
+        stride_s: float = 1.0,
+        rpeak_method: str = "pantompkins",
+        align_peak: bool = True,
+        filter_method: str = "butter",
+        filter_kwargs: dict = None,
+        norm_method: str = "zscore",
+    ) -> np.ndarray:
         """
         Master Preprocessing Pipeline.
         
@@ -217,14 +224,98 @@ class Preprocessing:
             window_s (float): Window size in seconds.
             stride_s (float): Stride size in seconds.
             
-            [Filter Params]
-            filter_method (str): 'butter', 'fir', 'notch', etc.
-            norm_method (str): 'zscore', 'minmax', or None.
+            [Detection and Alignment Params]
+            rpeak_method (str): NeuroKit2 R-peak detector name.
+            align_peak (bool): Refine each detected R-peak within a local
+                +/-50 ms neighbourhood before segmentation.
+
+            [Filter and Normalization Params]
+            filter_method (str or None): 'butter', 'fir', 'notch',
+                'savgol', or None.
+            filter_kwargs (dict or None): Method-specific filter settings.
+            norm_method (str or None): 'zscore', 'minmax', or None.
             
         Returns:
             np.ndarray: 2D array of shape (Num_Segments, Segment_Length).
                         Returns empty array if processing fails.
         """
+        ecg = np.asarray(ecg)
+
+        if ecg.ndim != 1:
+            raise ValueError("ecg must be a one-dimensional signal.")
+
+        if isinstance(fs, bool) or not np.isscalar(fs) or not np.isfinite(fs):
+            raise ValueError("fs must be a finite positive number.")
+
+        fs = float(fs)
+
+        if fs <= 0.0:
+            raise ValueError("fs must be a finite positive number.")
+
+        if mode not in {"beat", "blind"}:
+            raise ValueError(
+                f"Unknown preprocessing mode: {mode}. Use 'beat' or 'blind'."
+            )
+
+        for parameter_name, value in {
+            "pre_s": pre_s,
+            "post_s": post_s,
+            "window_s": window_s,
+            "stride_s": stride_s,
+        }.items():
+            if (
+                isinstance(value, bool)
+                or not np.isscalar(value)
+                or not np.isfinite(value)
+                or float(value) <= 0.0
+            ):
+                raise ValueError(
+                    f"{parameter_name} must be a finite positive number."
+                )
+
+        if resample_len is not None:
+            if (
+                isinstance(resample_len, bool)
+                or not isinstance(resample_len, (int, np.integer))
+                or int(resample_len) < 1
+            ):
+                raise ValueError(
+                    "resample_len must be a positive integer or None."
+                )
+            resample_len = int(resample_len)
+
+        if not isinstance(rpeak_method, str) or not rpeak_method.strip():
+            raise ValueError("rpeak_method must be a non-empty string.")
+
+        if not isinstance(align_peak, (bool, np.bool_)):
+            raise ValueError("align_peak must be Boolean.")
+
+        supported_filter_methods = {
+            None,
+            "butter",
+            "fir",
+            "notch",
+            "savgol",
+        }
+
+        if filter_method not in supported_filter_methods:
+            raise ValueError(
+                "filter_method must be one of: butter, fir, notch, "
+                "savgol, or None."
+            )
+
+        if filter_kwargs is None:
+            filter_kwargs = {}
+        elif not isinstance(filter_kwargs, dict):
+            raise ValueError("filter_kwargs must be a dictionary or None.")
+        else:
+            filter_kwargs = dict(filter_kwargs)
+
+        if norm_method not in {None, "zscore", "minmax"}:
+            raise ValueError(
+                "norm_method must be 'zscore', 'minmax', or None."
+            )
+
         # -----------------------------------------------------------
         # STEP 1: Filtering
         # -----------------------------------------------------------
@@ -246,13 +337,24 @@ class Preprocessing:
         # -----------------------------------------------------------
         if mode == "beat":
             # --- Mode A: Fiducial (Beat-Based) ---
-            r_locs = self.detect_r_peaks(ecg_clean, fs)
+            r_locs = self.detect_r_peaks(
+                ecg_clean,
+                fs,
+                method=rpeak_method,
+            )
             
             # Need at least 2 R-peaks to be sure of rhythm
             if len(r_locs) < 2:
                 return np.empty((0, 0))
             
-            raw_beats = self.cut_beats(ecg_clean, r_locs, fs, pre_s, post_s, align_peak=True)
+            raw_beats = self.cut_beats(
+                ecg_clean,
+                r_locs,
+                fs,
+                pre_s,
+                post_s,
+                align_peak=bool(align_peak),
+            )
             
             for b in raw_beats:
                 # Optional resampling for beats to ensure strict input size
@@ -263,9 +365,6 @@ class Preprocessing:
         elif mode == "blind":
             # --- Mode B: Non-Fiducial (Blind Window) ---
             segments = self.segment_blind(ecg_clean, fs, window_s, stride_s)
-
-        else:
-            raise ValueError(f"Unknown preprocessing mode: {mode}. Use 'beat' or 'blind'.")
 
         # If segmentation produced nothing (too short signal / no peaks)
         if not segments:

@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import glob
 from typing import List, Optional, Dict
+from collections.abc import Mapping
 import datetime
 import shutil
 import zipfile
@@ -42,6 +43,341 @@ def load_config(config_name: str = "config.yaml") -> dict:
     raise FileNotFoundError(f"Could not find '{config_name}'. Checked: {[str(p) for p in search_paths]}")
 
 CONFIG = load_config()
+
+
+# =============================================================================
+# PREPROCESSING CONFIGURATION
+# =============================================================================
+DEFAULT_PREPROCESSING_CONFIG = {
+    "mode": "beat",
+    "pre_s": 0.2,
+    "post_s": 0.4,
+    "resample_len": None,
+    "window_s": 5.0,
+    "stride_s": 1.0,
+    "rpeak_method": "pantompkins",
+    "align_peak": True,
+    "filter_method": "butter",
+    "filter_parameters": {
+        "low": 0.5,
+        "high": 40.0,
+        "order": 4,
+    },
+    "normalization_method": "zscore",
+}
+
+
+def _normalize_preprocessing_config(*configurations):
+    """
+    Merge and validate preprocessing settings using one canonical schema.
+
+    Configurations are applied from left to right. The function accepts the
+    historical keys used by earlier repository versions, but always returns
+    the complete canonical mapping recorded in caches and experiment logs.
+    """
+    normalized = {
+        **DEFAULT_PREPROCESSING_CONFIG,
+        "filter_parameters": dict(
+            DEFAULT_PREPROCESSING_CONFIG["filter_parameters"]
+        ),
+    }
+
+    canonical_keys = {
+        "mode",
+        "pre_s",
+        "post_s",
+        "resample_len",
+        "window_s",
+        "stride_s",
+        "rpeak_method",
+        "align_peak",
+        "filter_method",
+        "filter_parameters",
+        "normalization_method",
+    }
+
+    legacy_keys = {
+        "window_len",
+        "stride",
+        "bandpass",
+        "lowcut",
+        "highcut",
+        "filter_order",
+        "filter_kwargs",
+        "normalize",
+        "norm_method",
+    }
+
+    for configuration in configurations:
+        if configuration is None:
+            continue
+
+        if not isinstance(configuration, Mapping):
+            raise ValueError(
+                "Preprocessing configuration must be a mapping or None."
+            )
+
+        configuration = dict(configuration)
+        unknown_keys = (
+            set(configuration)
+            - canonical_keys
+            - legacy_keys
+        )
+
+        if unknown_keys:
+            raise ValueError(
+                "Unknown preprocessing parameter(s): "
+                + ", ".join(sorted(str(key) for key in unknown_keys))
+            )
+
+        translated = {}
+
+        for key in canonical_keys - {"filter_parameters"}:
+            if key in configuration:
+                translated[key] = configuration[key]
+
+        if (
+            "window_s" not in configuration
+            and "window_len" in configuration
+        ):
+            translated["window_s"] = configuration["window_len"]
+
+        if (
+            "stride_s" not in configuration
+            and "stride" in configuration
+        ):
+            translated["stride_s"] = configuration["stride"]
+
+        if (
+            "filter_method" not in configuration
+            and "bandpass" in configuration
+        ):
+            bandpass = configuration["bandpass"]
+
+            if not isinstance(bandpass, (bool, np.bool_)):
+                raise ValueError("bandpass must be Boolean.")
+
+            translated["filter_method"] = (
+                "butter" if bandpass else None
+            )
+
+        if (
+            "normalization_method" not in configuration
+            and "norm_method" in configuration
+        ):
+            translated["normalization_method"] = configuration[
+                "norm_method"
+            ]
+        elif (
+            "normalization_method" not in configuration
+            and "normalize" in configuration
+        ):
+            normalize = configuration["normalize"]
+
+            if not isinstance(normalize, (bool, np.bool_)):
+                raise ValueError("normalize must be Boolean.")
+
+            translated["normalization_method"] = (
+                "zscore" if normalize else None
+            )
+
+        if (
+            "filter_method" in translated
+            and translated["filter_method"]
+            != normalized["filter_method"]
+        ):
+            normalized["filter_parameters"] = {}
+
+        normalized.update(translated)
+
+        filter_parameters = {}
+
+        if "filter_kwargs" in configuration:
+            legacy_filter_parameters = configuration["filter_kwargs"]
+
+            if not isinstance(legacy_filter_parameters, Mapping):
+                raise ValueError("filter_kwargs must be a mapping.")
+
+            filter_parameters.update(legacy_filter_parameters)
+
+        if "lowcut" in configuration:
+            filter_parameters["low"] = configuration["lowcut"]
+
+        if "highcut" in configuration:
+            filter_parameters["high"] = configuration["highcut"]
+
+        if "filter_order" in configuration:
+            filter_parameters["order"] = configuration["filter_order"]
+
+        if "filter_parameters" in configuration:
+            explicit_filter_parameters = configuration[
+                "filter_parameters"
+            ]
+
+            if not isinstance(explicit_filter_parameters, Mapping):
+                raise ValueError(
+                    "filter_parameters must be a mapping."
+                )
+
+            filter_parameters.update(explicit_filter_parameters)
+
+        normalized["filter_parameters"].update(filter_parameters)
+
+    normalized["mode"] = str(normalized["mode"]).strip().lower()
+
+    if normalized["mode"] not in {"beat", "blind"}:
+        raise ValueError("mode must be 'beat' or 'blind'.")
+
+    for parameter_name in [
+        "pre_s",
+        "post_s",
+        "window_s",
+        "stride_s",
+    ]:
+        value = normalized[parameter_name]
+
+        if (
+            isinstance(value, (bool, np.bool_))
+            or not isinstance(value, (int, float, np.integer, np.floating))
+            or not np.isfinite(value)
+            or float(value) <= 0.0
+        ):
+            raise ValueError(
+                f"{parameter_name} must be a finite positive number."
+            )
+
+        normalized[parameter_name] = float(value)
+
+    resample_len = normalized["resample_len"]
+
+    if resample_len is not None:
+        if (
+            isinstance(resample_len, (bool, np.bool_))
+            or not isinstance(resample_len, (int, np.integer))
+            or int(resample_len) < 1
+        ):
+            raise ValueError(
+                "resample_len must be a positive integer or None."
+            )
+
+        normalized["resample_len"] = int(resample_len)
+
+    rpeak_method = normalized["rpeak_method"]
+
+    if not isinstance(rpeak_method, str) or not rpeak_method.strip():
+        raise ValueError("rpeak_method must be a non-empty string.")
+
+    normalized["rpeak_method"] = rpeak_method.strip().lower()
+
+    if not isinstance(normalized["align_peak"], (bool, np.bool_)):
+        raise ValueError("align_peak must be Boolean.")
+
+    normalized["align_peak"] = bool(normalized["align_peak"])
+
+    filter_method = normalized["filter_method"]
+
+    if isinstance(filter_method, str):
+        filter_method = filter_method.strip().lower()
+
+        if filter_method in {"", "none", "null"}:
+            filter_method = None
+
+    if filter_method not in {None, "butter", "fir", "notch", "savgol"}:
+        raise ValueError(
+            "filter_method must be one of: butter, fir, notch, "
+            "savgol, or None."
+        )
+
+    normalized["filter_method"] = filter_method
+
+    filter_parameters = dict(normalized["filter_parameters"])
+
+    if filter_method == "butter":
+        order = filter_parameters.get("order", 4)
+
+        if (
+            isinstance(order, (bool, np.bool_))
+            or not isinstance(order, (int, np.integer))
+            or int(order) < 1
+        ):
+            raise ValueError(
+                "Butterworth filter order must be a positive integer."
+            )
+
+        filter_parameters["order"] = int(order)
+
+        for cutoff_name in ["low", "high"]:
+            cutoff = filter_parameters.get(cutoff_name)
+
+            if cutoff is None:
+                continue
+
+            if (
+                isinstance(cutoff, (bool, np.bool_))
+                or not isinstance(
+                    cutoff,
+                    (int, float, np.integer, np.floating),
+                )
+                or not np.isfinite(cutoff)
+                or float(cutoff) <= 0.0
+            ):
+                raise ValueError(
+                    f"Butterworth {cutoff_name} cutoff must be "
+                    "a positive finite number or None."
+                )
+
+            filter_parameters[cutoff_name] = float(cutoff)
+
+        low = filter_parameters.get("low")
+        high = filter_parameters.get("high")
+
+        if low is not None and high is not None and low >= high:
+            raise ValueError(
+                "Butterworth cutoffs must satisfy low < high."
+            )
+
+    if filter_method is None:
+        filter_parameters = {}
+
+    normalized["filter_parameters"] = filter_parameters
+
+    normalization_method = normalized["normalization_method"]
+
+    if isinstance(normalization_method, str):
+        normalization_method = normalization_method.strip().lower()
+
+        if normalization_method in {"", "none", "null"}:
+            normalization_method = None
+
+    if normalization_method not in {None, "zscore", "minmax"}:
+        raise ValueError(
+            "normalization_method must be 'zscore', 'minmax', or None."
+        )
+
+    normalized["normalization_method"] = normalization_method
+
+    return normalized
+
+
+def _preprocess_signal(preprocessor, signal, fs, preprocessing_config):
+    """Apply the complete effective preprocessing configuration."""
+    config = _normalize_preprocessing_config(preprocessing_config)
+
+    return preprocessor.preprocess_ecg(
+        ecg=signal,
+        fs=fs,
+        mode=config["mode"],
+        pre_s=config["pre_s"],
+        post_s=config["post_s"],
+        resample_len=config["resample_len"],
+        window_s=config["window_s"],
+        stride_s=config["stride_s"],
+        rpeak_method=config["rpeak_method"],
+        align_peak=config["align_peak"],
+        filter_method=config["filter_method"],
+        filter_kwargs=dict(config["filter_parameters"]),
+        norm_method=config["normalization_method"],
+    )
 
 # =============================================================================
 # SHARED UTILITIES
@@ -168,7 +504,8 @@ class load_ecgid_dataset():
     """
     def __init__(self, num_beats_to_merge=1, beat_merge_method="average", 
                  data_split_mode="all-available", signal_type="raw", 
-                 cleanup_zip=False, **preprocessing_params):
+                 cleanup_zip=False, preprocessing_config=None,
+                 **preprocessing_params):
         
         self.preprocessor = Preprocessing()
         self.cfg = CONFIG["datasets"]["ecgid"]
@@ -179,7 +516,11 @@ class load_ecgid_dataset():
         self.url = self.cfg["url"]
         
         self.signal_type = "noisy" if signal_type == "raw" else "filtered"
-        self.prep_params = preprocessing_params if preprocessing_params else self.cfg.get("preprocessing", {})
+        self.prep_params = _normalize_preprocessing_config(
+            self.cfg.get("preprocessing", {}),
+            preprocessing_config,
+            preprocessing_params,
+        )
         self.num_beats = num_beats_to_merge
         self.merge_strategy = beat_merge_method
         self.cleanup_zip = cleanup_zip
@@ -249,17 +590,12 @@ class load_ecgid_dataset():
         return recordings
 
     def _process_signal(self, sig, fs):
-        beats = self.preprocessor.preprocess_ecg(
-            ecg=sig, fs=fs, 
-            mode=self.prep_params.get("mode", "beat"),
-            window_s=self.prep_params.get("window_len", 5.0),
-            stride_s=self.prep_params.get("stride", 1.0),
-            pre_s=self.prep_params.get("pre_s", 0.2), 
-            post_s=self.prep_params.get("post_s", 0.4), 
-            filter_method="butter" if self.prep_params.get("bandpass") else None,
-            filter_kwargs={'low': self.prep_params.get("lowcut", 0.5), 'high': self.prep_params.get("highcut", 40.0)},
-            norm_method="zscore" if self.prep_params.get("normalize") else None
-        )
+        beats = _preprocess_signal(
+                self.preprocessor,
+                sig,
+                fs,
+                self.prep_params,
+            )
         
         if self.num_beats == 1: return beats
         if len(beats) < self.num_beats: return np.empty((0, beats.shape[1])) 
@@ -437,18 +773,9 @@ class load_heartprint_dataset():
                  enroll_sessions=["session1"],
                  probe_sessions=["session2"], 
                  num_beats_to_merge=1, beat_merge_method="average", 
-                 cleanup_zip=False, **preprocessing_params):
+                 cleanup_zip=False, preprocessing_config=None,
+                 **preprocessing_params):
        
-        # --- KWARGS GUARD ---
-        allowed_prep_kwargs = ["mode", "window_s", "stride_s", "pre_s", "post_s", "bandpass", "lowcut", "highcut", "normalize"]
-        for k in preprocessing_params.keys():
-            if k not in allowed_prep_kwargs:
-                raise ValueError(
-                    f"\n[ERROR] Unrecognized parameter: '{k}'.\n"
-                    f"Did you misspell a class argument? (e.g., using 'enrol_sessions' instead of 'enroll_sessions')\n"
-                    f"Allowed preprocessing kwargs: {allowed_prep_kwargs}"
-                )
-
         self.preprocessor = Preprocessing()
         self.cfg = CONFIG["datasets"]["heartprint"]
         project_dir = Path(__file__).resolve().parent
@@ -458,7 +785,11 @@ class load_heartprint_dataset():
         self.url = self.cfg["url"]
         
         self.sample_len = self.cfg.get("sample_length", 3747)
-        self.prep_params = preprocessing_params if preprocessing_params else self.cfg.get("preprocessing", {})
+        self.prep_params = _normalize_preprocessing_config(
+            self.cfg.get("preprocessing", {}),
+            preprocessing_config,
+            preprocessing_params,
+        )
         self.num_beats = num_beats_to_merge
         self.merge_strategy = beat_merge_method
         self.cleanup_zip = cleanup_zip
@@ -588,16 +919,12 @@ class load_heartprint_dataset():
         if np.isnan(sig).any() or len(sig) < fs or np.std(sig) < 1e-5: 
             return np.empty((0, 0))
 
-        beats = self.preprocessor.preprocess_ecg(
-            sig, fs=fs, 
-            mode=self.prep_params.get("mode", "beat"),
-            window_s=self.prep_params.get("window_len", 5.0),
-            stride_s=self.prep_params.get("stride", 1.0),
-            pre_s=self.prep_params.get("pre_s", 0.2), post_s=self.prep_params.get("post_s", 0.4),
-            filter_method="butter" if self.prep_params.get("bandpass") else None,
-            filter_kwargs={'low': self.prep_params.get("lowcut", 0.5), 'high': self.prep_params.get("highcut", 40.0)},
-            norm_method="zscore" if self.prep_params.get("normalize") else None
-        )
+        beats = _preprocess_signal(
+                self.preprocessor,
+                sig,
+                fs,
+                self.prep_params,
+            )
         if self.num_beats == 1: return beats
         if len(beats) < self.num_beats: return np.empty((0, beats.shape[1]))
         
@@ -713,7 +1040,8 @@ class load_ptb_dataset():
     """
     def __init__(self, leads=['i'], data_split_mode="all-available",
                  only_healthy=False, num_beats_to_merge=1, beat_merge_method="average", 
-                 cleanup_zip=False, **preprocessing_params):
+                 cleanup_zip=False, preprocessing_config=None,
+                 **preprocessing_params):
        
         self.preprocessor = Preprocessing()
         self.cfg = CONFIG["datasets"]["ptb"]
@@ -723,7 +1051,11 @@ class load_ptb_dataset():
         self.zip_path = self.data_root / self.cfg["zip_name"]
         self.url = self.cfg["url"]
         
-        self.prep_params = preprocessing_params if preprocessing_params else self.cfg.get("preprocessing", {})
+        self.prep_params = _normalize_preprocessing_config(
+            self.cfg.get("preprocessing", {}),
+            preprocessing_config,
+            preprocessing_params,
+        )
         self.target_leads = [l.lower() for l in leads] if isinstance(leads, list) else leads
         self.only_healthy = only_healthy
         self.num_beats = num_beats_to_merge
@@ -838,15 +1170,11 @@ class load_ptb_dataset():
         n_channels = sig.shape[1]
         processed_channels = []
         for c in range(n_channels):
-            processed_channels.append(self.preprocessor.preprocess_ecg(
-                sig[:, c], fs, 
-                mode=self.prep_params.get("mode", "beat"),
-                window_s=self.prep_params.get("window_len", 5.0),
-                stride_s=self.prep_params.get("stride", 1.0),
-                pre_s=self.prep_params.get("pre_s", 0.2), post_s=self.prep_params.get("post_s", 0.4),
-                filter_method="butter" if self.prep_params.get("bandpass") else None,
-                filter_kwargs={'low': self.prep_params.get("lowcut", 0.5), 'high': self.prep_params.get("highcut", 40.0)},
-                norm_method="zscore" if self.prep_params.get("normalize") else None
+            processed_channels.append(_preprocess_signal(
+                self.preprocessor,
+                sig[:, c],
+                fs,
+                self.prep_params,
             ))
         if not processed_channels: return np.empty((0, n_channels, 0))
         min_len = min([len(ch) for ch in processed_channels])
@@ -1023,14 +1351,9 @@ class load_cybhi_dataset():
                  enroll_sessions=["long-term_S1"],
                  probe_sessions=["long-term_S2"], 
                  num_beats_to_merge=1, beat_merge_method="average", 
-                 cleanup_zip=False, **preprocessing_params):
+                 cleanup_zip=False, preprocessing_config=None,
+                 **preprocessing_params):
         
-        # --- KWARGS GUARD ---
-        allowed_prep_kwargs = ["mode", "window_s", "stride_s", "pre_s", "post_s", "bandpass", "lowcut", "highcut", "normalize"]
-        for k in preprocessing_params.keys():
-            if k not in allowed_prep_kwargs:
-                raise ValueError(f"\n[ERROR] Unrecognized parameter: '{k}'. Did you misspell an argument?")
-
         self.preprocessor = Preprocessing()
         self.cfg = CONFIG["datasets"]["cybhi"]
         project_dir = Path(__file__).resolve().parent
@@ -1039,7 +1362,11 @@ class load_cybhi_dataset():
         self.zip_path = self.data_root / self.cfg["zip_name"]
         self.url = self.cfg["url"]
         
-        self.prep_params = preprocessing_params if preprocessing_params else self.cfg.get("preprocessing", {})
+        self.prep_params = _normalize_preprocessing_config(
+            self.cfg.get("preprocessing", {}),
+            preprocessing_config,
+            preprocessing_params,
+        )
         self.num_beats = num_beats_to_merge
         self.merge_strategy = beat_merge_method
         self.cleanup_zip = cleanup_zip
@@ -1179,16 +1506,12 @@ class load_cybhi_dataset():
         if np.isnan(sig).any() or len(sig) < fs or np.std(sig) < 1e-5: 
             return np.empty((0, 0))
 
-        beats = self.preprocessor.preprocess_ecg(
-            sig, fs=fs, 
-            mode=self.prep_params.get("mode", "beat"),
-            window_s=self.prep_params.get("window_len", 5.0),
-            stride_s=self.prep_params.get("stride", 1.0),
-            pre_s=self.prep_params.get("pre_s", 0.2), post_s=self.prep_params.get("post_s", 0.4),
-            filter_method="butter" if self.prep_params.get("bandpass") else None,
-            filter_kwargs={'low': self.prep_params.get("lowcut", 0.5), 'high': self.prep_params.get("highcut", 40.0)},
-            norm_method="zscore" if self.prep_params.get("normalize") else None
-        )
+        beats = _preprocess_signal(
+                self.preprocessor,
+                sig,
+                fs,
+                self.prep_params,
+            )
         if self.num_beats == 1: return beats
         if len(beats) < self.num_beats: return np.empty((0, beats.shape[1]))
         
@@ -1299,7 +1622,8 @@ class load_mitbih_dataset():
     def __init__(self, leads=['MLII'], data_split_mode="all-available", 
                  single_segment_range=(0, 5), train_parts=None, enrol_parts=None, 
                  test_parts=None, num_beats_to_merge=1, beat_merge_method="average", 
-                 cleanup_zip=False, **preprocessing_params):
+                 cleanup_zip=False, preprocessing_config=None,
+                 **preprocessing_params):
         
         self.preprocessor = Preprocessing()
         self.cfg = CONFIG["datasets"]["mitbih"]
@@ -1309,7 +1633,11 @@ class load_mitbih_dataset():
         self.zip_path = self.data_root / self.cfg["zip_name"]
         self.url = self.cfg["url"]
         
-        self.prep_params = preprocessing_params if preprocessing_params else self.cfg.get("preprocessing", {})
+        self.prep_params = _normalize_preprocessing_config(
+            self.cfg.get("preprocessing", {}),
+            preprocessing_config,
+            preprocessing_params,
+        )
         self.target_leads = [l.lower() for l in leads] if isinstance(leads, list) else leads
         self.num_beats = num_beats_to_merge
         self.merge_strategy = beat_merge_method
@@ -1380,15 +1708,11 @@ class load_mitbih_dataset():
         n_channels = sig.shape[1]
         processed_channels = []
         for c in range(n_channels):
-            processed_channels.append(self.preprocessor.preprocess_ecg(
-                sig[:, c], fs, 
-                mode=self.prep_params.get("mode", "beat"),
-                window_s=self.prep_params.get("window_len", 5.0),
-                stride_s=self.prep_params.get("stride", 1.0),
-                pre_s=self.prep_params.get("pre_s", 0.2), post_s=self.prep_params.get("post_s", 0.4),
-                filter_method="butter" if self.prep_params.get("bandpass") else None,
-                filter_kwargs={'low': self.prep_params.get("lowcut", 0.5), 'high': self.prep_params.get("highcut", 40.0)},
-                norm_method="zscore" if self.prep_params.get("normalize") else None
+            processed_channels.append(_preprocess_signal(
+                self.preprocessor,
+                sig[:, c],
+                fs,
+                self.prep_params,
             ))
         if not processed_channels: return np.empty((0, n_channels, 0))
         min_len = min([len(ch) for ch in processed_channels])
@@ -1549,7 +1873,8 @@ class load_nsrdb_dataset():
     def __init__(self, leads=['ECG1'], data_split_mode="all-available", 
                  single_segment_range=(0, 60), train_parts=None, enrol_parts=None, 
                  test_parts=None, num_beats_to_merge=1, beat_merge_method="average", 
-                 cleanup_zip=False, **preprocessing_params):
+                 cleanup_zip=False, preprocessing_config=None,
+                 **preprocessing_params):
        
         self.preprocessor = Preprocessing()
         self.cfg = CONFIG["datasets"]["nsrdb"]
@@ -1559,7 +1884,11 @@ class load_nsrdb_dataset():
         self.zip_path = self.data_root / self.cfg["zip_name"]
         self.url = self.cfg["url"]
         
-        self.prep_params = preprocessing_params if preprocessing_params else self.cfg.get("preprocessing", {})
+        self.prep_params = _normalize_preprocessing_config(
+            self.cfg.get("preprocessing", {}),
+            preprocessing_config,
+            preprocessing_params,
+        )
         self.target_leads = [l.lower() for l in leads] if isinstance(leads, list) else leads
         self.num_beats = num_beats_to_merge
         self.merge_strategy = beat_merge_method
@@ -1653,15 +1982,11 @@ class load_nsrdb_dataset():
         n_channels = sig.shape[1]
         processed_channels = []
         for c in range(n_channels):
-            processed_channels.append(self.preprocessor.preprocess_ecg(
-                sig[:, c], fs, 
-                mode=self.prep_params.get("mode", "beat"),
-                window_s=self.prep_params.get("window_len", 5.0),
-                stride_s=self.prep_params.get("stride", 1.0),
-                pre_s=self.prep_params.get("pre_s", 0.2), post_s=self.prep_params.get("post_s", 0.4),
-                filter_method="butter" if self.prep_params.get("bandpass") else None,
-                filter_kwargs={'low': self.prep_params.get("lowcut", 0.5), 'high': self.prep_params.get("highcut", 40.0)},
-                norm_method="zscore" if self.prep_params.get("normalize") else None
+            processed_channels.append(_preprocess_signal(
+                self.preprocessor,
+                sig[:, c],
+                fs,
+                self.prep_params,
             ))
         if not processed_channels: return np.empty((0, n_channels, 0))
         min_len = min([len(ch) for ch in processed_channels])
@@ -1796,7 +2121,8 @@ class load_ptbxl_dataset():
     def __init__(self, leads=['i'], resolution='high', only_healthy=False, 
                  data_split_mode="all-available", num_beats_to_merge=1, 
                  beat_merge_method="average", limit_records=None, 
-                 cleanup_zip=False, **preprocessing_params):
+                 cleanup_zip=False, preprocessing_config=None,
+                 **preprocessing_params):
        
         self.preprocessor = Preprocessing()
         self.cfg = CONFIG["datasets"]["ptbxl"]
@@ -1806,7 +2132,11 @@ class load_ptbxl_dataset():
         self.zip_path = self.data_root / self.cfg["zip_name"]
         self.url = self.cfg["url"]
         
-        self.prep_params = preprocessing_params if preprocessing_params else self.cfg.get("preprocessing", {})
+        self.prep_params = _normalize_preprocessing_config(
+            self.cfg.get("preprocessing", {}),
+            preprocessing_config,
+            preprocessing_params,
+        )
         self.target_leads = [l.lower() for l in leads] if isinstance(leads, list) else leads
         self.resolution = resolution
         self.only_healthy = only_healthy
@@ -1908,15 +2238,11 @@ class load_ptbxl_dataset():
         n_channels = sig.shape[1]
         processed_channels = []
         for c in range(n_channels):
-            processed_channels.append(self.preprocessor.preprocess_ecg(
-                sig[:, c], fs, 
-                mode=self.prep_params.get("mode", "beat"),
-                window_s=self.prep_params.get("window_len", 5.0),
-                stride_s=self.prep_params.get("stride", 1.0),
-                pre_s=self.prep_params.get("pre_s", 0.2), post_s=self.prep_params.get("post_s", 0.4),
-                filter_method="butter" if self.prep_params.get("bandpass") else None,
-                filter_kwargs={'low': self.prep_params.get("lowcut", 0.5), 'high': self.prep_params.get("highcut", 40.0)},
-                norm_method="zscore" if self.prep_params.get("normalize") else None
+            processed_channels.append(_preprocess_signal(
+                self.preprocessor,
+                sig[:, c],
+                fs,
+                self.prep_params,
             ))
         if not processed_channels: return np.empty((0, n_channels, 0))
         min_len = min([len(ch) for ch in processed_channels])

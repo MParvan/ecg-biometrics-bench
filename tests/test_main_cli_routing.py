@@ -474,6 +474,7 @@ class MainCLIRoutingTests(unittest.TestCase):
                 loader_constructor.assert_called_once_with(
                     data_split_mode="all-available",
                     num_beats_to_merge=1,
+                    preprocessing_config={},
                     signal_type="raw",
                 )
 

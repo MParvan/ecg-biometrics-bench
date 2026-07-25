@@ -425,6 +425,14 @@ def validate_experiment_arguments(args, parser):
         normalized_augmentation["parameters"]
     )
 
+    if not isinstance(
+        args.preprocessing_parameters,
+        dict,
+    ):
+        parser.error(
+            "'preprocessing_parameters' must be a mapping."
+        )
+
     # ---------------------------------------------------------
     # 6. Session-list validation
     # ---------------------------------------------------------
@@ -789,6 +797,17 @@ def get_parser():
                             help="Target session if running intra-session tasks (1-4) on multi-session datasets.")
     data_group.add_argument('--num_beats_to_merge', type=int, default=1,
                             help="Consecutive beats to fuse natively in the loader (default: 1).")
+    data_group.add_argument(
+        '--preprocessing_parameters',
+        type=_parse_json_mapping,
+        default={},
+        metavar='JSON_OBJECT',
+        help=(
+            "Explicit preprocessing overrides as a JSON object. "
+            "The effective canonical mapping is stored in caches and "
+            "experiment logs."
+        ),
+    )
     data_group.add_argument('--signal_type', type=str, default='raw', choices=['raw', 'filtered'],
                             help="For ECG-ID (raw vs filtered channel).")
     data_group.add_argument(
@@ -1045,7 +1064,10 @@ def main():
     # Build a kwargs dictionary dynamically, omitting None values
     loader_kwargs = {
         'data_split_mode': args.data_split_mode,
-        'num_beats_to_merge': args.num_beats_to_merge
+        'num_beats_to_merge': args.num_beats_to_merge,
+        'preprocessing_config': (
+            args.preprocessing_parameters
+        ),
     }
     
     if args.train_sessions: loader_kwargs['train_sessions'] = args.train_sessions

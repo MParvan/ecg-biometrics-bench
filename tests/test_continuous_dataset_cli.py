@@ -128,6 +128,7 @@ class ContinuousDatasetCLITests(
         constructor_mock.assert_called_once_with(
             data_split_mode="custom-split",
             num_beats_to_merge=1,
+            preprocessing_config={},
             train_parts=[
                 (0.0, 5.0),
                 (10.0, 15.0),
@@ -213,6 +214,7 @@ class ContinuousDatasetCLITests(
         constructor_mock.assert_called_once_with(
             data_split_mode="single-segment",
             num_beats_to_merge=1,
+            preprocessing_config={},
             single_segment_range=(
                 60.0,
                 120.0,

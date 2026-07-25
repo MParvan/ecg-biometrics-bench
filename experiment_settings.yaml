@@ -20,7 +20,26 @@ val_split: 0.0          # No validation split by default
 seed: 42                # Random seed for reproducibility across splits and weights
 n_runs: 5               # Number of independent runs (with varying seeds) for robust statistical validation
 
-# --- 3. TRAINING-ONLY DATA AUGMENTATION ---
+# --- 3. PREPROCESSING OVERRIDES ---
+# These settings make the submitted benchmark preprocessing explicit.
+# They preserve the numerical behaviour used to produce the original tables.
+preprocessing_parameters:
+  mode: 'beat'
+  pre_s: 0.2
+  post_s: 0.4
+  resample_len: null
+  window_s: 5.0
+  stride_s: 1.0
+  rpeak_method: 'pantompkins'
+  align_peak: true
+  filter_method: 'butter'
+  filter_parameters:
+    low: 0.5
+    high: 40.0
+    order: 4
+  normalization_method: 'zscore'
+
+# --- 4. TRAINING-ONLY DATA AUGMENTATION ---
 # Augmentation is applied only after the final training/validation split.
 # Validation, enrollment, gallery, calibration, test, and probe samples remain unchanged.
 use_augmentation: false
@@ -39,7 +58,7 @@ augmentation_copies: 1
 # Gaussian example: {std: 0.02, relative: true}
 augmentation_parameters: {}
 
-# --- 4. BIOMETRIC EVALUATION & TEMPLATE SETTINGS ---
+# --- 5. BIOMETRIC EVALUATION & TEMPLATE SETTINGS ---
 use_template: true      # true: Extract features for Gallery/Probe matching. false: Standard Softmax classification
 template_fusion_method: 'mean'
 # Available options:
@@ -70,14 +89,14 @@ sampling_mode: 'all'
 
 use_deployment_evaluation: false # true: Calculates Global Threshold on Validation set, applies to Test set
 
-# --- 5. SIGNAL QUALITY & OUTLIER FILTERING ---
+# --- 6. SIGNAL QUALITY & OUTLIER FILTERING ---
 outlier_filtering_on_train: false  # true: Filters noisy beats during representation learning/enrollment
 outlier_filtering_on_test: false   # true: Filters noisy beats from probes before matching
 sqi_method: 'kurtosis'             # SQI calculation metric (e.g., 'kurtosis')
 sqi_threshold: 0.05                # Absolute minimum SQI score required to keep a beat (0.0 to 1.0)
 sqi_keep_pct: 0.80                 # Top percentage of beats to keep per subject after filtering (e.g., 0.80 = 80%)
 
-# --- 6. HARDWARE & LOGGING ---
+# --- 7. HARDWARE & LOGGING ---
 device: 'auto'                  # 'cuda' (GPU), 'cpu', or 'auto' (detects available hardware)
 visualize: false                # true: Generates t-SNE scatter plots and confusion matrices (disable for multi-run loops)
 save_results_and_settings: true # true: Automatically writes params and metrics to .txt logs
