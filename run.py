@@ -432,6 +432,214 @@ def _validate_deployment_evaluation(
             "is not permitted."
         )
 
+def _split_subject_cohorts(
+    subjects,
+    test_split,
+    val_split,
+    seed,
+):
+    """
+    Split unique subjects into disjoint train, validation, and test cohorts.
+
+    ``test_split`` is applied first to the complete eligible subject set.
+    ``val_split`` is then applied to the remaining training-subject pool,
+    preserving the framework's existing split semantics.
+
+    Returns:
+        tuple:
+            (
+                train_subjects,
+                validation_subjects,
+                test_subjects,
+            )
+    """
+    subject_array = np.asarray(
+        subjects
+    )
+
+    if subject_array.ndim != 1:
+        raise ValueError(
+            "subjects must be a one-dimensional sequence."
+        )
+
+    unique_subjects = np.unique(
+        subject_array
+    )
+
+    if len(unique_subjects) < 2:
+        raise ValueError(
+            "At least two unique subjects are required "
+            "to create train and test cohorts."
+        )
+
+    split_values = {
+        "test_split": test_split,
+        "val_split": val_split,
+    }
+
+    normalized_splits = {}
+
+    for split_name, split_value in (
+        split_values.items()
+    ):
+        if isinstance(
+            split_value,
+            (
+                bool,
+                np.bool_,
+            ),
+        ):
+            raise ValueError(
+                f"{split_name} must be numeric, not Boolean."
+            )
+
+        try:
+            normalized_value = float(
+                split_value
+            )
+        except (
+            TypeError,
+            ValueError,
+        ) as error:
+            raise ValueError(
+                f"{split_name} must be numeric."
+            ) from error
+
+        if not np.isfinite(
+            normalized_value
+        ):
+            raise ValueError(
+                f"{split_name} must be finite."
+            )
+
+        normalized_splits[
+            split_name
+        ] = normalized_value
+
+    test_fraction = normalized_splits[
+        "test_split"
+    ]
+
+    validation_fraction = normalized_splits[
+        "val_split"
+    ]
+
+    if not 0.0 < test_fraction < 1.0:
+        raise ValueError(
+            "test_split must satisfy 0 < test_split < 1."
+        )
+
+    if not 0.0 <= validation_fraction < 1.0:
+        raise ValueError(
+            "val_split must satisfy 0 <= val_split < 1."
+        )
+
+    try:
+        train_validation_subjects, test_subjects = (
+            train_test_split(
+                unique_subjects,
+                test_size=test_fraction,
+                random_state=seed,
+            )
+        )
+    except ValueError as error:
+        raise ValueError(
+            "Unable to create train and test subject "
+            "cohorts from the available subjects."
+        ) from error
+
+    if validation_fraction > 0.0:
+        if len(train_validation_subjects) < 2:
+            raise ValueError(
+                "At least two subjects must remain after "
+                "the test split when val_split is positive."
+            )
+
+        try:
+            (
+                train_subjects,
+                validation_subjects,
+            ) = train_test_split(
+                train_validation_subjects,
+                test_size=validation_fraction,
+                random_state=seed,
+            )
+        except ValueError as error:
+            raise ValueError(
+                "Unable to create train and validation "
+                "subject cohorts from the remaining subjects."
+            ) from error
+    else:
+        train_subjects = (
+            train_validation_subjects
+        )
+
+        validation_subjects = np.asarray(
+            [],
+            dtype=unique_subjects.dtype,
+        )
+
+    train_subjects = np.asarray(
+        train_subjects
+    )
+
+    validation_subjects = np.asarray(
+        validation_subjects
+    )
+
+    test_subjects = np.asarray(
+        test_subjects
+    )
+
+    train_set = set(
+        train_subjects.tolist()
+    )
+
+    validation_set = set(
+        validation_subjects.tolist()
+    )
+
+    test_set = set(
+        test_subjects.tolist()
+    )
+
+    all_subjects = set(
+        unique_subjects.tolist()
+    )
+
+    if train_set & validation_set:
+        raise RuntimeError(
+            "Train and validation subject cohorts overlap."
+        )
+
+    if train_set & test_set:
+        raise RuntimeError(
+            "Train and test subject cohorts overlap."
+        )
+
+    if validation_set & test_set:
+        raise RuntimeError(
+            "Validation and test subject cohorts overlap."
+        )
+
+    assigned_subjects = (
+        train_set
+        | validation_set
+        | test_set
+    )
+
+    if assigned_subjects != all_subjects:
+        raise RuntimeError(
+            "Subject cohort splitting did not preserve "
+            "the complete eligible subject set."
+        )
+
+    return (
+        train_subjects,
+        validation_subjects,
+        test_subjects,
+    )
+
 # =============================================================================
 # MULTI-RUN ARGUMENT HANDLING
 # =============================================================================
@@ -1506,21 +1714,56 @@ def run_subject_disjoint_identification(x, y, model_class, epochs=150, batch_siz
     # ====================================================
     # 3. SPLIT SUBJECTS (Strictly Disjoint)
     # ====================================================
-    y_enc, classes = _encode_labels(y)
-    unique_subjs = np.unique(y_enc)
-    
-    train_subs_full, test_subs = train_test_split(unique_subjs, test_size=test_split, random_state=seed)
-    
-    if val_split > 0.0:
-        train_subs, val_subs = train_test_split(train_subs_full, test_size=val_split, random_state=seed)
-        val_mask = np.isin(y_enc, val_subs)
-        X_val, y_val = x[val_mask], y_enc[val_mask]
-        if sqi_scores is not None: sqi_val = sqi_scores[val_mask]
-        print(f"Subject Split: Train={len(train_subs)}, Val={len(val_subs)}, Test={len(test_subs)}")
+    y_enc, classes = _encode_labels(
+        y
+    )
+
+    unique_subjs = np.unique(
+        y_enc
+    )
+
+    (
+        train_subs,
+        val_subs,
+        test_subs,
+    ) = _split_subject_cohorts(
+        unique_subjs,
+        test_split=test_split,
+        val_split=val_split,
+        seed=seed,
+    )
+
+    if len(val_subs) > 0:
+        val_mask = np.isin(
+            y_enc,
+            val_subs,
+        )
+
+        X_val = x[val_mask]
+        y_val = y_enc[val_mask]
+
+        if sqi_scores is not None:
+            sqi_val = sqi_scores[
+                val_mask
+            ]
+
+        print(
+            "Subject Split: "
+            f"Train={len(train_subs)}, "
+            f"Val={len(val_subs)}, "
+            f"Test={len(test_subs)}"
+        )
     else:
-        train_subs = train_subs_full
-        X_val, y_val, sqi_val, val_subs = None, None, None, None
-        print(f"Subject Split: Train={len(train_subs)}, Val=0, Test={len(test_subs)}")
+        X_val = None
+        y_val = None
+        sqi_val = None
+
+        print(
+            "Subject Split: "
+            f"Train={len(train_subs)}, "
+            "Val=0, "
+            f"Test={len(test_subs)}"
+        )
 
     train_mask = np.isin(y_enc, train_subs)
     X_train, y_train = x[train_mask], y_enc[train_mask]
@@ -1894,21 +2137,51 @@ def run_subject_disjoint_verification(x, y, model_class, epochs=150, batch_size=
     # ====================================================
     # 3. SPLIT SUBJECTS (Strictly Disjoint)
     # ====================================================
-    y_enc, classes = _encode_labels(y)
-    unique_subjs = np.unique(y_enc)
-    
-    train_subs_full, test_subs = train_test_split(unique_subjs, test_size=test_split, random_state=seed)
-    
-    if val_split > 0.0:
-        train_subs, val_subs = train_test_split(train_subs_full, test_size=val_split, random_state=seed)
-        val_mask = np.isin(y_enc, val_subs)
-        X_val, y_val = x[val_mask], y_enc[val_mask]
-        if sqi_scores is not None: sqi_val = sqi_scores[val_mask]
-        print(f"Subject Split: Train={len(train_subs)}, Val={len(val_subs)}, Test={len(test_subs)}")
+    y_enc, classes = _encode_labels(
+        y
+    )
+
+    unique_subjs = np.unique(
+        y_enc
+    )
+
+    (
+        train_subs,
+        val_subs,
+        test_subs,
+    ) = _split_subject_cohorts(
+        unique_subjs,
+        test_split=test_split,
+        val_split=val_split,
+        seed=seed,
+    )
+
+    if len(val_subs) > 0:
+        val_mask = np.isin(
+            y_enc,
+            val_subs,
+        )
+
+        X_val = x[val_mask]
+        y_val = y_enc[val_mask]
+
+        if sqi_scores is not None:
+            sqi_val = sqi_scores[
+                val_mask
+            ]
+        else:
+            sqi_val = None
     else:
-        train_subs = train_subs_full
-        X_val, y_val, sqi_val, val_subs = None, None, None, None
-        print(f"Subject Split: Train={len(train_subs)}, Val=0, Test={len(test_subs)}")
+        X_val = None
+        y_val = None
+        sqi_val = None
+
+    print(
+        "Subject Split: "
+        f"Train={len(train_subs)}, "
+        f"Val={len(val_subs)}, "
+        f"Test={len(test_subs)}"
+    )
 
     train_mask = np.isin(y_enc, train_subs)
     X_train, y_train = x[train_mask], y_enc[train_mask]
@@ -2995,15 +3268,23 @@ def run_subject_disjoint_cross_session_identification(
         raise ValueError("[ERROR] Not enough common subjects across sessions after filtering.")
         
     # Split the distinct subjects into Train, Val, and Test cohorts
-    train_subs_full, test_subs = train_test_split(common_subs, test_size=test_split, random_state=seed)
-    
-    if val_split > 0.0:
-        train_subs, val_subs = train_test_split(train_subs_full, test_size=val_split, random_state=seed)
-        print(f"Subject Split: Train={len(train_subs)}, Val={len(val_subs)}, Test={len(test_subs)}")
-    else:
-        train_subs = train_subs_full
-        val_subs = []
-        print(f"Subject Split: Train={len(train_subs)}, Val=0, Test={len(test_subs)}")
+    (
+        train_subs,
+        val_subs,
+        test_subs,
+    ) = _split_subject_cohorts(
+        common_subs,
+        test_split=test_split,
+        val_split=val_split,
+        seed=seed,
+    )
+
+    print(
+        "Subject Split: "
+        f"Train={len(train_subs)}, "
+        f"Val={len(val_subs)}, "
+        f"Test={len(test_subs)}"
+    )
 
     # Extract respective datasets based on the disjoint subject split
     X_train, Y_train = x_s1[np.isin(y_s1, train_subs)], y_s1[np.isin(y_s1, train_subs)]
@@ -3330,15 +3611,23 @@ def run_subject_disjoint_cross_session_verification(
     if len(common_subs) < 2: 
         raise ValueError("[ERROR] Not enough common subjects across sessions after filtering.")
         
-    train_subs_full, test_subs = train_test_split(common_subs, test_size=test_split, random_state=seed)
-    
-    if val_split > 0.0:
-        train_subs, val_subs = train_test_split(train_subs_full, test_size=val_split, random_state=seed)
-        print(f"Subject Split: Train={len(train_subs)}, Val={len(val_subs)}, Test={len(test_subs)}")
-    else:
-        train_subs = train_subs_full
-        val_subs = []
-        print(f"Subject Split: Train={len(train_subs)}, Val=0, Test={len(test_subs)}")
+    (
+        train_subs,
+        val_subs,
+        test_subs,
+    ) = _split_subject_cohorts(
+        common_subs,
+        test_split=test_split,
+        val_split=val_split,
+        seed=seed,
+    )
+
+    print(
+        "Subject Split: "
+        f"Train={len(train_subs)}, "
+        f"Val={len(val_subs)}, "
+        f"Test={len(test_subs)}"
+    )
 
     X_train, Y_train = x_s1[np.isin(y_s1, train_subs)], y_s1[np.isin(y_s1, train_subs)]
     
