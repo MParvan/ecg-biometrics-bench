@@ -695,16 +695,6 @@ def run_closed_set_identification(x, y, model_class, epochs=150, batch_size=256,
     if n_runs > 1:
         # Capture current arguments to repeat the experiment
         call_args = _prepare_multi_run_arguments(locals())
-        
-        # CLEANUP: Crucial step. Remove internal variables from the dict so we don't 
-        # pass 'data_stats' or 'hyperparams' as arguments to the next call.
-        for k in ['data_stats', 'hyperparams', 'call_args', 'intelligent_weight_loading']: 
-            call_args.pop(k, None)
-        
-        # Configure the sub-runs: 
-        # - Disable their internal logging (we log the aggregate instead)
-        # - Tell them to return their stats so we can capture them
-        call_args.update({'n_runs': 1, '_return_stats': True, 'save_results_and_settings': False})
         base_seed = call_args.get('seed', 42)
         results = []
         
@@ -1077,9 +1067,6 @@ def run_closed_set_verification(x, y, model_class, epochs=150, batch_size=256, l
     # --- MULTI-RUN AGGREGATOR ---
     if n_runs > 1:
         call_args = _prepare_multi_run_arguments(locals())
-        for k in ['data_stats', 'hyperparams', 'call_args', 'intelligent_weight_loading']: 
-            call_args.pop(k, None)
-        call_args.update({'n_runs': 1, '_return_stats': True, 'save_results_and_settings': False})
         base_seed = call_args.get('seed', 42)
         results = []
         
@@ -1454,8 +1441,6 @@ def run_subject_disjoint_identification(x, y, model_class, epochs=150, batch_siz
 
     if n_runs > 1:
         call_args = _prepare_multi_run_arguments(locals())
-        for k in ['data_stats', 'hyperparams', 'call_args', 'intelligent_weight_loading']: call_args.pop(k, None)
-        call_args.update({'n_runs': 1, '_return_stats': True, 'save_results_and_settings': False})
         base_seed = call_args.get('seed', 42)
         results = []
         
@@ -1836,8 +1821,6 @@ def run_subject_disjoint_verification(x, y, model_class, epochs=150, batch_size=
 
     if n_runs > 1:
         call_args = _prepare_multi_run_arguments(locals())
-        for k in ['data_stats', 'hyperparams', 'call_args', 'intelligent_weight_loading']: call_args.pop(k, None)
-        call_args.update({'n_runs': 1, '_return_stats': True, 'save_results_and_settings': False})
         base_seed = call_args.get('seed', 42)
         results = []
         
@@ -2248,8 +2231,6 @@ def run_cross_session_identification(x_train, y_train, x_test, y_test, model_cla
 
     if n_runs > 1:
         call_args = _prepare_multi_run_arguments(locals())
-        for k in ['data_stats', 'hyperparams', 'call_args', 'intelligent_weight_loading']: call_args.pop(k, None)
-        call_args.update({'n_runs': 1, '_return_stats': True, 'save_results_and_settings': False})
         base_seed = call_args.get('seed', 42)
         results = []
         
@@ -2580,8 +2561,6 @@ def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class
 
     if n_runs > 1:
         call_args = _prepare_multi_run_arguments(locals())
-        for k in ['data_stats', 'hyperparams', 'call_args', 'intelligent_weight_loading']: call_args.pop(k, None)
-        call_args.update({'n_runs': 1, '_return_stats': True, 'save_results_and_settings': False})
         base_seed = call_args.get('seed', 42)
         results = []
         
@@ -2924,8 +2903,6 @@ def run_subject_disjoint_cross_session_identification(
 
     if n_runs > 1:
         call_args = _prepare_multi_run_arguments(locals())
-        for k in ['data_stats', 'hyperparams', 'call_args', 'intelligent_weight_loading']: call_args.pop(k, None)
-        call_args.update({'n_runs': 1, '_return_stats': True, 'save_results_and_settings': False})
         base_seed = call_args.get('seed', 42)
         results = []
         
@@ -3263,8 +3240,6 @@ def run_subject_disjoint_cross_session_verification(
 
     if n_runs > 1:
         call_args = _prepare_multi_run_arguments(locals())
-        for k in ['data_stats', 'hyperparams', 'call_args', 'intelligent_weight_loading']: call_args.pop(k, None)
-        call_args.update({'n_runs': 1, '_return_stats': True, 'save_results_and_settings': False})
         base_seed = call_args.get('seed', 42)
         results = []
         
