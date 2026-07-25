@@ -3,6 +3,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import Mock
 
 import yaml
 
@@ -63,6 +64,8 @@ class AugmentationAblationRunnerTests(
 
     def test_augmented_config_preserves_base_and_parameters(self):
         base = {
+            "dataset": "ecgid",
+            "task": 2,
             "epochs": 3,
         }
 
@@ -76,6 +79,14 @@ class AugmentationAblationRunnerTests(
             },
         )
 
+        self.assertEqual(
+            config["dataset"],
+            "ecgid",
+        )
+        self.assertEqual(
+            config["task"],
+            2,
+        )
         self.assertEqual(
             config["epochs"],
             3,
@@ -205,6 +216,58 @@ class AugmentationAblationRunnerTests(
         self.assertEqual(
             detected,
             new_log.resolve(),
+        )
+
+    def test_target_is_read_from_yaml_and_cli_can_override(self):
+        parser = Mock()
+        base_config = {
+            "dataset": "ptb",
+            "task": 1,
+        }
+
+        dataset, task = ablation._resolve_experiment_target(
+            None,
+            None,
+            base_config,
+            parser,
+        )
+        self.assertEqual(
+            (dataset, task),
+            ("ptb", 1),
+        )
+
+        dataset, task = ablation._resolve_experiment_target(
+            "ecgid",
+            2,
+            base_config,
+            parser,
+        )
+        self.assertEqual(
+            (dataset, task),
+            ("ecgid", 2),
+        )
+        parser.error.assert_not_called()
+
+    def test_main_command_uses_only_self_contained_config(self):
+        command = ablation._build_main_command(
+            Path("project"),
+            Path("variant.yaml"),
+        )
+
+        self.assertEqual(
+            command[-2:],
+            [
+                "--config",
+                "variant.yaml",
+            ],
+        )
+        self.assertNotIn(
+            "--dataset",
+            command,
+        )
+        self.assertNotIn(
+            "--task",
+            command,
         )
 
     def test_summary_csv_and_json_are_written(self):

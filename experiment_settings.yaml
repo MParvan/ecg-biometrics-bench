@@ -1,8 +1,29 @@
 # ==============================================================================
-# 🫀 ECG BIOMETRICS FRAMEWORK - GLOBAL EXPERIMENT CONFIGURATION
+# ECG BIOMETRICS FRAMEWORK - SELF-CONTAINED EXPERIMENT CONFIGURATION
 # ==============================================================================
 
-# --- 1. CORE MODEL SETTINGS ---
+# --- 1. EXPERIMENT IDENTITY AND DATA ROUTING ---
+# These values make this file directly executable with:
+# python main.py --config experiment_settings.yaml
+dataset: 'ecgid'
+task: 1
+data_split_mode: 'all-available'
+signal_type: 'raw'
+num_beats_to_merge: 1
+
+# Session-based datasets (HeartPrint and CYBHi).
+train_sessions: null
+enroll_sessions: null
+probe_sessions: null
+session_for_single_session_evaluation: null
+
+# Continuous datasets (MIT-BIH and NSRDB).
+single_segment_range: null
+train_parts: null
+enrol_parts: null
+test_parts: null
+
+# --- 2. CORE MODEL SETTINGS ---
 model: 'deepecg'
 # Available options:
 # - 'deepecg'     : DeepECG CNN architecture (Default, highly effective)
@@ -11,7 +32,7 @@ model: 'deepecg'
 # - 'hybrid'      : CNN-LSTM Hybrid architecture
 # - 'transformer' : ECG Transformer network
 
-# --- 2. TRAINING HYPERPARAMETERS ---
+# --- 3. TRAINING HYPERPARAMETERS ---
 epochs: 150             # Maximum number of training epochs
 batch_size: 256         # Number of ECG signals per training batch
 lr: 0.001               # Learning rate for the Adam optimizer (e.g., 1e-3)
@@ -20,7 +41,7 @@ val_split: 0.0          # No validation split by default
 seed: 42                # Random seed for reproducibility across splits and weights
 n_runs: 5               # Number of independent runs (with varying seeds) for robust statistical validation
 
-# --- 3. PREPROCESSING OVERRIDES ---
+# --- 4. PREPROCESSING OVERRIDES ---
 # These settings make the submitted benchmark preprocessing explicit.
 # They preserve the numerical behaviour used to produce the original tables.
 preprocessing_parameters:
@@ -39,7 +60,7 @@ preprocessing_parameters:
     order: 4
   normalization_method: 'zscore'
 
-# --- 4. TRAINING-ONLY DATA AUGMENTATION ---
+# --- 5. TRAINING-ONLY DATA AUGMENTATION ---
 # Augmentation is applied only after the final training/validation split.
 # Validation, enrollment, gallery, calibration, test, and probe samples remain unchanged.
 use_augmentation: false
@@ -58,7 +79,7 @@ augmentation_copies: 1
 # Gaussian example: {std: 0.02, relative: true}
 augmentation_parameters: {}
 
-# --- 5. BIOMETRIC EVALUATION & TEMPLATE SETTINGS ---
+# --- 6. BIOMETRIC EVALUATION & TEMPLATE SETTINGS ---
 use_template: true      # true: Extract features for Gallery/Probe matching. false: Standard Softmax classification
 template_fusion_method: 'mean'
 # Available options:
@@ -89,14 +110,16 @@ sampling_mode: 'all'
 
 use_deployment_evaluation: false # true: Calculates Global Threshold on Validation set, applies to Test set
 
-# --- 6. SIGNAL QUALITY & OUTLIER FILTERING ---
+# --- 7. SIGNAL QUALITY & OUTLIER FILTERING ---
 outlier_filtering_on_train: false  # true: Filters noisy beats during representation learning/enrollment
 outlier_filtering_on_test: false   # true: Filters noisy beats from probes before matching
 sqi_method: 'kurtosis'             # SQI calculation metric (e.g., 'kurtosis')
 sqi_threshold: 0.05                # Absolute minimum SQI score required to keep a beat (0.0 to 1.0)
 sqi_keep_pct: 0.80                 # Top percentage of beats to keep per subject after filtering (e.g., 0.80 = 80%)
 
-# --- 7. HARDWARE & LOGGING ---
+# --- 8. HARDWARE & LOGGING ---
 device: 'auto'                  # 'cuda' (GPU), 'cpu', or 'auto' (detects available hardware)
 visualize: false                # true: Generates t-SNE scatter plots and confusion matrices (disable for multi-run loops)
 save_results_and_settings: true # true: Automatically writes params and metrics to .txt logs
+intelligent_data_loading: false   # true: cache preprocessed dataset arrays
+intelligent_weight_loading: false # true: cache trained model weights

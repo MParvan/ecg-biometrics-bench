@@ -478,6 +478,19 @@ class MainCLIRoutingTests(unittest.TestCase):
                     signal_type="raw",
                 )
 
+                self.assertEqual(
+                    loader.effective_experiment_configuration[
+                        "dataset"
+                    ],
+                    "ecgid",
+                )
+                self.assertEqual(
+                    loader.effective_experiment_configuration[
+                        "task"
+                    ],
+                    task,
+                )
+
                 timer_mock.assert_called_once_with()
 
                 expected_runner_name = (
@@ -571,11 +584,14 @@ class MainCLIRoutingTests(unittest.TestCase):
                     keyword_arguments,
                 )
 
-    def test_yaml_overrides_reach_selected_runner(self):
+    def test_yaml_defaults_and_cli_overrides_reach_selected_runner(self):
         loader = SyntheticLoader()
 
         configuration = {
+            "dataset": "ptb",
+            "task": 1,
             "model": "resnet1d",
+            "data_split_mode": "single-session",
             "epochs": 3,
             "batch_size": 7,
             "lr": 0.004,
@@ -614,6 +630,8 @@ class MainCLIRoutingTests(unittest.TestCase):
                 "2",
                 "--model",
                 "deepecg",
+                "--data_split_mode",
+                "all-available",
                 "--epochs",
                 "1",
                 "--batch_size",
@@ -649,18 +667,25 @@ class MainCLIRoutingTests(unittest.TestCase):
             runner_mock.call_args.kwargs
         )
 
+        # Explicit command-line values override YAML defaults.
         self.assertIs(
             keyword_arguments["model_class"],
-            ResNet1D,
+            DeepECG,
         )
         self.assertEqual(
             keyword_arguments["epochs"],
-            3,
+            1,
         )
         self.assertEqual(
             keyword_arguments["batch_size"],
-            7,
+            4,
         )
+        self.assertEqual(
+            keyword_arguments["sampling_mode"],
+            "all",
+        )
+
+        # Values not supplied on the CLI still come from YAML.
         self.assertEqual(
             keyword_arguments["lr"],
             0.004,
@@ -676,10 +701,6 @@ class MainCLIRoutingTests(unittest.TestCase):
         self.assertEqual(
             keyword_arguments["num_pairs"],
             24,
-        )
-        self.assertEqual(
-            keyword_arguments["sampling_mode"],
-            "balanced",
         )
         self.assertTrue(
             keyword_arguments["use_template"]
@@ -712,6 +733,98 @@ class MainCLIRoutingTests(unittest.TestCase):
             keyword_arguments[
                 "save_results_and_settings"
             ]
+        )
+
+        effective_configuration = (
+            loader.effective_experiment_configuration
+        )
+        self.assertEqual(
+            effective_configuration["dataset"],
+            "ecgid",
+        )
+        self.assertEqual(
+            effective_configuration["task"],
+            2,
+        )
+        self.assertEqual(
+            effective_configuration["model"],
+            "deepecg",
+        )
+        self.assertEqual(
+            effective_configuration["epochs"],
+            1,
+        )
+        self.assertTrue(
+            effective_configuration["save_results"],
+        )
+
+    def test_config_only_supplies_dataset_and_task(self):
+        loader = SyntheticLoader()
+
+        configuration = {
+            "dataset": "ecgid",
+            "task": 2,
+            "model": "resnet1d",
+            "data_split_mode": "all-available",
+            "epochs": 3,
+            "batch_size": 7,
+            "val_split": 0.0,
+            "device": "cpu",
+        }
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            configuration_path = (
+                Path(temporary_directory)
+                / "self_contained.yaml"
+            )
+            configuration_path.write_text(
+                yaml.safe_dump(
+                    configuration
+                ),
+                encoding="utf-8",
+            )
+
+            cli_arguments = [
+                "main.py",
+                "--config",
+                str(configuration_path),
+            ]
+
+            with patch.object(
+                sys,
+                "argv",
+                cli_arguments,
+            ), patch.object(
+                main,
+                "load_ecgid_dataset",
+                return_value=loader,
+            ), patch.object(
+                main.run,
+                "start_experiment_timer",
+            ), patch.object(
+                main,
+                "run_closed_set_verification",
+            ) as runner_mock:
+                main.main()
+
+        runner_mock.assert_called_once()
+        self.assertIs(
+            runner_mock.call_args.kwargs[
+                "model_class"
+            ],
+            ResNet1D,
+        )
+        self.assertEqual(
+            loader.effective_experiment_configuration[
+                "dataset"
+            ],
+            "ecgid",
+        )
+        self.assertEqual(
+            loader.effective_experiment_configuration[
+                "task"
+            ],
+            2,
         )
 
     def test_data_cache_hit_bypasses_dataset_loading(self):

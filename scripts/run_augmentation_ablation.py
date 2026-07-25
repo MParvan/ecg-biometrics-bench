@@ -11,6 +11,16 @@ from pathlib import Path
 import yaml
 
 
+SUPPORTED_DATASETS = (
+    "ecgid",
+    "ptb",
+    "mitbih",
+    "nsrdb",
+    "ptbxl",
+    "heartprint",
+    "cybhi",
+)
+
 SUPPORTED_METHODS = (
     "gaussian",
     "amplitude",
@@ -219,6 +229,68 @@ def _build_variant_config(
 
     return config
 
+
+
+def _resolve_experiment_target(
+    cli_dataset,
+    cli_task,
+    base_config,
+    parser,
+):
+    """
+    Resolve dataset and task using CLI-over-YAML precedence.
+    """
+    dataset = (
+        cli_dataset
+        if cli_dataset is not None
+        else base_config.get("dataset")
+    )
+    task = (
+        cli_task
+        if cli_task is not None
+        else base_config.get("task")
+    )
+
+    if dataset is None:
+        parser.error(
+            "Dataset must be supplied by --dataset or the base YAML."
+        )
+
+    if dataset not in SUPPORTED_DATASETS:
+        parser.error(
+            f"Unsupported dataset {dataset!r}. Expected one of: "
+            f"{list(SUPPORTED_DATASETS)}."
+        )
+
+    if isinstance(task, bool) or not isinstance(task, int):
+        parser.error(
+            "Task must be an integer supplied by --task or the base YAML."
+        )
+
+    if task not in range(1, 9):
+        parser.error(
+            "Task must be between 1 and 8."
+        )
+
+    return dataset, task
+
+
+def _build_main_command(
+    project_root,
+    variant_config_path,
+):
+    """
+    Build a config-only invocation of main.py.
+    """
+    return [
+        sys.executable,
+        str(
+            Path(project_root)
+            / "main.py"
+        ),
+        "--config",
+        str(variant_config_path),
+    ]
 
 
 def _snapshot_result_logs(results_root):
@@ -466,16 +538,23 @@ def _build_parser():
 
     parser.add_argument(
         "--dataset",
-        required=True,
-        help="Dataset name accepted by main.py.",
+        default=None,
+        choices=SUPPORTED_DATASETS,
+        help=(
+            "Dataset name accepted by main.py. If omitted, read it "
+            "from the base YAML."
+        ),
     )
 
     parser.add_argument(
         "--task",
-        required=True,
+        default=None,
         type=int,
         choices=range(1, 9),
-        help="Biometric task number from 1 to 8.",
+        help=(
+            "Biometric task number from 1 to 8. If omitted, read it "
+            "from the base YAML."
+        ),
     )
 
     parser.add_argument(
@@ -620,6 +699,18 @@ def main():
             str(error)
         )
 
+    dataset, task = _resolve_experiment_target(
+        args.dataset,
+        args.task,
+        base_config,
+        parser,
+    )
+
+    # Every generated scenario is directly executable through
+    # ``python main.py --config <variant.yaml>``.
+    base_config["dataset"] = dataset
+    base_config["task"] = task
+
     if args.output_dir is None:
         timestamp = datetime.now().strftime(
             "%Y%m%d_%H%M%S"
@@ -630,7 +721,7 @@ def main():
             / "results"
             / "augmentation_ablation"
             / (
-                f"{args.dataset}_task{args.task}_"
+                f"{dataset}_task{task}_"
                 f"{timestamp}"
             )
         )
@@ -791,21 +882,10 @@ def main():
             )
         )
 
-        command = [
-            sys.executable,
-            str(
-                project_root
-                / "main.py"
-            ),
-            "--dataset",
-            args.dataset,
-            "--task",
-            str(args.task),
-            "--config",
-            str(
-                variant_config_path
-            ),
-        ]
+        command = _build_main_command(
+            project_root,
+            variant_config_path,
+        )
 
         start_time = time.perf_counter()
 

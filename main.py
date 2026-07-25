@@ -1,4 +1,5 @@
 import argparse
+import copy
 import json
 import sys
 import traceback
@@ -36,8 +37,9 @@ from models import DeepECG, ResNet1D, RNN_ECG, HybridCNNLSTM, ECGTransformer
 # =============================================================================
 
 CONFIG_KEY_ALIASES = {
-    # Backward-compatible name used by experiment_settings.yaml
+    # Backward-compatible names used by experiment configuration files.
     "save_results_and_settings": "save_results",
+    "enroll_parts": "enrol_parts",
 }
 
 
@@ -69,39 +71,115 @@ def _parse_json_mapping(value):
     return parsed_value
 
 
-def apply_yaml_config(args, parser):
+def _collect_parser_defaults(parser):
     """
-    Apply experiment settings from a YAML file.
-
-    YAML values override argparse defaults and explicitly supplied CLI values.
-    Unknown YAML keys raise an error instead of being silently ignored.
+    Return an independent mapping of the parser's built-in defaults.
     """
-    if not args.config:
-        return args
+    defaults = {}
 
-    config_path = Path(args.config)
-
-    if not config_path.exists():
-        parser.error(f"Configuration file not found: {config_path}")
-
-    print(f"[INFO] Loading experiment parameters from YAML: {config_path.name}")
-
-    with open(config_path, "r", encoding="utf-8") as file:
-        yaml_cfg = yaml.safe_load(file) or {}
-
-    if not isinstance(yaml_cfg, dict):
-        parser.error("The YAML configuration must contain a key-value mapping.")
-
-    unknown_keys = []
-
-    for yaml_key, value in yaml_cfg.items():
-        argument_name = CONFIG_KEY_ALIASES.get(yaml_key, yaml_key)
-
-        if not hasattr(args, argument_name):
-            unknown_keys.append(yaml_key)
+    for action in parser._actions:
+        if action.dest == "help":
             continue
 
-        setattr(args, argument_name, value)
+        if action.default == argparse.SUPPRESS:
+            continue
+
+        defaults[action.dest] = copy.deepcopy(
+            action.default
+        )
+
+    return defaults
+
+
+def _parse_explicit_cli_arguments(parser, argv):
+    """
+    Parse only values explicitly supplied on the command line.
+
+    Suppressing action defaults avoids accidental merging for ``append``
+    arguments and makes precedence deterministic:
+
+    built-in defaults < YAML values < explicit CLI values.
+    """
+    for action in parser._actions:
+        if action.dest != "help":
+            action.default = argparse.SUPPRESS
+
+    return vars(
+        parser.parse_args(argv)
+    )
+
+
+def _load_yaml_defaults(config_path, parser):
+    """
+    Load and validate one experiment YAML mapping.
+
+    YAML keys are restricted to command-line argument destinations, plus
+    documented backward-compatible aliases. The ``config`` key is reserved
+    for the command line so configuration files cannot recursively redirect
+    to another file.
+    """
+    config_path = Path(config_path)
+
+    if not config_path.exists():
+        parser.error(
+            f"Configuration file not found: {config_path}"
+        )
+
+    print(
+        "[INFO] Loading experiment parameters from YAML: "
+        f"{config_path.name}"
+    )
+
+    with config_path.open(
+        "r",
+        encoding="utf-8",
+    ) as file:
+        yaml_config = yaml.safe_load(file) or {}
+
+    if not isinstance(yaml_config, dict):
+        parser.error(
+            "The YAML configuration must contain a key-value mapping."
+        )
+
+    valid_argument_names = {
+        action.dest
+        for action in parser._actions
+        if action.dest != "help"
+    }
+
+    normalized_defaults = {}
+    source_key_by_argument = {}
+    unknown_keys = []
+
+    for yaml_key, value in yaml_config.items():
+        argument_name = CONFIG_KEY_ALIASES.get(
+            yaml_key,
+            yaml_key,
+        )
+
+        if argument_name == "config":
+            parser.error(
+                "The YAML key 'config' is reserved for the command line."
+            )
+
+        if argument_name not in valid_argument_names:
+            unknown_keys.append(
+                str(yaml_key)
+            )
+            continue
+
+        if argument_name in normalized_defaults:
+            previous_key = source_key_by_argument[
+                argument_name
+            ]
+            parser.error(
+                "Configuration keys "
+                f"{previous_key!r} and {yaml_key!r} both map to "
+                f"'{argument_name}'. Keep only one of them."
+            )
+
+        normalized_defaults[argument_name] = value
+        source_key_by_argument[argument_name] = yaml_key
 
     if unknown_keys:
         parser.error(
@@ -109,7 +187,64 @@ def apply_yaml_config(args, parser):
             + ", ".join(sorted(unknown_keys))
         )
 
-    return args
+    return normalized_defaults
+
+
+def parse_experiment_arguments(argv=None):
+    """
+    Resolve one complete experiment configuration.
+
+    Built-in parser defaults are applied first, values from ``--config`` are
+    applied second, and arguments explicitly supplied on the CLI are applied
+    last. This permits a YAML file to provide ``dataset`` and ``task`` while
+    preserving conventional command-line precedence.
+    """
+    if argv is None:
+        argv = sys.argv[1:]
+    else:
+        argv = list(argv)
+
+    parser = get_parser()
+    parser_defaults = _collect_parser_defaults(
+        parser
+    )
+    explicit_cli_values = (
+        _parse_explicit_cli_arguments(
+            parser,
+            argv,
+        )
+    )
+
+    yaml_defaults = {}
+    config_path = explicit_cli_values.get(
+        "config"
+    )
+
+    if config_path:
+        yaml_defaults = _load_yaml_defaults(
+            config_path,
+            parser,
+        )
+
+    effective_values = parser_defaults
+    effective_values.update(
+        yaml_defaults
+    )
+    effective_values.update(
+        explicit_cli_values
+    )
+
+    args = argparse.Namespace(
+        **effective_values
+    )
+
+    return (
+        validate_experiment_arguments(
+            args,
+            parser,
+        ),
+        parser,
+    )
 
 def _normalize_minute_range(
     value,
@@ -244,7 +379,30 @@ def validate_experiment_arguments(args, parser):
     """
 
     # ---------------------------------------------------------
-    # 1. Revalidate argparse choices after YAML overrides
+    # 1. Require the final experiment identity
+    # ---------------------------------------------------------
+    missing_core_arguments = [
+        argument_name
+        for argument_name in (
+            "dataset",
+            "task",
+        )
+        if getattr(
+            args,
+            argument_name,
+            None,
+        ) is None
+    ]
+
+    if missing_core_arguments:
+        parser.error(
+            "The final experiment configuration must define: "
+            + ", ".join(missing_core_arguments)
+            + ". Supply them in YAML or explicitly on the CLI."
+        )
+
+    # ---------------------------------------------------------
+    # 2. Revalidate argparse choices after YAML defaults
     # ---------------------------------------------------------
     for action in parser._actions:
         if action.dest == "help" or action.choices is None:
@@ -259,7 +417,7 @@ def validate_experiment_arguments(args, parser):
             )
 
     # ---------------------------------------------------------
-    # 2. Shared type and range validation helpers
+    # 3. Shared type and range validation helpers
     # ---------------------------------------------------------
     def require_integer(name, minimum=None):
         value = getattr(args, name)
@@ -301,7 +459,7 @@ def validate_experiment_arguments(args, parser):
             )
 
     # ---------------------------------------------------------
-    # 3. Integer-valued parameters
+    # 4. Integer-valued parameters
     # ---------------------------------------------------------
     for argument_name in [
         "epochs",
@@ -326,7 +484,7 @@ def validate_experiment_arguments(args, parser):
         )
 
     # ---------------------------------------------------------
-    # 4. Floating-point and fraction parameters
+    # 5. Floating-point and fraction parameters
     # ---------------------------------------------------------
     require_real(
         "lr",
@@ -381,7 +539,7 @@ def validate_experiment_arguments(args, parser):
         )
 
     # ---------------------------------------------------------
-    # 5. Training-only augmentation configuration
+    # 6. Training-only augmentation configuration
     # ---------------------------------------------------------
     if not isinstance(
         args.augmentation_parameters,
@@ -434,7 +592,32 @@ def validate_experiment_arguments(args, parser):
         )
 
     # ---------------------------------------------------------
-    # 6. Session-list validation
+    # 7. Boolean configuration values
+    # ---------------------------------------------------------
+    for argument_name in [
+        "use_augmentation",
+        "use_template",
+        "use_deployment_evaluation",
+        "outlier_filtering_on_train",
+        "outlier_filtering_on_test",
+        "save_results",
+        "visualize",
+        "intelligent_data_loading",
+        "intelligent_weight_loading",
+    ]:
+        value = getattr(
+            args,
+            argument_name,
+        )
+
+        if not isinstance(value, bool):
+            parser.error(
+                f"'{argument_name}' must be Boolean, "
+                f"received {value!r}."
+            )
+
+    # ---------------------------------------------------------
+    # 8. Session-list validation
     # ---------------------------------------------------------
     session_arguments = [
         "train_sessions",
@@ -469,7 +652,7 @@ def validate_experiment_arguments(args, parser):
             )
 
     # ---------------------------------------------------------
-    # 7. Continuous-recording minute ranges
+    # 9. Continuous-recording minute ranges
     # ---------------------------------------------------------
     continuous_datasets = {
         "mitbih",
@@ -603,7 +786,7 @@ def validate_experiment_arguments(args, parser):
             )
 
     # ---------------------------------------------------------
-    # 8. General string validation
+    # 10. General string validation
     # ---------------------------------------------------------
     for argument_name in [
         "data_split_mode",
@@ -618,7 +801,7 @@ def validate_experiment_arguments(args, parser):
             )
 
     # ---------------------------------------------------------
-    # 9. Task-specific consistency
+    # 11. Task-specific consistency
     # ---------------------------------------------------------
     if args.task in [3, 7] and not args.use_template:
         parser.error(
@@ -637,6 +820,24 @@ def validate_experiment_arguments(args, parser):
         )
 
     return args
+
+
+def build_effective_configuration(args):
+    """
+    Return a detached snapshot of every resolved experiment argument.
+
+    The snapshot is attached to the loader because the experiment logger
+    already records public loader attributes. This keeps the complete final
+    configuration alongside the result without changing the task APIs.
+    """
+    return copy.deepcopy(
+        dict(
+            sorted(
+                vars(args).items()
+            )
+        )
+    )
+
 
 def build_data_cache_config(args, loader, task_type):
     """
@@ -770,16 +971,16 @@ def get_parser():
     # CORE CONFIGURATION
     # ----------------------------------------------------
     core_group = parser.add_argument_group('Core Configuration')
-    core_group.add_argument('--dataset', type=str, required=True, 
+    core_group.add_argument('--dataset', type=str, default=None,
                             choices=['ecgid', 'ptb', 'mitbih', 'nsrdb', 'ptbxl', 'heartprint', 'cybhi'],
                             help="Target database to load.")
-    core_group.add_argument('--task', type=int, required=True, choices=[1, 2, 3, 4, 5, 6, 7, 8],
+    core_group.add_argument('--task', type=int, default=None, choices=[1, 2, 3, 4, 5, 6, 7, 8],
                             help="Biometric Evaluation Task Number (1 to 8).")
     core_group.add_argument('--model', type=str, default='deepecg', 
                             choices=['deepecg', 'resnet1d', 'rnn', 'hybrid', 'transformer'],
                             help="Neural Network Architecture (default: deepecg).")
     core_group.add_argument('--config', type=str, default=None,
-                            help="Path to a YAML file to automatically override default parameters.")
+                            help="Path to a YAML file providing experiment defaults. Explicit CLI values take precedence.")
     
     # ----------------------------------------------------
     # DATASET ROUTING & PARAMS
@@ -1030,16 +1231,15 @@ def get_parser():
     return parser
 
 def main():
-    parser = get_parser()
-    args = parser.parse_args()
+    args, parser = parse_experiment_arguments()
 
     # ==========================================
-    # 0. YAML CONFIGURATION
+    # 0. EFFECTIVE CONFIGURATION
     # ==========================================
-    args = apply_yaml_config(args, parser)
-    args = validate_experiment_arguments(
-        args,
-        parser,
+    effective_configuration = (
+        build_effective_configuration(
+            args
+        )
     )
 
     # Measure the complete pipeline, including data loading,
@@ -1117,6 +1317,10 @@ def main():
     else:
         print(f"[ERROR] Unsupported dataset: {args.dataset}")
         sys.exit(1)
+
+    loader.effective_experiment_configuration = (
+        effective_configuration
+    )
 
     # ==========================================
     # 3. DATA EXTRACTION LOGIC
