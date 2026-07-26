@@ -1009,8 +1009,8 @@ def get_parser():
             "experiment logs."
         ),
     )
-    data_group.add_argument('--signal_type', type=str, default='raw', choices=['raw', 'filtered'],
-                            help="For ECG-ID (raw vs filtered channel).")
+    data_group.add_argument('--signal_type', type=str, default='filtered', choices=['raw', 'filtered'],
+                            help="For ECG-ID: filtered hardware channel by default, or raw unfiltered channel.")
     data_group.add_argument(
         "--single_segment_range",
         type=float,

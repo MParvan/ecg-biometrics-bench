@@ -475,7 +475,7 @@ class MainCLIRoutingTests(unittest.TestCase):
                     data_split_mode="all-available",
                     num_beats_to_merge=1,
                     preprocessing_config={},
-                    signal_type="raw",
+                    signal_type="filtered",
                 )
 
                 self.assertEqual(

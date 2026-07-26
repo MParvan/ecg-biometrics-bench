@@ -110,7 +110,7 @@ Accordingly:
 
 The framework provides plug-and-play automated download and parsing for the following datasets:
 
-1. **ECG-ID**: 90 subjects, varied short-term/long-term sessions.
+1. **ECG-ID**: 90 subjects, varied short-term/long-term sessions. The framework uses the hardware-filtered ECG channel by default; pass `--signal_type raw` to select the unfiltered channel explicitly.
 2. **PTB**: 290 subjects (includes healthy controls and clinical pathologies).
 3. **MIT-BIH Arrhythmia**: 47 subjects, continuous 30-minute Holter recordings.
 4. **NSRDB**: 18 subjects, extremely long-term 24-hour continuous recordings.

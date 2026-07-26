@@ -503,7 +503,7 @@ class load_ecgid_dataset():
             Common options: mode='beat'|'blind', bandpass=True, normalize=True, window_len=5.0
     """
     def __init__(self, num_beats_to_merge=1, beat_merge_method="average", 
-                 data_split_mode="all-available", signal_type="raw", 
+                 data_split_mode="all-available", signal_type="filtered",
                  cleanup_zip=False, preprocessing_config=None,
                  **preprocessing_params):
         
@@ -515,7 +515,12 @@ class load_ecgid_dataset():
         self.zip_path = self.data_root / self.cfg["zip_name"]
         self.url = self.cfg["url"]
         
-        self.signal_type = "noisy" if signal_type == "raw" else "filtered"
+        if signal_type not in {"raw", "filtered"}:
+            raise ValueError(
+                "signal_type must be either 'raw' or 'filtered'."
+            )
+
+        self.signal_type = signal_type
         self.prep_params = _normalize_preprocessing_config(
             self.cfg.get("preprocessing", {}),
             preprocessing_config,
@@ -540,6 +545,15 @@ class load_ecgid_dataset():
     def _extract_rec_number(self, filename):
         match = re.search(r'rec_(\d+)', filename)
         return int(match.group(1)) if match else 9999
+
+    def _get_channel_index(self):
+        """
+        Return the WFDB channel corresponding to the selected signal type.
+
+        Channel 0 is the raw signal and channel 1 is the
+        hardware-filtered signal.
+        """
+        return 0 if self.signal_type == "raw" else 1
 
     def load_raw_data(self):
         """
@@ -570,7 +584,7 @@ class load_ecgid_dataset():
                                 except: pass
                     if rec_date is None: rec_date = datetime.date.min
 
-                    channel_idx = 0 if self.signal_type == "raw" else 1
+                    channel_idx = self._get_channel_index()
                     
                     # Safety check just in case a file has only 1 channel
                     if record.p_signal.shape[1] <= channel_idx:

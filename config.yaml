@@ -9,7 +9,7 @@ datasets:
     url: "https://physionet.org/content/ecgiddb/get-zip/1.0.0/"
     sample_length: 20000
     fs: 500
-    signal_type: "filtered"        # Options: "filtered", "noisy", "both"
+    signal_type: "filtered"        # Options: "raw", "filtered"
     preprocessing:
       mode: "beat"
       pre_s: 0.2
