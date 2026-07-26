@@ -60,6 +60,7 @@ import torch.nn as nn
 from torch.utils.data import TensorDataset, DataLoader
 
 import datetime
+import json
 from pathlib import Path
 
 from visualizations import Visualizer
@@ -642,6 +643,284 @@ def _collect_source_revision():
     }
 
 # =============================================================================
+# STRUCTURED EXPERIMENT OUTPUT
+# =============================================================================
+
+def _to_json_compatible(value):
+    """
+    Recursively convert experiment metadata into JSON-compatible values.
+
+    NumPy scalars and arrays, tensors, paths, tuples, sets, and uncommon
+    metadata objects are converted without modifying the caller's objects.
+    Non-finite floating-point values are represented as strings because
+    strict JSON does not support NaN or infinity.
+    """
+    if value is None:
+        return None
+
+    if isinstance(
+        value,
+        (
+            str,
+            bool,
+            int,
+        ),
+    ):
+        return value
+
+    if isinstance(
+        value,
+        float,
+    ):
+        if np.isfinite(value):
+            return value
+
+        return str(value)
+
+    if isinstance(
+        value,
+        np.generic,
+    ):
+        return _to_json_compatible(
+            value.item()
+        )
+
+    if isinstance(
+        value,
+        np.ndarray,
+    ):
+        return _to_json_compatible(
+            value.tolist()
+        )
+
+    if torch.is_tensor(value):
+        return _to_json_compatible(
+            value.detach().cpu().tolist()
+        )
+
+    if isinstance(
+        value,
+        Path,
+    ):
+        return str(value)
+
+    if isinstance(
+        value,
+        Mapping,
+    ):
+        return {
+            str(key): _to_json_compatible(
+                item
+            )
+            for key, item in value.items()
+        }
+
+    if isinstance(
+        value,
+        (
+            list,
+            tuple,
+        ),
+    ):
+        return [
+            _to_json_compatible(item)
+            for item in value
+        ]
+
+    if isinstance(
+        value,
+        (
+            set,
+            frozenset,
+        ),
+    ):
+        return [
+            _to_json_compatible(item)
+            for item in sorted(
+                value,
+                key=repr,
+            )
+        ]
+
+    if isinstance(
+        value,
+        bytes,
+    ):
+        return value.decode(
+            "utf-8",
+            errors="replace",
+        )
+
+    if isinstance(
+        value,
+        type,
+    ):
+        return (
+            f"{value.__module__}."
+            f"{value.__qualname__}"
+        )
+
+    try:
+        json.dumps(
+            value,
+            allow_nan=False,
+        )
+    except (
+        TypeError,
+        ValueError,
+    ):
+        return str(value)
+
+    return value
+
+
+def _to_structured_result_value(value):
+    """
+    Preserve numeric metrics and normalize mean-plus-std result strings.
+
+    Existing multi-run text reports store aggregate metrics as strings such
+    as ``0.9500 ? 0.0100``. The structured output exposes their numeric mean
+    and standard deviation while retaining the original display value.
+    """
+    if isinstance(
+        value,
+        str,
+    ):
+        for separator in (
+            "?",
+            "?",
+        ):
+            if value.count(separator) != 1:
+                continue
+
+            mean_text, std_text = value.split(
+                separator,
+                maxsplit=1,
+            )
+
+            try:
+                mean_value = float(
+                    mean_text.strip()
+                )
+                std_value = float(
+                    std_text.strip()
+                )
+            except ValueError:
+                continue
+
+            return {
+                "mean": mean_value,
+                "std": std_value,
+                "display": value,
+            }
+
+    return _to_json_compatible(
+        value
+    )
+
+
+def _build_structured_experiment_record(
+    experiment_time,
+    task_name,
+    dataset_name,
+    metrics_dict,
+    data_stats,
+    hyperparams,
+    dataset_kwargs,
+    software_environment,
+    source_revision,
+    runtime_profile,
+):
+    """
+    Build one self-contained machine-readable experiment record.
+    """
+    return {
+        "experiment_time": (
+            experiment_time.isoformat(
+                timespec="seconds"
+            )
+        ),
+        "task": str(task_name),
+        "dataset": str(dataset_name),
+        "data_statistics": (
+            _to_json_compatible(
+                data_stats
+            )
+        ),
+        "effective_experiment_configuration": {
+            "model_hyperparameters": (
+                _to_json_compatible(
+                    hyperparams
+                )
+            ),
+            (
+                "dataset_and_preprocessing_"
+                "settings"
+            ): _to_json_compatible(
+                dataset_kwargs
+            ),
+        },
+        "software_and_hardware_environment": (
+            _to_json_compatible(
+                software_environment
+            )
+        ),
+        "source_revision": (
+            _to_json_compatible(
+                source_revision
+            )
+        ),
+        "computational_profile": (
+            _to_json_compatible(
+                runtime_profile
+            )
+        ),
+        "results": {
+            str(key): (
+                _to_structured_result_value(
+                    value
+                )
+            )
+            for key, value in metrics_dict.items()
+        },
+    }
+
+
+def _append_structured_experiment_record(
+    structured_log_file,
+    record,
+):
+    """
+    Append one strict JSON record to a JSON Lines result file.
+    """
+    serialized_record = json.dumps(
+        _to_json_compatible(
+            record
+        ),
+        ensure_ascii=False,
+        sort_keys=True,
+        allow_nan=False,
+        separators=(
+            ",",
+            ":",
+        ),
+    )
+
+    with open(
+        structured_log_file,
+        "a",
+        encoding="utf-8",
+        newline="\n",
+    ) as structured_file:
+        structured_file.write(
+            serialized_record
+        )
+        structured_file.write(
+            "\n"
+        )
+
+
+# =============================================================================
 # AUTOMATED EXPERIMENT LOGGER
 # =============================================================================
 def _log_experiment_results(task_name, metrics_dict, data_stats, hyperparams, loader=None):
@@ -696,7 +975,12 @@ def _log_experiment_results(task_name, metrics_dict, data_stats, hyperparams, lo
     # (e.g., "Closed-Set Identification" -> "Closed-Set_Identification.txt")
     safe_task_name = str(task_name).replace(" ", "_").replace("/", "_").replace("\\", "_")
     log_file = results_dir / f"{safe_task_name}.txt"
+    structured_log_file = (
+        results_dir
+        / f"{safe_task_name}.jsonl"
+    )
 
+    experiment_time = datetime.datetime.now()
     software_environment = _collect_software_environment()
     source_revision = _collect_source_revision()
     runtime_profile = _collect_runtime_profile()
@@ -704,7 +988,10 @@ def _log_experiment_results(task_name, metrics_dict, data_stats, hyperparams, lo
     # 6. Format and Append
     with open(log_file, "a", encoding="utf-8") as f:
         f.write(f"\n{'='*70}\n")
-        f.write(f"EXPERIMENT TIME : {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(
+            "EXPERIMENT TIME : "
+            f"{experiment_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+        )
         f.write(f"TASK            : {task_name}\n")
         f.write(f"DATASET         : {dataset_name}\n")
         f.write(f"{'-'*70}\n")
@@ -759,7 +1046,34 @@ def _log_experiment_results(task_name, metrics_dict, data_stats, hyperparams, lo
                 f.write(f"  {k:<28}: {v}\n")
         f.write(f"{'='*70}\n")
     
-    print(f"\n[INFO] Experiment settings and results successfully saved to: {log_file}")
+    structured_record = (
+        _build_structured_experiment_record(
+            experiment_time=experiment_time,
+            task_name=task_name,
+            dataset_name=dataset_name,
+            metrics_dict=metrics_dict,
+            data_stats=data_stats,
+            hyperparams=hyperparams,
+            dataset_kwargs=dataset_kwargs,
+            software_environment=software_environment,
+            source_revision=source_revision,
+            runtime_profile=runtime_profile,
+        )
+    )
+
+    _append_structured_experiment_record(
+        structured_log_file,
+        structured_record,
+    )
+
+    print(
+        "\n[INFO] Experiment settings and "
+        f"results successfully saved to: {log_file}"
+    )
+    print(
+        "[INFO] Structured experiment record "
+        f"appended to: {structured_log_file}"
+    )
 
 # =============================================================================
 # EVALUATION CONFIGURATION VALIDATION
