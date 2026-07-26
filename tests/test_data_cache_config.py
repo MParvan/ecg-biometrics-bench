@@ -16,6 +16,7 @@ from utils import _generate_config_hash
 class DummyLoader:
     def __init__(self):
         self.cfg = {
+            "root_dir": "synthetic_dataset",
             "preprocessing": {
                 "filter_method": "butter",
                 "resample_len": 256,
@@ -28,8 +29,13 @@ class DummyLoader:
             "resample_len": 128,
         }
 
-        self.leads = ["MLII"]
-        self.beat_merge_method = "average"
+        self.data_split_mode = "cross-session"
+        self.num_beats = 2
+        self.merge_strategy = "average"
+        self.target_leads = ["MLII"]
+        self.only_healthy = False
+        self.resolution = 100
+        self.limit_records = None
         self.single_segment_range = (0, 5)
         self.train_parts = [(0, 5)]
         self.enrol_parts = [(5, 10)]
@@ -139,6 +145,85 @@ class DataCacheConfigurationTests(unittest.TestCase):
             _generate_config_hash(config_1),
             _generate_config_hash(config_2),
         )
+
+    def test_effective_loader_settings_are_recorded(self):
+        config = build_data_cache_config(
+            make_args(),
+            DummyLoader(),
+            task_type="cross_session",
+        )
+
+        settings = config["loader_settings"]
+
+        self.assertEqual(
+            settings["num_beats"],
+            2,
+        )
+        self.assertEqual(
+            settings["merge_strategy"],
+            "average",
+        )
+        self.assertEqual(
+            settings["target_leads"],
+            ["MLII"],
+        )
+        self.assertFalse(
+            settings["only_healthy"]
+        )
+        self.assertEqual(
+            settings["resolution"],
+            100,
+        )
+        self.assertIsNone(
+            settings["limit_records"]
+        )
+        self.assertEqual(
+            config["dataset_config"]["root_dir"],
+            "synthetic_dataset",
+        )
+
+    def test_effective_loader_settings_change_data_hash(self):
+        changed_values = {
+            "num_beats": 4,
+            "merge_strategy": "concatenate",
+            "target_leads": ["V1"],
+            "only_healthy": True,
+            "resolution": 500,
+            "limit_records": 50,
+        }
+
+        for attribute_name, changed_value in changed_values.items():
+            with self.subTest(
+                attribute=attribute_name
+            ):
+                loader_1 = DummyLoader()
+                loader_2 = DummyLoader()
+
+                setattr(
+                    loader_2,
+                    attribute_name,
+                    changed_value,
+                )
+
+                config_1 = build_data_cache_config(
+                    make_args(),
+                    loader_1,
+                    task_type="cross_session",
+                )
+                config_2 = build_data_cache_config(
+                    make_args(),
+                    loader_2,
+                    task_type="cross_session",
+                )
+
+                self.assertNotEqual(
+                    _generate_config_hash(
+                        config_1
+                    ),
+                    _generate_config_hash(
+                        config_2
+                    ),
+                )
 
 
 if __name__ == "__main__":

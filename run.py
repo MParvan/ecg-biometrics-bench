@@ -51,6 +51,7 @@ from utils import (
     _compute_metrics_identification, _compute_metrics_verification,
     _run_training_loop, _run_train_loop_unseen_subjects, _train_epoch, _detect_channels,
     DEFAULT_CACHE_DIR, DEFAULT_RESULTS_DIR, resolve_artifact_path,
+    _build_loader_cache_identity, _fingerprint_array_collection,
 )
 
 import torch
@@ -2102,81 +2103,48 @@ def _prepare_multi_run_arguments(local_arguments):
 # WEIGHT CACHE CONFIGURATION
 # =============================================================================
 
-def _build_weight_cache_config(loader, training_config):
+def _build_weight_cache_config(
+    loader,
+    training_config,
+    training_samples=None,
+    training_labels=None,
+):
     """
-    Add dataset and loader identity to a model-weight cache configuration.
+    Build the complete identity for reusable trained model weights.
 
-    Model weights are reusable only when both the training hyperparameters
-    and the effective dataset and preprocessing configuration are equivalent.
+    When training arrays are supplied, their complete post-partition and
+    post-augmentation contents are fingerprinted so equal shapes cannot cause
+    weights from a different training population to be reused.
     """
-    complete_config = dict(training_config)
-
-    if loader is None:
-        complete_config["loader_identity"] = None
-        return complete_config
-
-    loader_cfg = getattr(loader, "cfg", {})
-    effective_preprocessing = {}
-
-    if isinstance(loader_cfg, dict):
-        configured_preprocessing = loader_cfg.get(
-            "preprocessing",
-            {},
-        )
-
-        if isinstance(configured_preprocessing, dict):
-            effective_preprocessing.update(
-                configured_preprocessing
-            )
-
-    preprocessing_overrides = getattr(
-        loader,
-        "prep_params",
-        {},
+    complete_config = dict(
+        training_config
     )
 
-    if isinstance(preprocessing_overrides, dict):
-        effective_preprocessing.update(
-            preprocessing_overrides
+    if (
+        training_samples is None
+    ) != (
+        training_labels is None
+    ):
+        raise ValueError(
+            "training_samples and training_labels "
+            "must be supplied together."
         )
 
-    loader_settings = {}
+    if training_samples is not None:
+        complete_config[
+            "training_partition"
+        ] = _fingerprint_array_collection(
+            {
+                "samples": training_samples,
+                "labels": training_labels,
+            }
+        )
 
-    cache_relevant_attributes = [
-        "data_split_mode",
-        "num_beats_to_merge",
-        "beat_merge_method",
-        "signal_type",
-        "train_sessions",
-        "enroll_sessions",
-        "enrol_sessions",
-        "probe_sessions",
-        "session_for_single_session_evaluation",
-        "leads",
-        "single_segment_range",
-        "train_parts",
-        "enrol_parts",
-        "enroll_parts",
-        "test_parts",
-    ]
-
-    for attribute_name in cache_relevant_attributes:
-        if hasattr(loader, attribute_name):
-            loader_settings[attribute_name] = getattr(
-                loader,
-                attribute_name,
-            )
-
-    complete_config["loader_identity"] = {
-        "loader_class": type(loader).__name__,
-        "root_dir": (
-            loader_cfg.get("root_dir")
-            if isinstance(loader_cfg, dict)
-            else None
-        ),
-        "preprocessing": effective_preprocessing,
-        "settings": loader_settings,
-    }
+    complete_config[
+        "loader_identity"
+    ] = _build_loader_cache_identity(
+        loader
+    )
 
     return complete_config
 
@@ -2589,6 +2557,8 @@ def run_closed_set_identification(x, y, model_class, epochs=150, batch_size=256,
         train_config = _build_weight_cache_config(
             loader,
             train_config,
+            training_samples=X_tr,
+            training_labels=y_tr,
         )
         
         cached_model, uid = cache.get_weight_cache(train_config, model, device)
@@ -3015,6 +2985,8 @@ def run_closed_set_verification(x, y, model_class, epochs=150, batch_size=256, l
         train_config = _build_weight_cache_config(
             loader,
             train_config,
+            training_samples=X_tr,
+            training_labels=y_tr,
         )
         
         cached_model, uid = cache.get_weight_cache(train_config, model, device)
@@ -3473,6 +3445,8 @@ def run_subject_disjoint_identification(x, y, model_class, epochs=150, batch_siz
         train_config = _build_weight_cache_config(
             loader,
             train_config,
+            training_samples=X_tr,
+            training_labels=y_tr,
         )
         
         cached_model, uid = cache.get_weight_cache(train_config, model, device)
@@ -3937,6 +3911,8 @@ def run_subject_disjoint_verification(x, y, model_class, epochs=150, batch_size=
         train_config = _build_weight_cache_config(
             loader,
             train_config,
+            training_samples=X_tr,
+            training_labels=y_tr,
         )
         
         cached_model, uid = cache.get_weight_cache(train_config, model, device)
@@ -4372,6 +4348,8 @@ def run_cross_session_identification(x_train, y_train, x_test, y_test, model_cla
         train_config = _build_weight_cache_config(
             loader,
             train_config,
+            training_samples=X_tr,
+            training_labels=y_tr,
         )
         
         cached_model, uid = cache.get_weight_cache(train_config, model, device)
@@ -4771,6 +4749,8 @@ def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class
         train_config = _build_weight_cache_config(
             loader,
             train_config,
+            training_samples=X_tr,
+            training_labels=y_tr,
         )
         
         cached_model, uid = cache.get_weight_cache(train_config, model, device)
@@ -5194,6 +5174,8 @@ def run_subject_disjoint_cross_session_identification(
         train_config = _build_weight_cache_config(
             loader,
             train_config,
+            training_samples=X_tr,
+            training_labels=y_tr,
         )
         
         cached_model, uid = cache.get_weight_cache(train_config, model, device)
@@ -5586,6 +5568,8 @@ def run_subject_disjoint_cross_session_verification(
         train_config = _build_weight_cache_config(
             loader,
             train_config,
+            training_samples=X_tr,
+            training_labels=y_tr,
         )
 
         cached_model, uid = cache.get_weight_cache(train_config, model, device)

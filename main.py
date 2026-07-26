@@ -843,57 +843,17 @@ def build_data_cache_config(args, loader, task_type):
     """
     Build a complete, deterministic identity for cached dataset arrays.
 
-    The cache key must include every setting that can change which records
-    are loaded or how they are preprocessed.
+    The cache key includes public routing arguments and the effective loader
+    configuration that determines which records and processed arrays are
+    returned.
     """
-    effective_preprocessing = {}
-
-    loader_cfg = getattr(loader, "cfg", {})
-
-    if isinstance(loader_cfg, dict):
-        configured_preprocessing = loader_cfg.get(
-            "preprocessing",
-            {},
-        )
-
-        if isinstance(configured_preprocessing, dict):
-            effective_preprocessing.update(
-                configured_preprocessing
-            )
-
-    preprocessing_overrides = getattr(
-        loader,
-        "prep_params",
-        {},
+    loader_identity = utils._build_loader_cache_identity(
+        loader
     )
-
-    if isinstance(preprocessing_overrides, dict):
-        effective_preprocessing.update(
-            preprocessing_overrides
-        )
-
-    loader_settings = {}
-
-    cache_relevant_loader_attributes = [
-        "leads",
-        "beat_merge_method",
-        "single_segment_range",
-        "train_parts",
-        "enrol_parts",
-        "enroll_parts",
-        "test_parts",
-    ]
-
-    for attribute_name in cache_relevant_loader_attributes:
-        if hasattr(loader, attribute_name):
-            loader_settings[attribute_name] = getattr(
-                loader,
-                attribute_name,
-            )
 
     return {
         "dataset": args.dataset,
-        "loader_class": type(loader).__name__,
+        "loader_class": loader_identity["loader_class"],
         "task_type": task_type,
         "split_mode": args.data_split_mode,
         "num_beats_to_merge": args.num_beats_to_merge,
@@ -908,8 +868,15 @@ def build_data_cache_config(args, loader, task_type):
         "session_for_single_session_evaluation": (
             args.session_for_single_session_evaluation
         ),
-        "preprocessing": effective_preprocessing,
-        "loader_settings": loader_settings,
+        "dataset_config": loader_identity[
+            "dataset_config"
+        ],
+        "preprocessing": loader_identity[
+            "preprocessing"
+        ],
+        "loader_settings": loader_identity[
+            "settings"
+        ],
     }
 
 def _terminate_pipeline_with_error(error):

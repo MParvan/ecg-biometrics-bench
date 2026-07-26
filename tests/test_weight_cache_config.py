@@ -3,9 +3,12 @@ import unittest
 from copy import deepcopy
 from pathlib import Path
 
+import numpy as np
+
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
+import run
 from run import _build_weight_cache_config
 from utils import _generate_config_hash
 
@@ -32,13 +35,16 @@ class DummyLoader:
         }
 
         self.data_split_mode = "cross-session"
-        self.num_beats_to_merge = 2
-        self.beat_merge_method = "average"
+        self.num_beats = 2
+        self.merge_strategy = "average"
         self.signal_type = signal_type
         self.train_sessions = train_sessions or ["session_1"]
         self.enroll_sessions = ["session_2"]
         self.probe_sessions = ["session_3"]
-        self.leads = ["MLII"]
+        self.target_leads = ["MLII"]
+        self.only_healthy = False
+        self.resolution = 100
+        self.limit_records = None
 
 
 def make_training_config():
@@ -171,6 +177,174 @@ class WeightCacheConfigurationTests(unittest.TestCase):
         )
 
         self.assertIsNone(config["loader_identity"])
+
+    def test_effective_loader_settings_are_added(self):
+        config = _build_weight_cache_config(
+            DummyLoader(),
+            make_training_config(),
+        )
+
+        settings = config[
+            "loader_identity"
+        ]["settings"]
+
+        self.assertEqual(
+            settings["num_beats"],
+            2,
+        )
+        self.assertEqual(
+            settings["merge_strategy"],
+            "average",
+        )
+        self.assertEqual(
+            settings["target_leads"],
+            ["MLII"],
+        )
+        self.assertFalse(
+            settings["only_healthy"]
+        )
+        self.assertEqual(
+            settings["resolution"],
+            100,
+        )
+        self.assertIsNone(
+            settings["limit_records"]
+        )
+
+    def test_training_partition_fingerprint_is_deterministic(self):
+        samples = np.arange(
+            24,
+            dtype=np.float32,
+        ).reshape(4, 6)
+        labels = np.asarray(
+            [
+                "subject_1",
+                "subject_1",
+                "subject_2",
+                "subject_2",
+            ],
+            dtype=object,
+        )
+
+        config_1 = _build_weight_cache_config(
+            DummyLoader(),
+            make_training_config(),
+            training_samples=samples,
+            training_labels=labels,
+        )
+        config_2 = _build_weight_cache_config(
+            DummyLoader(),
+            make_training_config(),
+            training_samples=samples.copy(),
+            training_labels=labels.copy(),
+        )
+
+        self.assertEqual(
+            config_1["training_partition"],
+            config_2["training_partition"],
+        )
+        self.assertEqual(
+            _generate_config_hash(config_1),
+            _generate_config_hash(config_2),
+        )
+
+    def test_training_sample_content_changes_weight_hash(self):
+        samples_1 = np.arange(
+            24,
+            dtype=np.float32,
+        ).reshape(4, 6)
+        samples_2 = samples_1.copy()
+        samples_2[0, 0] += 1.0
+
+        labels = np.asarray(
+            [0, 0, 1, 1],
+            dtype=np.int64,
+        )
+
+        config_1 = _build_weight_cache_config(
+            DummyLoader(),
+            make_training_config(),
+            training_samples=samples_1,
+            training_labels=labels,
+        )
+        config_2 = _build_weight_cache_config(
+            DummyLoader(),
+            make_training_config(),
+            training_samples=samples_2,
+            training_labels=labels,
+        )
+
+        self.assertNotEqual(
+            _generate_config_hash(config_1),
+            _generate_config_hash(config_2),
+        )
+
+    def test_training_label_content_changes_weight_hash(self):
+        samples = np.arange(
+            24,
+            dtype=np.float32,
+        ).reshape(4, 6)
+
+        labels_1 = np.asarray(
+            [0, 0, 1, 1],
+            dtype=np.int64,
+        )
+        labels_2 = np.asarray(
+            [0, 1, 0, 1],
+            dtype=np.int64,
+        )
+
+        config_1 = _build_weight_cache_config(
+            DummyLoader(),
+            make_training_config(),
+            training_samples=samples,
+            training_labels=labels_1,
+        )
+        config_2 = _build_weight_cache_config(
+            DummyLoader(),
+            make_training_config(),
+            training_samples=samples,
+            training_labels=labels_2,
+        )
+
+        self.assertNotEqual(
+            _generate_config_hash(config_1),
+            _generate_config_hash(config_2),
+        )
+
+    def test_partial_training_partition_is_rejected(self):
+        with self.assertRaisesRegex(
+            ValueError,
+            "must be supplied together",
+        ):
+            _build_weight_cache_config(
+                DummyLoader(),
+                make_training_config(),
+                training_samples=np.zeros(
+                    (2, 4),
+                    dtype=np.float32,
+                ),
+            )
+
+    def test_all_runners_fingerprint_the_training_partition(self):
+        run_source = Path(
+            run.__file__
+        ).read_text(
+            encoding="utf-8"
+        )
+
+        self.assertEqual(
+            run_source.count(
+                "training_samples=X_tr"
+            ),
+            8,
+        )
+        self.assertEqual(
+            run_source.count(
+                "training_labels=y_tr"
+            ),
+            8,
+        )
 
 
 if __name__ == "__main__":

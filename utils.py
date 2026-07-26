@@ -1042,6 +1042,195 @@ def resolve_artifact_path(path):
     )
 
 
+_CACHE_RELEVANT_LOADER_ATTRIBUTES = (
+    "data_split_mode",
+    "num_beats",
+    "num_beats_to_merge",
+    "merge_strategy",
+    "beat_merge_method",
+    "signal_type",
+    "train_sessions",
+    "enroll_sessions",
+    "enrol_sessions",
+    "probe_sessions",
+    "session_for_single_session_evaluation",
+    "required_cross_sessions",
+    "target_leads",
+    "leads",
+    "single_segment_range",
+    "train_parts",
+    "enrol_parts",
+    "enroll_parts",
+    "test_parts",
+    "only_healthy",
+    "resolution",
+    "limit_records",
+    "sample_len",
+    "data_root",
+    "dataset_root",
+)
+
+
+def _build_loader_cache_identity(loader):
+    """
+    Build the effective dataset-loader identity used by data and weight caches.
+
+    The identity records the configured dataset definition, merged
+    preprocessing settings, and public loader attributes that can alter which
+    records, channels, sessions, leads, or samples are returned.
+    """
+    if loader is None:
+        return None
+
+    loader_cfg = getattr(
+        loader,
+        "cfg",
+        {},
+    )
+
+    dataset_config = {}
+    effective_preprocessing = {}
+
+    if isinstance(loader_cfg, dict):
+        dataset_config = copy.deepcopy(
+            loader_cfg
+        )
+
+        configured_preprocessing = dataset_config.pop(
+            "preprocessing",
+            {},
+        )
+
+        if isinstance(configured_preprocessing, dict):
+            effective_preprocessing.update(
+                configured_preprocessing
+            )
+
+    preprocessing_overrides = getattr(
+        loader,
+        "prep_params",
+        {},
+    )
+
+    if isinstance(preprocessing_overrides, dict):
+        effective_preprocessing.update(
+            preprocessing_overrides
+        )
+
+    loader_settings = {}
+
+    for attribute_name in _CACHE_RELEVANT_LOADER_ATTRIBUTES:
+        if hasattr(loader, attribute_name):
+            loader_settings[attribute_name] = copy.deepcopy(
+                getattr(
+                    loader,
+                    attribute_name,
+                )
+            )
+
+    return {
+        "loader_class": type(loader).__name__,
+        "root_dir": dataset_config.get(
+            "root_dir"
+        ),
+        "dataset_config": dataset_config,
+        "preprocessing": effective_preprocessing,
+        "settings": loader_settings,
+    }
+
+
+def _fingerprint_array_collection(arrays):
+    """
+    Return a deterministic SHA-256 identity for named NumPy-compatible arrays.
+
+    Shapes, dtypes, names, and complete array contents are included. Object
+    arrays are serialized canonically rather than hashing process-specific
+    object pointers.
+    """
+    digest = hashlib.sha256()
+    array_metadata = {}
+
+    for array_name in sorted(arrays):
+        array = np.asarray(
+            arrays[array_name]
+        )
+
+        metadata = {
+            "shape": list(array.shape),
+            "dtype": str(array.dtype),
+        }
+
+        array_metadata[array_name] = metadata
+
+        header = json.dumps(
+            {
+                "name": str(array_name),
+                **metadata,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+
+        digest.update(
+            len(header).to_bytes(
+                8,
+                byteorder="big",
+            )
+        )
+        digest.update(header)
+
+        if array.dtype.hasobject:
+            payload = json.dumps(
+                array.tolist(),
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                default=str,
+            ).encode("utf-8")
+
+            digest.update(
+                len(payload).to_bytes(
+                    8,
+                    byteorder="big",
+                )
+            )
+            digest.update(payload)
+
+        else:
+            contiguous_array = np.ascontiguousarray(
+                array
+            )
+            byte_view = memoryview(
+                contiguous_array
+            ).cast("B")
+
+            digest.update(
+                len(byte_view).to_bytes(
+                    8,
+                    byteorder="big",
+                )
+            )
+
+            chunk_size = 8 * 1024 * 1024
+
+            for offset in range(
+                0,
+                len(byte_view),
+                chunk_size,
+            ):
+                digest.update(
+                    byte_view[
+                        offset:
+                        offset + chunk_size
+                    ]
+                )
+
+    return {
+        "sha256": digest.hexdigest(),
+        "arrays": array_metadata,
+    }
+
+
 def _generate_config_hash(config_dict):
     """Creates a deterministic short hash from a dictionary of parameters."""
     # Convert dict to a sorted JSON string to ensure consistent hashing
