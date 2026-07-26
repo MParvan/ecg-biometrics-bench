@@ -123,3 +123,5 @@ visualize: false                # true: Generates t-SNE scatter plots and confus
 save_results_and_settings: true # true: Automatically writes params and metrics to .txt logs
 intelligent_data_loading: false   # true: cache preprocessed dataset arrays
 intelligent_weight_loading: false # true: cache trained model weights
+cache_dir: '../ecg-biometrics-artifacts/cache'
+results_dir: '../ecg-biometrics-artifacts/results'

@@ -49,7 +49,8 @@ from utils import (
     _get_embeddings, _create_templates, _generate_pairs,
     _find_optimal_threshold, _evaluate_with_global_threshold, _summarize_verification_pairs,
     _compute_metrics_identification, _compute_metrics_verification,
-    _run_training_loop, _run_train_loop_unseen_subjects, _train_epoch, _detect_channels
+    _run_training_loop, _run_train_loop_unseen_subjects, _train_epoch, _detect_channels,
+    DEFAULT_CACHE_DIR, DEFAULT_RESULTS_DIR, resolve_artifact_path,
 )
 
 import torch
@@ -329,8 +330,21 @@ def _log_experiment_results(task_name, metrics_dict, data_stats, hyperparams, lo
             if k not in ignore_keys and not k.startswith('_'):
                 dataset_kwargs[k] = v
 
-    # 4. Ensure Results Directory exists: ./results/dataset_name/
-    results_dir = Path("results") / dataset_name.replace(" ", "_")
+    # 4. Resolve the configured external result directory.
+    configured_results_dir = getattr(
+        loader,
+        "results_dir",
+        DEFAULT_RESULTS_DIR,
+    )
+
+    results_dir = (
+        Path(
+            resolve_artifact_path(
+                configured_results_dir
+            )
+        )
+        / dataset_name.replace(" ", "_")
+    )
     results_dir.mkdir(parents=True, exist_ok=True)
     
     # 5. TARGET FILE: Dynamically name the file based on the Task Name
@@ -2550,7 +2564,13 @@ def run_closed_set_identification(x, y, model_class, epochs=150, batch_size=256,
 
     if intelligent_weight_loading:
         from utils import CacheManager
-        cache = CacheManager()
+        cache = CacheManager(
+            base_dir=getattr(
+                loader,
+                "cache_dir",
+                DEFAULT_CACHE_DIR,
+            )
+        )
         train_config = {
         "training_regime": "intra_session_closed_set",
         "model": model_class.__name__,
@@ -2977,7 +2997,13 @@ def run_closed_set_verification(x, y, model_class, epochs=150, batch_size=256, l
 
     if intelligent_weight_loading:
         from utils import CacheManager
-        cache = CacheManager()
+        cache = CacheManager(
+            base_dir=getattr(
+                loader,
+                "cache_dir",
+                DEFAULT_CACHE_DIR,
+            )
+        )
         train_config = {
             "training_regime": "intra_session_closed_set",
             "model": model_class.__name__, "epochs": epochs, "batch_size": batch_size, "lr": lr, 
@@ -3428,7 +3454,13 @@ def run_subject_disjoint_identification(x, y, model_class, epochs=150, batch_siz
 
     if intelligent_weight_loading:
         from utils import CacheManager
-        cache = CacheManager()
+        cache = CacheManager(
+            base_dir=getattr(
+                loader,
+                "cache_dir",
+                DEFAULT_CACHE_DIR,
+            )
+        )
         train_config = {
             "training_regime": "intra_session_subject_disjoint",
             "model": model_class.__name__, "epochs": epochs, "batch_size": batch_size, "lr": lr, 
@@ -3886,7 +3918,13 @@ def run_subject_disjoint_verification(x, y, model_class, epochs=150, batch_size=
 
     if intelligent_weight_loading:
         from utils import CacheManager
-        cache = CacheManager()
+        cache = CacheManager(
+            base_dir=getattr(
+                loader,
+                "cache_dir",
+                DEFAULT_CACHE_DIR,
+            )
+        )
         train_config = {
             "training_regime": "intra_session_subject_disjoint",
             "model": model_class.__name__, "epochs": epochs, "batch_size": batch_size, "lr": lr, 
@@ -4316,7 +4354,13 @@ def run_cross_session_identification(x_train, y_train, x_test, y_test, model_cla
 
     if intelligent_weight_loading:
         from utils import CacheManager
-        cache = CacheManager()
+        cache = CacheManager(
+            base_dir=getattr(
+                loader,
+                "cache_dir",
+                DEFAULT_CACHE_DIR,
+            )
+        )
         train_config = {
             "training_regime": "cross_session_closed_set",
             "model": model_class.__name__, "epochs": epochs, "batch_size": batch_size, "lr": lr, 
@@ -4709,7 +4753,13 @@ def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class
 
     if intelligent_weight_loading:
         from utils import CacheManager
-        cache = CacheManager()
+        cache = CacheManager(
+            base_dir=getattr(
+                loader,
+                "cache_dir",
+                DEFAULT_CACHE_DIR,
+            )
+        )
         train_config = {
             "training_regime": "cross_session_closed_set",
             "model": model_class.__name__, "epochs": epochs, "batch_size": batch_size, "lr": lr, 
@@ -5125,7 +5175,13 @@ def run_subject_disjoint_cross_session_identification(
 
     if intelligent_weight_loading:
         from utils import CacheManager
-        cache = CacheManager()
+        cache = CacheManager(
+            base_dir=getattr(
+                loader,
+                "cache_dir",
+                DEFAULT_CACHE_DIR,
+            )
+        )
         train_config = {
             "training_regime": "cross_session_subject_disjoint",
             "model": model_class.__name__, "epochs": epochs, "batch_size": batch_size, "lr": lr, 
@@ -5511,7 +5567,13 @@ def run_subject_disjoint_cross_session_verification(
 
     if intelligent_weight_loading:
         from utils import CacheManager
-        cache = CacheManager()
+        cache = CacheManager(
+            base_dir=getattr(
+                loader,
+                "cache_dir",
+                DEFAULT_CACHE_DIR,
+            )
+        )
         train_config = {
             "training_regime": "cross_session_subject_disjoint",
             "model": model_class.__name__, "epochs": epochs, "batch_size": batch_size, "lr": lr, 

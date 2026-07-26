@@ -1227,6 +1227,24 @@ def get_parser():
                             help="If set, saves/loads precomputed data arrays based on hyperparameters.")
     misc_group.add_argument('--intelligent_weight_loading', action='store_true',
                             help="If set, saves/loads pre-trained model weights based on hyperparameters.")
+    misc_group.add_argument(
+        '--cache_dir',
+        type=str,
+        default=utils.DEFAULT_CACHE_DIR,
+        help=(
+            "Directory for preprocessed arrays and trained model "
+            "weights. Relative paths are resolved from the repository."
+        ),
+    )
+    misc_group.add_argument(
+        '--results_dir',
+        type=str,
+        default=utils.DEFAULT_RESULTS_DIR,
+        help=(
+            "Directory for experiment outputs. Relative paths are "
+            "resolved from the repository."
+        ),
+    )
 
     return parser
 
@@ -1318,6 +1336,9 @@ def main():
         print(f"[ERROR] Unsupported dataset: {args.dataset}")
         sys.exit(1)
 
+    loader.cache_dir = args.cache_dir
+    loader.results_dir = args.results_dir
+
     loader.effective_experiment_configuration = (
         effective_configuration
     )
@@ -1327,7 +1348,9 @@ def main():
     # ==========================================
     if args.intelligent_data_loading:
         from utils import CacheManager
-        cache = CacheManager()
+        cache = CacheManager(
+            base_dir=args.cache_dir
+        )
         
         # Tasks 1 to 4: Intra-Session
         if args.task in [1, 2, 3, 4]:

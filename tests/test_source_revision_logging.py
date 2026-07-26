@@ -12,12 +12,13 @@ import run
 
 
 class DummyLoader:
-    def __init__(self):
+    def __init__(self, results_dir=None):
         self.cfg = {
             "root_dir": "synthetic_dataset",
             "preprocessing": {},
         }
         self.prep_params = {}
+        self.results_dir = results_dir
 
 
 class SourceRevisionLoggingTests(unittest.TestCase):
@@ -148,11 +149,13 @@ class SourceRevisionLoggingTests(unittest.TestCase):
                         hyperparams={
                             "epochs": 1,
                         },
-                        loader=DummyLoader(),
+                        loader=DummyLoader(
+                            results_dir=temporary_directory,
+                        ),
                     )
 
                 log_path = (
-                    Path("results")
+                    Path(temporary_directory)
                     / "synthetic_dataset"
                     / "Synthetic_Task.txt"
                 )

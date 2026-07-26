@@ -989,6 +989,59 @@ def _apply_outlier_filter(
     return x[final_indices], y[final_indices]
 
 
+PROJECT_ROOT = os.path.dirname(
+    os.path.abspath(__file__)
+)
+
+DEFAULT_CACHE_DIR = os.path.join(
+    "..",
+    "ecg-biometrics-artifacts",
+    "cache",
+)
+
+DEFAULT_RESULTS_DIR = os.path.join(
+    "..",
+    "ecg-biometrics-artifacts",
+    "results",
+)
+
+
+def resolve_artifact_path(path):
+    """
+    Resolve an artifact path relative to the repository directory.
+
+    Environment variables and user-home markers are expanded. Absolute
+    paths are preserved.
+    """
+    if path is None:
+        raise ValueError(
+            "Artifact path cannot be None."
+        )
+
+    expanded_path = os.path.expandvars(
+        os.path.expanduser(
+            os.fspath(path)
+        )
+    )
+
+    if not expanded_path.strip():
+        raise ValueError(
+            "Artifact path cannot be empty."
+        )
+
+    if not os.path.isabs(
+        expanded_path
+    ):
+        expanded_path = os.path.join(
+            PROJECT_ROOT,
+            expanded_path,
+        )
+
+    return os.path.abspath(
+        expanded_path
+    )
+
+
 def _generate_config_hash(config_dict):
     """Creates a deterministic short hash from a dictionary of parameters."""
     # Convert dict to a sorted JSON string to ensure consistent hashing
@@ -1051,9 +1104,18 @@ def _remove_cache_files(*paths):
             )
 
 class CacheManager:
-    def __init__(self, base_dir="precomputed"):
-        self.data_dir = os.path.join(base_dir, "data")
-        self.weight_dir = os.path.join(base_dir, "weights")
+    def __init__(self, base_dir=DEFAULT_CACHE_DIR):
+        self.base_dir = resolve_artifact_path(
+            base_dir
+        )
+        self.data_dir = os.path.join(
+            self.base_dir,
+            "data",
+        )
+        self.weight_dir = os.path.join(
+            self.base_dir,
+            "weights",
+        )
         os.makedirs(self.data_dir, exist_ok=True)
         os.makedirs(self.weight_dir, exist_ok=True)
 

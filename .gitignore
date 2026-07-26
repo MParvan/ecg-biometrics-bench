@@ -1,3 +1,22 @@
 # Python cache files
 __pycache__/
 *.py[cod]
+
+# Generated experiment artifacts
+precomputed/
+cache/
+results/
+validation_runs/
+ecg-biometrics-artifacts/
+
+# Model, cache, and array payloads
+*.pth
+*.pt
+*.ckpt
+*.npz
+*.npy
+*.pkl
+*.pickle
+
+# Local validation and backup files
+*.before_manuscript_validation
