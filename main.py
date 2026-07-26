@@ -1313,6 +1313,10 @@ def main():
     # ==========================================
     # 3. DATA EXTRACTION LOGIC
     # ==========================================
+    data_preparation_started = (
+        run._start_runtime_stage()
+    )
+
     if args.intelligent_data_loading:
         from utils import CacheManager
         cache = CacheManager(
@@ -1326,7 +1330,11 @@ def main():
                 loader,
                 task_type="intra_session",
             )
-            cached_data, uid = cache.get_data_cache(data_config)
+            cached_data, uid = run._timed_runtime_call(
+                "Data Cache Read",
+                cache.get_data_cache,
+                data_config,
+            )
             
             if cached_data:
                 print(f"\n[INFO] Loaded precomputed data from cache (Hash: {uid})")
@@ -1350,7 +1358,16 @@ def main():
                         x, y = loader.load_session(
                             "train"
                         )
-                cache.save_data_cache({'x': x, 'y': y}, data_config, uid)
+                run._timed_runtime_call(
+                    "Data Cache Write",
+                    cache.save_data_cache,
+                    {
+                        "x": x,
+                        "y": y,
+                    },
+                    data_config,
+                    uid,
+                )
 
             print(f"\n[INFO] Data Loaded: X={x.shape}, Y={y.shape}")
             if x.shape[0] == 0:
@@ -1364,7 +1381,11 @@ def main():
                 loader,
                 task_type="cross_session",
             )
-            cached_data, uid = cache.get_data_cache(data_config)
+            cached_data, uid = run._timed_runtime_call(
+                "Data Cache Read",
+                cache.get_data_cache,
+                data_config,
+            )
             
             if cached_data:
                 print(f"\n[INFO] Loaded precomputed cross-session data from cache (Hash: {uid})")
@@ -1373,7 +1394,18 @@ def main():
             else:
                 x_s1, y_s1 = loader.load_session("train")
                 x_s2, y_s2 = loader.load_session("test")
-                cache.save_data_cache({'x_s1': x_s1, 'y_s1': y_s1, 'x_s2': x_s2, 'y_s2': y_s2}, data_config, uid)
+                run._timed_runtime_call(
+                    "Data Cache Write",
+                    cache.save_data_cache,
+                    {
+                        "x_s1": x_s1,
+                        "y_s1": y_s1,
+                        "x_s2": x_s2,
+                        "y_s2": y_s2,
+                    },
+                    data_config,
+                    uid,
+                )
 
             print(f"\n[INFO] Session 1 (Enroll) Loaded: X={x_s1.shape}, Y={y_s1.shape}")
             print(f"[INFO] Session 2 (Probe) Loaded:  X={x_s2.shape}, Y={y_s2.shape}")
@@ -1419,6 +1451,10 @@ def main():
                 print("[ERROR] One or both cross-session arrays are empty. Check your parameters.")
                 sys.exit(1)
 
+    run._record_runtime_stage(
+        "Data Preparation (inclusive)",
+        data_preparation_started,
+    )
 
     # ==========================================
     # 4. SHARED EXECUTION ARGUMENTS

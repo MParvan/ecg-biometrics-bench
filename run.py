@@ -26,6 +26,7 @@ import numpy as np
 import random
 import collections
 import copy
+from functools import wraps
 from collections.abc import Mapping
 from inspect import signature
 from typing import Dict, Any, Optional, Tuple, List, Union
@@ -124,17 +125,68 @@ def _collect_software_environment():
 
 _EXPERIMENT_START_TIME = None
 
+_RUNTIME_STAGE_TOTALS = collections.defaultdict(
+    float
+)
+_RUNTIME_STAGE_COUNTS = collections.defaultdict(
+    int
+)
+_RUNTIME_RUN_TIMES = []
+
+_RUNTIME_STAGE_ORDER = (
+    "Data Preparation (inclusive)",
+    "Data Cache Read",
+    "Data Cache Write",
+    "Partition Preparation",
+    "Weight Cache Read",
+    "Model Training",
+    "Weight Cache Write",
+    "Embedding Extraction",
+    "Template Construction",
+    "Similarity Scoring",
+    "Pair Generation",
+    "Probe Fusion",
+    "Metric Computation",
+)
+
+
+def _reset_runtime_profile():
+    """
+    Clear stage and per-run timing measurements.
+    """
+    _RUNTIME_STAGE_TOTALS.clear()
+    _RUNTIME_STAGE_COUNTS.clear()
+    _RUNTIME_RUN_TIMES.clear()
+
+
+def _synchronize_cuda():
+    """
+    Synchronize pending CUDA operations before a timing boundary.
+
+    CUDA execution is asynchronous, so synchronization is required for
+    meaningful wall-clock measurements. Synchronization failures are ignored
+    to ensure profiling cannot interrupt an experiment.
+    """
+    if not torch.cuda.is_available():
+        return
+
+    try:
+        torch.cuda.synchronize()
+    except Exception:
+        pass
+
 
 def start_experiment_timer():
     """
-    Start wall-clock and peak-memory measurement for a complete experiment.
+    Start wall-clock, stage, and peak-memory profiling for one experiment.
 
     The timer is started by the command-line entry point before dataset
-    loading, so the reported duration covers data preparation, training,
-    evaluation, and result generation.
+    loading, so total duration covers data preparation, training, evaluation,
+    and result generation up to creation of the experiment log.
     """
     global _EXPERIMENT_START_TIME
 
+    _reset_runtime_profile()
     _EXPERIMENT_START_TIME = time.perf_counter()
 
     if torch.cuda.is_available():
@@ -144,18 +196,223 @@ def start_experiment_timer():
             pass
 
 
+def _start_runtime_stage():
+    """
+    Return a synchronized high-resolution stage start time.
+    """
+    _synchronize_cuda()
+    return time.perf_counter()
+
+
+def _finish_runtime_interval(started_at):
+    """
+    Finish one synchronized timing interval and return elapsed seconds.
+    """
+    _synchronize_cuda()
+
+    elapsed_seconds = (
+        time.perf_counter()
+        - started_at
+    )
+
+    return max(
+        0.0,
+        float(elapsed_seconds),
+    )
+
+
+def _record_runtime_stage(
+    stage_name,
+    started_at,
+):
+    """
+    Add one elapsed interval to a named runtime stage.
+    """
+    elapsed_seconds = _finish_runtime_interval(
+        started_at
+    )
+
+    _RUNTIME_STAGE_TOTALS[
+        str(stage_name)
+    ] += elapsed_seconds
+
+    _RUNTIME_STAGE_COUNTS[
+        str(stage_name)
+    ] += 1
+
+    return elapsed_seconds
+
+
+def _timed_runtime_call(
+    stage_name,
+    function,
+    *args,
+    **kwargs,
+):
+    """
+    Execute a callable and record its complete wall-clock duration.
+
+    Timing is also recorded when the callable raises, after which the original
+    exception is propagated unchanged.
+    """
+    started_at = _start_runtime_stage()
+
+    try:
+        return function(
+            *args,
+            **kwargs,
+        )
+    finally:
+        _record_runtime_stage(
+            stage_name,
+            started_at,
+        )
+
+
+def _record_multi_run_time(
+    run_index,
+    seed,
+    started_at,
+):
+    """
+    Record the complete wall-clock duration of one recursive seed run.
+    """
+    elapsed_seconds = _finish_runtime_interval(
+        started_at
+    )
+
+    _RUNTIME_RUN_TIMES.append(
+        {
+            "run_index": int(run_index),
+            "seed": int(seed),
+            "seconds": elapsed_seconds,
+        }
+    )
+
+    return elapsed_seconds
+
+
+def _make_runtime_wrapper(
+    stage_name,
+    function,
+):
+    """
+    Create a transparent timing wrapper around an imported helper.
+    """
+    @wraps(function)
+    def timed_function(
+        *args,
+        **kwargs,
+    ):
+        return _timed_runtime_call(
+            stage_name,
+            function,
+            *args,
+            **kwargs,
+        )
+
+    return timed_function
+
+
+# Retain direct references to the numerical implementations. The local names
+# used by this module are then replaced with transparent timing wrappers.
+_ORIGINAL_RUN_TRAINING_LOOP = (
+    _run_training_loop
+)
+_ORIGINAL_RUN_TRAIN_LOOP_UNSEEN_SUBJECTS = (
+    _run_train_loop_unseen_subjects
+)
+_ORIGINAL_GET_EMBEDDINGS = (
+    _get_embeddings
+)
+_ORIGINAL_CREATE_TEMPLATES = (
+    _create_templates
+)
+_ORIGINAL_COMPUTE_SCORE_MATRIX = (
+    _compute_score_matrix
+)
+_ORIGINAL_GENERATE_PAIRS = (
+    _generate_pairs
+)
+_ORIGINAL_APPLY_SCORE_FUSION = (
+    _apply_score_fusion
+)
+_ORIGINAL_COMPUTE_METRICS_IDENTIFICATION = (
+    _compute_metrics_identification
+)
+_ORIGINAL_COMPUTE_METRICS_VERIFICATION = (
+    _compute_metrics_verification
+)
+
+
+_run_training_loop = _make_runtime_wrapper(
+    "Model Training",
+    _ORIGINAL_RUN_TRAINING_LOOP,
+)
+
+_run_train_loop_unseen_subjects = (
+    _make_runtime_wrapper(
+        "Model Training",
+        _ORIGINAL_RUN_TRAIN_LOOP_UNSEEN_SUBJECTS,
+    )
+)
+
+_get_embeddings = _make_runtime_wrapper(
+    "Embedding Extraction",
+    _ORIGINAL_GET_EMBEDDINGS,
+)
+
+_create_templates = _make_runtime_wrapper(
+    "Template Construction",
+    _ORIGINAL_CREATE_TEMPLATES,
+)
+
+_compute_score_matrix = _make_runtime_wrapper(
+    "Similarity Scoring",
+    _ORIGINAL_COMPUTE_SCORE_MATRIX,
+)
+
+_generate_pairs = _make_runtime_wrapper(
+    "Pair Generation",
+    _ORIGINAL_GENERATE_PAIRS,
+)
+
+_apply_score_fusion = _make_runtime_wrapper(
+    "Probe Fusion",
+    _ORIGINAL_APPLY_SCORE_FUSION,
+)
+
+_compute_metrics_identification = (
+    _make_runtime_wrapper(
+        "Metric Computation",
+        _ORIGINAL_COMPUTE_METRICS_IDENTIFICATION,
+    )
+)
+
+_compute_metrics_verification = (
+    _make_runtime_wrapper(
+        "Metric Computation",
+        _ORIGINAL_COMPUTE_METRICS_VERIFICATION,
+    )
+)
+
+
 def _collect_runtime_profile():
     """
-    Return runtime and optional CUDA-memory statistics.
+    Return total, stage, multi-run, and optional CUDA-memory statistics.
 
-    An empty dictionary is returned when the timer was not initialized, such
-    as when a task runner is called directly rather than through main.py.
+    An empty dictionary is returned when the complete experiment timer was not
+    initialized, such as when a task runner is called directly rather than
+    through main.py.
     """
     if _EXPERIMENT_START_TIME is None:
         return {}
 
+    _synchronize_cuda()
+
     elapsed_seconds = (
-        time.perf_counter() - _EXPERIMENT_START_TIME
+        time.perf_counter()
+        - _EXPERIMENT_START_TIME
     )
 
     profile = {
@@ -164,19 +421,106 @@ def _collect_runtime_profile():
         ),
     }
 
+    ordered_stage_names = list(
+        _RUNTIME_STAGE_ORDER
+    )
+
+    additional_stage_names = sorted(
+        set(_RUNTIME_STAGE_TOTALS)
+        - set(ordered_stage_names)
+    )
+
+    ordered_stage_names.extend(
+        additional_stage_names
+    )
+
+    for stage_name in ordered_stage_names:
+        if stage_name not in _RUNTIME_STAGE_TOTALS:
+            continue
+
+        profile[
+            f"{stage_name} Time (seconds)"
+        ] = float(
+            _RUNTIME_STAGE_TOTALS[
+                stage_name
+            ]
+        )
+
+        profile[
+            f"{stage_name} Calls"
+        ] = int(
+            _RUNTIME_STAGE_COUNTS[
+                stage_name
+            ]
+        )
+
+    if _RUNTIME_RUN_TIMES:
+        run_durations = np.asarray(
+            [
+                entry["seconds"]
+                for entry in _RUNTIME_RUN_TIMES
+            ],
+            dtype=float,
+        )
+
+        for entry in _RUNTIME_RUN_TIMES:
+            run_index = entry[
+                "run_index"
+            ]
+
+            profile[
+                f"Run {run_index} Seed"
+            ] = entry["seed"]
+
+            profile[
+                (
+                    f"Run {run_index} "
+                    "Wall-Clock Time (seconds)"
+                )
+            ] = float(
+                entry["seconds"]
+            )
+
+        profile[
+            "Per-Run Time Mean (seconds)"
+        ] = float(
+            np.mean(run_durations)
+        )
+
+        profile[
+            "Per-Run Time Std (seconds)"
+        ] = float(
+            np.std(run_durations)
+        )
+
+        profile[
+            "Per-Run Time Min (seconds)"
+        ] = float(
+            np.min(run_durations)
+        )
+
+        profile[
+            "Per-Run Time Max (seconds)"
+        ] = float(
+            np.max(run_durations)
+        )
+
     if torch.cuda.is_available():
         try:
             peak_memory_bytes = (
                 torch.cuda.max_memory_allocated()
             )
 
-            profile["Peak CUDA Memory (MiB)"] = (
-                peak_memory_bytes / (1024 ** 2)
+            profile[
+                "Peak CUDA Memory (MiB)"
+            ] = (
+                peak_memory_bytes
+                / (1024 ** 2)
             )
         except Exception:
-            profile["Peak CUDA Memory (MiB)"] = (
-                "unavailable"
-            )
+            profile[
+                "Peak CUDA Memory (MiB)"
+            ] = "unavailable"
 
     return profile
 
@@ -2311,7 +2655,13 @@ def run_closed_set_identification(x, y, model_class, epochs=150, batch_size=256,
             print(f"\n{'='*40}\n RUN {i+1}/{n_runs} (Seed: {call_args['seed']})\n{'='*40}")
             
             # Recursive call to execute a single seed
+            run_wall_clock_started = _start_runtime_stage()
             res, d_stats, h_params = run_closed_set_identification(**call_args) 
+            _record_multi_run_time(
+                run_index=i + 1,
+                seed=call_args["seed"],
+                started_at=run_wall_clock_started,
+            )
             
             results.append(res)
             # Preserve metadata from the last successful run for the final log file
@@ -2354,6 +2704,7 @@ def run_closed_set_identification(x, y, model_class, epochs=150, batch_size=256,
     ] = augmentation_config
 
     _set_seed(seed); device = _get_device(device)
+    partition_stage_started = _start_runtime_stage()
     task_title = "Closed-Set Identification"
     mode_str = f"Template ({template_fusion_method}, {matching_method})" if use_template else "Softmax"
     print(f"\n[TASK] {task_title} | Mode: {mode_str} | Device: {device}")
@@ -2524,6 +2875,11 @@ def run_closed_set_identification(x, y, model_class, epochs=150, batch_size=256,
     test_loader = _make_loader(X_test, y_test_enc, batch_size, shuffle=False)
  
     # 3. Train (Always start with Softmax training)
+    _record_runtime_stage(
+        "Partition Preparation",
+        partition_stage_started,
+    )
+
     model = model_class(in_channels=_detect_channels(x), num_classes=len(classes), include_top=True).to(device)
 
     hyperparams.update(
@@ -2561,7 +2917,13 @@ def run_closed_set_identification(x, y, model_class, epochs=150, batch_size=256,
             training_labels=y_tr,
         )
         
-        cached_model, uid = cache.get_weight_cache(train_config, model, device)
+        cached_model, uid = _timed_runtime_call(
+            "Weight Cache Read",
+            cache.get_weight_cache,
+            train_config,
+            model,
+            device,
+        )
         if cached_model:
             print(f"\n[INFO] Loaded pre-trained weights (Hash: {uid}). Skipping training!")
             model = cached_model
@@ -2569,7 +2931,13 @@ def run_closed_set_identification(x, y, model_class, epochs=150, batch_size=256,
             print(f"\n[INFO] Training new model (Hash: {uid})...")
             optimizer = torch.optim.Adam(model.parameters(), lr=lr); criterion = nn.CrossEntropyLoss()
             model = _run_training_loop(model, train_loader, val_loader, optimizer, criterion, device, epochs)
-            cache.save_weight_cache(model, train_config, uid)
+            _timed_runtime_call(
+                "Weight Cache Write",
+                cache.save_weight_cache,
+                model,
+                train_config,
+                uid,
+            )
     else:
         optimizer = torch.optim.Adam(model.parameters(), lr=lr); criterion = nn.CrossEntropyLoss()
         model = _run_training_loop(model, train_loader, val_loader, optimizer, criterion, device, epochs)
@@ -2761,7 +3129,13 @@ def run_closed_set_verification(x, y, model_class, epochs=150, batch_size=256, l
             call_args['seed'] = base_seed + i
             call_args['visualize'] = False 
             print(f"\n{'='*40}\n RUN {i+1}/{n_runs} (Seed: {call_args['seed']})\n{'='*40}")
+            run_wall_clock_started = _start_runtime_stage()
             res, d_stats, h_params = run_closed_set_verification(**call_args) 
+            _record_multi_run_time(
+                run_index=i + 1,
+                seed=call_args["seed"],
+                started_at=run_wall_clock_started,
+            )
             results.append(res)
             data_stats = d_stats
             hyperparams = h_params
@@ -2795,6 +3169,7 @@ def run_closed_set_verification(x, y, model_class, epochs=150, batch_size=256, l
     ] = augmentation_config
 
     _set_seed(seed); device = _get_device(device)
+    partition_stage_started = _start_runtime_stage()
     task_title = "Closed-Set Verification"
     mode_str = f"Template ({template_fusion_method}, size={template_size})" if use_template else "Cloud Pairs (Test Only)"
     print(f"\n[TASK] {task_title} | Mode: {mode_str} | Match: {matching_method}")
@@ -2959,6 +3334,11 @@ def run_closed_set_verification(x, y, model_class, epochs=150, batch_size=256, l
     test_loader = _make_loader(X_test, y_test_enc, batch_size, shuffle=False)
     
     # 7. Train Model
+    _record_runtime_stage(
+        "Partition Preparation",
+        partition_stage_started,
+    )
+
     model = model_class(in_channels=_detect_channels(x), num_classes=len(classes), include_top=True).to(device)
 
     hyperparams.update(
@@ -2989,7 +3369,13 @@ def run_closed_set_verification(x, y, model_class, epochs=150, batch_size=256, l
             training_labels=y_tr,
         )
         
-        cached_model, uid = cache.get_weight_cache(train_config, model, device)
+        cached_model, uid = _timed_runtime_call(
+            "Weight Cache Read",
+            cache.get_weight_cache,
+            train_config,
+            model,
+            device,
+        )
         if cached_model:
             print(f"\n[INFO] Loaded pre-trained weights (Hash: {uid}). Skipping training!")
             model = cached_model
@@ -2997,7 +3383,13 @@ def run_closed_set_verification(x, y, model_class, epochs=150, batch_size=256, l
             print(f"\n[INFO] Training new model (Hash: {uid})...")
             optimizer = torch.optim.Adam(model.parameters(), lr=lr); criterion = nn.CrossEntropyLoss()
             model = _run_training_loop(model, train_loader, val_loader, optimizer, criterion, device, epochs)
-            cache.save_weight_cache(model, train_config, uid)
+            _timed_runtime_call(
+                "Weight Cache Write",
+                cache.save_weight_cache,
+                model,
+                train_config,
+                uid,
+            )
     else:
         optimizer = torch.optim.Adam(model.parameters(), lr=lr)
         criterion = nn.CrossEntropyLoss()
@@ -3216,7 +3608,13 @@ def run_subject_disjoint_identification(x, y, model_class, epochs=150, batch_siz
             call_args['seed'] = base_seed + i
             call_args['visualize'] = False 
             print(f"\n{'='*40}\n RUN {i+1}/{n_runs} (Seed: {call_args['seed']})\n{'='*40}")
+            run_wall_clock_started = _start_runtime_stage()
             res, d_stats, h_params = run_subject_disjoint_identification(**call_args) 
+            _record_multi_run_time(
+                run_index=i + 1,
+                seed=call_args["seed"],
+                started_at=run_wall_clock_started,
+            )
             results.append(res); data_stats = d_stats; hyperparams = h_params
 
         hyperparams = _add_seed_metadata(
@@ -3245,6 +3643,7 @@ def run_subject_disjoint_identification(x, y, model_class, epochs=150, batch_siz
     ] = augmentation_config
 
     _set_seed(seed); device = _get_device(device)
+    partition_stage_started = _start_runtime_stage()
     task_title = "Subject-Disjoint Identification"
     mode_str = f"Gallery: First {template_size} beats | Fusion: {template_fusion_method}"
     print(f"\n[TASK] {task_title} | Mode: {mode_str} | Match: {matching_method}")
@@ -3418,6 +3817,11 @@ def run_subject_disjoint_identification(x, y, model_class, epochs=150, batch_siz
     
     test_loader = _make_loader(X_test, y_test, batch_size, shuffle=False)
     
+    _record_runtime_stage(
+        "Partition Preparation",
+        partition_stage_started,
+    )
+
     model = model_class(in_channels=_detect_channels(x), num_classes=num_train_classes, include_top=True).to(device)
 
     hyperparams.update(
@@ -3449,7 +3853,13 @@ def run_subject_disjoint_identification(x, y, model_class, epochs=150, batch_siz
             training_labels=y_tr,
         )
         
-        cached_model, uid = cache.get_weight_cache(train_config, model, device)
+        cached_model, uid = _timed_runtime_call(
+            "Weight Cache Read",
+            cache.get_weight_cache,
+            train_config,
+            model,
+            device,
+        )
         if cached_model:
             print(f"\n[INFO] Loaded pre-trained weights (Hash: {uid}). Skipping training!")
             model = cached_model
@@ -3461,7 +3871,13 @@ def run_subject_disjoint_identification(x, y, model_class, epochs=150, batch_siz
                 val_loader_unseen=val_loader_unseen, optimizer=optimizer, criterion=criterion, 
                 device=device, epochs=epochs, matching_method=matching_method, patience=40, lr_patience=15
             )
-            cache.save_weight_cache(model, train_config, uid)
+            _timed_runtime_call(
+                "Weight Cache Write",
+                cache.save_weight_cache,
+                model,
+                train_config,
+                uid,
+            )
     
     else:
         optimizer = torch.optim.Adam(model.parameters(), lr=lr)
@@ -3676,7 +4092,13 @@ def run_subject_disjoint_verification(x, y, model_class, epochs=150, batch_size=
             call_args['seed'] = base_seed + i
             call_args['visualize'] = False 
             print(f"\n{'='*40}\n RUN {i+1}/{n_runs} (Seed: {call_args['seed']})\n{'='*40}")
+            run_wall_clock_started = _start_runtime_stage()
             res, d_stats, h_params = run_subject_disjoint_verification(**call_args) 
+            _record_multi_run_time(
+                run_index=i + 1,
+                seed=call_args["seed"],
+                started_at=run_wall_clock_started,
+            )
             results.append(res); data_stats = d_stats; hyperparams = h_params
 
         hyperparams = _add_seed_metadata(
@@ -3711,6 +4133,7 @@ def run_subject_disjoint_verification(x, y, model_class, epochs=150, batch_size=
     ] = augmentation_config
 
     _set_seed(seed); device = _get_device(device)
+    partition_stage_started = _start_runtime_stage()
     task_title = "Subject-Disjoint Verification"        
     mode_str = f"Template ({template_fusion_method}, First {template_size})" if use_template else "Cloud Pairs (Test Only)"
     print(f"\n[TASK] {task_title} | Mode: {mode_str} | Match: {matching_method}")
@@ -3884,6 +4307,11 @@ def run_subject_disjoint_verification(x, y, model_class, epochs=150, batch_size=
     
     test_loader = _make_loader(X_test, y_test, batch_size, shuffle=False)
     
+    _record_runtime_stage(
+        "Partition Preparation",
+        partition_stage_started,
+    )
+
     model = model_class(in_channels=_detect_channels(x), num_classes=num_train_classes, include_top=True).to(device)
 
     hyperparams.update(
@@ -3915,7 +4343,13 @@ def run_subject_disjoint_verification(x, y, model_class, epochs=150, batch_size=
             training_labels=y_tr,
         )
         
-        cached_model, uid = cache.get_weight_cache(train_config, model, device)
+        cached_model, uid = _timed_runtime_call(
+            "Weight Cache Read",
+            cache.get_weight_cache,
+            train_config,
+            model,
+            device,
+        )
         if cached_model:
             print(f"\n[INFO] Loaded pre-trained weights (Hash: {uid}). Skipping training!")
             model = cached_model
@@ -3927,7 +4361,13 @@ def run_subject_disjoint_verification(x, y, model_class, epochs=150, batch_size=
                 val_loader_unseen=val_loader_unseen, optimizer=optimizer, criterion=criterion, 
                 device=device, epochs=epochs, matching_method=matching_method, patience=40, lr_patience=15
             )
-            cache.save_weight_cache(model, train_config, uid)
+            _timed_runtime_call(
+                "Weight Cache Write",
+                cache.save_weight_cache,
+                model,
+                train_config,
+                uid,
+            )
     
     else:
         optimizer = torch.optim.Adam(model.parameters(), lr=lr)
@@ -4166,7 +4606,13 @@ def run_cross_session_identification(x_train, y_train, x_test, y_test, model_cla
             call_args['seed'] = base_seed + i
             call_args['visualize'] = False 
             print(f"\n{'='*40}\n RUN {i+1}/{n_runs} (Seed: {call_args['seed']})\n{'='*40}")
+            run_wall_clock_started = _start_runtime_stage()
             res, d_stats, h_params = run_cross_session_identification(**call_args) 
+            _record_multi_run_time(
+                run_index=i + 1,
+                seed=call_args["seed"],
+                started_at=run_wall_clock_started,
+            )
             results.append(res); data_stats = d_stats; hyperparams = h_params
 
         hyperparams = _add_seed_metadata(
@@ -4195,6 +4641,7 @@ def run_cross_session_identification(x_train, y_train, x_test, y_test, model_cla
     ] = augmentation_config
 
     _set_seed(seed); device = _get_device(device)
+    partition_stage_started = _start_runtime_stage()
     task_title = "Cross-Session Identification"
     mode_str = f"Template ({template_fusion_method}, size={template_size or 'All'})" if use_template else "Softmax Classifier"
     print(f"\n[TASK] {task_title} | Mode: {mode_str} | Match: {matching_method if use_template else 'N/A'}")
@@ -4322,6 +4769,11 @@ def run_cross_session_identification(x_train, y_train, x_test, y_test, model_cla
     probe_loader = _make_loader(x_test_filtered, y_test_enc, batch_size, shuffle=False)
     
     # Train Model
+    _record_runtime_stage(
+        "Partition Preparation",
+        partition_stage_started,
+    )
+
     model = model_class(in_channels=_detect_channels(x_train_full), num_classes=len(classes), include_top=True).to(device)
 
     hyperparams.update(
@@ -4352,7 +4804,13 @@ def run_cross_session_identification(x_train, y_train, x_test, y_test, model_cla
             training_labels=y_tr,
         )
         
-        cached_model, uid = cache.get_weight_cache(train_config, model, device)
+        cached_model, uid = _timed_runtime_call(
+            "Weight Cache Read",
+            cache.get_weight_cache,
+            train_config,
+            model,
+            device,
+        )
         if cached_model:
             print(f"\n[INFO] Loaded pre-trained weights (Hash: {uid}). Skipping training!")
             model = cached_model
@@ -4360,7 +4818,13 @@ def run_cross_session_identification(x_train, y_train, x_test, y_test, model_cla
             print(f"\n[INFO] Training new Cross-Session model (Hash: {uid})...")
             optimizer = torch.optim.Adam(model.parameters(), lr=lr); criterion = nn.CrossEntropyLoss()
             model = _run_training_loop(model, train_loader, val_loader, optimizer, criterion, device, epochs)
-            cache.save_weight_cache(model, train_config, uid)
+            _timed_runtime_call(
+                "Weight Cache Write",
+                cache.save_weight_cache,
+                model,
+                train_config,
+                uid,
+            )
     else:
         optimizer = torch.optim.Adam(model.parameters(), lr=lr); criterion = nn.CrossEntropyLoss()
         model = _run_training_loop(model, train_loader, val_loader, optimizer, criterion, device, epochs)
@@ -4545,7 +5009,13 @@ def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class
             call_args['seed'] = base_seed + i
             call_args['visualize'] = False 
             print(f"\n{'='*40}\n RUN {i+1}/{n_runs} (Seed: {call_args['seed']})\n{'='*40}")
+            run_wall_clock_started = _start_runtime_stage()
             res, d_stats, h_params = run_cross_session_verification(**call_args) 
+            _record_multi_run_time(
+                run_index=i + 1,
+                seed=call_args["seed"],
+                started_at=run_wall_clock_started,
+            )
             results.append(res); data_stats = d_stats; hyperparams = h_params
 
         hyperparams = _add_seed_metadata(
@@ -4577,6 +5047,7 @@ def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class
     ] = augmentation_config
 
     _set_seed(seed); device = _get_device(device)
+    partition_stage_started = _start_runtime_stage()
     task_title = "Cross-Session Verification"
     mode_str = f"Template ({template_fusion_method}, size={template_size or 'All'})" if use_template else "Cloud Pairs (Session 2 Only)"
     print(f"\n[TASK] {task_title} | Mode: {mode_str} | Match: {matching_method}")
@@ -4723,6 +5194,11 @@ def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class
     probe_loader = _make_loader(x_test_filtered, y_test_enc, batch_size, shuffle=False)
     
     # Train Model
+    _record_runtime_stage(
+        "Partition Preparation",
+        partition_stage_started,
+    )
+
     model = model_class(in_channels=_detect_channels(x_train_full), num_classes=len(classes), include_top=True).to(device)
 
     hyperparams.update(
@@ -4753,7 +5229,13 @@ def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class
             training_labels=y_tr,
         )
         
-        cached_model, uid = cache.get_weight_cache(train_config, model, device)
+        cached_model, uid = _timed_runtime_call(
+            "Weight Cache Read",
+            cache.get_weight_cache,
+            train_config,
+            model,
+            device,
+        )
         if cached_model:
             print(f"\n[INFO] Loaded pre-trained weights (Hash: {uid}). Skipping training!")
             model = cached_model
@@ -4761,7 +5243,13 @@ def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class
             print(f"\n[INFO] Training new Cross-Session model (Hash: {uid})...")
             optimizer = torch.optim.Adam(model.parameters(), lr=lr); criterion = nn.CrossEntropyLoss()
             model = _run_training_loop(model, train_loader, val_loader, optimizer, criterion, device, epochs)
-            cache.save_weight_cache(model, train_config, uid)
+            _timed_runtime_call(
+                "Weight Cache Write",
+                cache.save_weight_cache,
+                model,
+                train_config,
+                uid,
+            )
     else:
         optimizer = torch.optim.Adam(model.parameters(), lr=lr); criterion = nn.CrossEntropyLoss()    
         model = _run_training_loop(model, train_loader, val_loader, optimizer, criterion, device, epochs)
@@ -4968,7 +5456,13 @@ def run_subject_disjoint_cross_session_identification(
             call_args['seed'] = base_seed + i
             call_args['visualize'] = False 
             print(f"\n{'='*40}\n RUN {i+1}/{n_runs} (Seed: {call_args['seed']})\n{'='*40}")
+            run_wall_clock_started = _start_runtime_stage()
             res, d_stats, h_params = run_subject_disjoint_cross_session_identification(**call_args) 
+            _record_multi_run_time(
+                run_index=i + 1,
+                seed=call_args["seed"],
+                started_at=run_wall_clock_started,
+            )
             results.append(res); data_stats = d_stats; hyperparams = h_params
 
         hyperparams = _add_seed_metadata(
@@ -5000,6 +5494,7 @@ def run_subject_disjoint_cross_session_identification(
     ] = augmentation_config
 
     _set_seed(seed); device = _get_device(device)
+    partition_stage_started = _start_runtime_stage()
     task_title = "Subject-Disjoint Cross-Session ID"
     mode_str = f"Gallery: Session 1 ({template_fusion_method}, size={template_size or 'All'})"
     print(f"\n[TASK] {task_title} | Mode: {mode_str} | Match: {matching_method}")
@@ -5147,6 +5642,11 @@ def run_subject_disjoint_cross_session_identification(
     # UNSEEN Validation now strictly passes the Session 1 loader only (Intra-Session check)
     val_loader_unseen = val_loader_s1
     
+    _record_runtime_stage(
+        "Partition Preparation",
+        partition_stage_started,
+    )
+
     model = model_class(in_channels=_detect_channels(x_s1), num_classes=num_train_classes, include_top=True).to(device)
 
     hyperparams.update(
@@ -5178,7 +5678,13 @@ def run_subject_disjoint_cross_session_identification(
             training_labels=y_tr,
         )
         
-        cached_model, uid = cache.get_weight_cache(train_config, model, device)
+        cached_model, uid = _timed_runtime_call(
+            "Weight Cache Read",
+            cache.get_weight_cache,
+            train_config,
+            model,
+            device,
+        )
         if cached_model:
             print(f"\n[INFO] Loaded pre-trained weights (Hash: {uid}). Skipping training!")
             model = cached_model
@@ -5190,7 +5696,13 @@ def run_subject_disjoint_cross_session_identification(
                 val_loader_unseen=val_loader_unseen, optimizer=optimizer, criterion=criterion, 
                 device=device, epochs=epochs, matching_method=matching_method, patience=40, lr_patience=15
             )
-            cache.save_weight_cache(model, train_config, uid)
+            _timed_runtime_call(
+                "Weight Cache Write",
+                cache.save_weight_cache,
+                model,
+                train_config,
+                uid,
+            )
     else:
         optimizer = torch.optim.Adam(model.parameters(), lr=lr)
         criterion = nn.CrossEntropyLoss()
@@ -5370,7 +5882,13 @@ def run_subject_disjoint_cross_session_verification(
             call_args['seed'] = base_seed + i
             call_args['visualize'] = False 
             print(f"\n{'='*40}\n RUN {i+1}/{n_runs} (Seed: {call_args['seed']})\n{'='*40}")
+            run_wall_clock_started = _start_runtime_stage()
             res, d_stats, h_params = run_subject_disjoint_cross_session_verification(**call_args) 
+            _record_multi_run_time(
+                run_index=i + 1,
+                seed=call_args["seed"],
+                started_at=run_wall_clock_started,
+            )
             results.append(res); data_stats = d_stats; hyperparams = h_params
 
         hyperparams = _add_seed_metadata(
@@ -5402,6 +5920,7 @@ def run_subject_disjoint_cross_session_verification(
     ] = augmentation_config
 
     _set_seed(seed); device = _get_device(device)
+    partition_stage_started = _start_runtime_stage()
     task_title = "Subject-Disjoint Cross-Session Verification"
     mode_str = f"Template ({template_fusion_method}, S1 Enroll -> S2 Probe)" if use_template else "Cloud Pairs (S2 vs S2)"
     print(f"\n[TASK] {task_title} | Mode: {mode_str} | Match: {matching_method}")
@@ -5541,6 +6060,11 @@ def run_subject_disjoint_cross_session_verification(
     # UNSEEN Validation now strictly passes the Session 1 loader only (Intra-Session check)
     val_loader_unseen = val_loader_s1
     
+    _record_runtime_stage(
+        "Partition Preparation",
+        partition_stage_started,
+    )
+
     model = model_class(in_channels=_detect_channels(x_s1), num_classes=num_train_classes, include_top=True).to(device)
 
     hyperparams.update(
@@ -5572,7 +6096,13 @@ def run_subject_disjoint_cross_session_verification(
             training_labels=y_tr,
         )
 
-        cached_model, uid = cache.get_weight_cache(train_config, model, device)
+        cached_model, uid = _timed_runtime_call(
+            "Weight Cache Read",
+            cache.get_weight_cache,
+            train_config,
+            model,
+            device,
+        )
         if cached_model:
             print(f"\n[INFO] Loaded pre-trained weights (Hash: {uid}). Skipping training!")
             model = cached_model
@@ -5584,7 +6114,13 @@ def run_subject_disjoint_cross_session_verification(
                 val_loader_unseen=val_loader_unseen, optimizer=optimizer, criterion=criterion, 
                 device=device, epochs=epochs, matching_method=matching_method, patience=40, lr_patience=15
             )
-            cache.save_weight_cache(model, train_config, uid)
+            _timed_runtime_call(
+                "Weight Cache Write",
+                cache.save_weight_cache,
+                model,
+                train_config,
+                uid,
+            )
     else:
         optimizer = torch.optim.Adam(model.parameters(), lr=lr)
         criterion = nn.CrossEntropyLoss()
