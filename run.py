@@ -830,6 +830,7 @@ def _build_structured_experiment_record(
     software_environment,
     source_revision,
     runtime_profile,
+    per_run_results=None,
 ):
     """
     Build one self-contained machine-readable experiment record.
@@ -873,6 +874,15 @@ def _build_structured_experiment_record(
         "computational_profile": (
             _to_json_compatible(
                 runtime_profile
+            )
+        ),
+        "per_run_results": (
+            _to_json_compatible(
+                (
+                    []
+                    if per_run_results is None
+                    else per_run_results
+                )
             )
         ),
         "results": {
@@ -923,7 +933,14 @@ def _append_structured_experiment_record(
 # =============================================================================
 # AUTOMATED EXPERIMENT LOGGER
 # =============================================================================
-def _log_experiment_results(task_name, metrics_dict, data_stats, hyperparams, loader=None):
+def _log_experiment_results(
+    task_name,
+    metrics_dict,
+    data_stats,
+    hyperparams,
+    loader=None,
+    per_run_results=None,
+):
     """
     Dynamically writes experiment configurations and results to a text file.
     Intelligently extracts parameters directly from the dataset loader object.
@@ -1058,6 +1075,7 @@ def _log_experiment_results(task_name, metrics_dict, data_stats, hyperparams, lo
             software_environment=software_environment,
             source_revision=source_revision,
             runtime_profile=runtime_profile,
+            per_run_results=per_run_results,
         )
     )
 
@@ -2845,6 +2863,148 @@ def _get_verification_pair_statistics(
 # RANDOM-SEED METADATA
 # =============================================================================
 
+def _build_per_run_results(
+    results,
+    seeds,
+    metric_names=None,
+):
+    """
+    Build structured seed-level metric records for a multi-run experiment.
+
+    The original metric values returned by each single-seed execution are
+    retained. This helper does not recompute metrics or alter the aggregate
+    mean and standard-deviation calculations performed by the task runners.
+    """
+    results = list(results)
+    seeds = list(seeds)
+
+    if len(results) != len(seeds):
+        raise ValueError(
+            "The number of multi-run results must match "
+            "the number of run seeds."
+        )
+
+    if not results:
+        return []
+
+    normalized_results = []
+
+    for result in results:
+        if isinstance(
+            result,
+            np.ndarray,
+        ):
+            if result.ndim == 0:
+                values = [
+                    result.item()
+                ]
+            else:
+                values = list(
+                    result.tolist()
+                )
+        elif isinstance(
+            result,
+            (
+                list,
+                tuple,
+            ),
+        ):
+            values = list(result)
+        else:
+            values = [
+                result
+            ]
+
+        normalized_results.append(
+            values
+        )
+
+    if metric_names is None:
+        default_metric_names = {
+            2: (
+                "Rank-1 Accuracy",
+                "Rank-5 Accuracy",
+            ),
+            4: (
+                "EER",
+                "AUC",
+                "d-prime",
+                "TAR@0.1%FAR",
+            ),
+        }
+
+        metric_names = (
+            default_metric_names.get(
+                len(
+                    normalized_results[0]
+                )
+            )
+        )
+
+        if metric_names is None:
+            raise ValueError(
+                "Metric names must be provided when "
+                "a run returns an unsupported number "
+                "of metric values."
+            )
+
+    metric_names = [
+        str(metric_name)
+        for metric_name in metric_names
+    ]
+
+    if len(set(metric_names)) != len(
+        metric_names
+    ):
+        raise ValueError(
+            "Per-run metric names must be unique."
+        )
+
+    per_run_results = []
+
+    for run_index, (
+        seed,
+        metric_values,
+    ) in enumerate(
+        zip(
+            seeds,
+            normalized_results,
+        ),
+        start=1,
+    ):
+        if len(metric_values) != len(
+            metric_names
+        ):
+            raise ValueError(
+                "Every multi-run result must contain "
+                "the same number of values as the "
+                "metric-name list."
+            )
+
+        per_run_results.append(
+            {
+                "run_index": run_index,
+                "seed": int(seed),
+                "metrics": {
+                    metric_name: (
+                        _to_json_compatible(
+                            metric_value
+                        )
+                    )
+                    for (
+                        metric_name,
+                        metric_value,
+                    ) in zip(
+                        metric_names,
+                        metric_values,
+                    )
+                },
+            }
+        )
+
+    return per_run_results
+
+
 def _add_seed_metadata(
     hyperparams,
     base_seed,
@@ -2987,6 +3147,15 @@ def run_closed_set_identification(x, y, model_class, epochs=150, batch_size=256,
             base_seed=base_seed,
             n_runs=n_runs,
         )
+
+        per_run_results = (
+            _build_per_run_results(
+                results=results,
+                seeds=hyperparams[
+                    "run_seeds"
+                ],
+            )
+        )
                 
         # Aggregate metrics across all runs
         r1_vals = [r[0] for r in results]
@@ -3002,7 +3171,14 @@ def run_closed_set_identification(x, y, model_class, epochs=150, batch_size=256,
                 "Rank-1 Accuracy": f"{r1_mean:.4f} ± {r1_std:.4f}", 
                 "Rank-5 Accuracy": f"{r5_mean:.4f} ± {r5_std:.4f}"
             }
-            _log_experiment_results("Closed-Set Identification", metrics_dict, data_stats, hyperparams, loader)
+            _log_experiment_results(
+                "Closed-Set Identification",
+                metrics_dict,
+                data_stats,
+                hyperparams,
+                loader,
+                per_run_results=per_run_results,
+            )
         
         # Return the aggregated statistics
         return (r1_mean, r1_std), (r5_mean, r5_std)
@@ -3459,6 +3635,15 @@ def run_closed_set_verification(x, y, model_class, epochs=150, batch_size=256, l
             base_seed=base_seed,
             n_runs=n_runs,
         )
+
+        per_run_results = (
+            _build_per_run_results(
+                results=results,
+                seeds=hyperparams[
+                    "run_seeds"
+                ],
+            )
+        )
                 
         metrics_t = list(zip(*results))
         means, stds = [np.mean(m) for m in metrics_t], [np.std(m) for m in metrics_t]
@@ -3468,7 +3653,14 @@ def run_closed_set_verification(x, y, model_class, epochs=150, batch_size=256, l
                 "EER": f"{means[0]:.4f} ± {stds[0]:.4f}", "AUC": f"{means[1]:.4f} ± {stds[1]:.4f}", 
                 "d-prime": f"{means[2]:.4f} ± {stds[2]:.4f}", "TAR@0.1%FAR": f"{means[3]:.4f} ± {stds[3]:.4f}"
             }
-            _log_experiment_results("Closed-Set Verification", metrics_dict, data_stats, hyperparams, loader)
+            _log_experiment_results(
+                "Closed-Set Verification",
+                metrics_dict,
+                data_stats,
+                hyperparams,
+                loader,
+                per_run_results=per_run_results,
+            )
         return tuple(zip(means, stds))
     # ----------------------------
 
@@ -3936,13 +4128,29 @@ def run_subject_disjoint_identification(x, y, model_class, epochs=150, batch_siz
             base_seed=base_seed,
             n_runs=n_runs,
         )
+
+        per_run_results = (
+            _build_per_run_results(
+                results=results,
+                seeds=hyperparams[
+                    "run_seeds"
+                ],
+            )
+        )
                 
         r1_mean, r1_std = np.mean([r[0] for r in results]), np.std([r[0] for r in results])
         r5_mean, r5_std = np.mean([r[1] for r in results]), np.std([r[1] for r in results])
         
         if save_results_and_settings:
             metrics_dict = {"Rank-1 Accuracy": f"{r1_mean:.4f} ± {r1_std:.4f}", "Rank-5 Accuracy": f"{r5_mean:.4f} ± {r5_std:.4f}"}
-            _log_experiment_results("Subject-Disjoint Identification", metrics_dict, data_stats, hyperparams, loader)
+            _log_experiment_results(
+                "Subject-Disjoint Identification",
+                metrics_dict,
+                data_stats,
+                hyperparams,
+                loader,
+                per_run_results=per_run_results,
+            )
         return (r1_mean, r1_std), (r5_mean, r5_std)
     # ----------------------------
 
@@ -4420,6 +4628,15 @@ def run_subject_disjoint_verification(x, y, model_class, epochs=150, batch_size=
             base_seed=base_seed,
             n_runs=n_runs,
         )
+
+        per_run_results = (
+            _build_per_run_results(
+                results=results,
+                seeds=hyperparams[
+                    "run_seeds"
+                ],
+            )
+        )
                 
         metrics_t = list(zip(*results))
         means, stds = [np.mean(m) for m in metrics_t], [np.std(m) for m in metrics_t]
@@ -4429,7 +4646,14 @@ def run_subject_disjoint_verification(x, y, model_class, epochs=150, batch_size=
                 "EER": f"{means[0]:.4f} ± {stds[0]:.4f}", "AUC": f"{means[1]:.4f} ± {stds[1]:.4f}", 
                 "d-prime": f"{means[2]:.4f} ± {stds[2]:.4f}", "TAR@0.1%FAR": f"{means[3]:.4f} ± {stds[3]:.4f}"
             }
-            _log_experiment_results("Subject-Disjoint Verification", metrics_dict, data_stats, hyperparams, loader)
+            _log_experiment_results(
+                "Subject-Disjoint Verification",
+                metrics_dict,
+                data_stats,
+                hyperparams,
+                loader,
+                per_run_results=per_run_results,
+            )
         return tuple(zip(means, stds))
     # ----------------------------
 
@@ -4934,13 +5158,29 @@ def run_cross_session_identification(x_train, y_train, x_test, y_test, model_cla
             base_seed=base_seed,
             n_runs=n_runs,
         )
+
+        per_run_results = (
+            _build_per_run_results(
+                results=results,
+                seeds=hyperparams[
+                    "run_seeds"
+                ],
+            )
+        )
                 
         r1_mean, r1_std = np.mean([r[0] for r in results]), np.std([r[0] for r in results])
         r5_mean, r5_std = np.mean([r[1] for r in results]), np.std([r[1] for r in results])
         
         if save_results_and_settings:
             metrics_dict = {"Rank-1 Accuracy": f"{r1_mean:.4f} ± {r1_std:.4f}", "Rank-5 Accuracy": f"{r5_mean:.4f} ± {r5_std:.4f}"}
-            _log_experiment_results("Cross-Session Identification", metrics_dict, data_stats, hyperparams, loader)
+            _log_experiment_results(
+                "Cross-Session Identification",
+                metrics_dict,
+                data_stats,
+                hyperparams,
+                loader,
+                per_run_results=per_run_results,
+            )
         return (r1_mean, r1_std), (r5_mean, r5_std)
     # ----------------------------
 
@@ -5337,6 +5577,15 @@ def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class
             base_seed=base_seed,
             n_runs=n_runs,
         )
+
+        per_run_results = (
+            _build_per_run_results(
+                results=results,
+                seeds=hyperparams[
+                    "run_seeds"
+                ],
+            )
+        )
                 
         metrics_t = list(zip(*results))
         means, stds = [np.mean(m) for m in metrics_t], [np.std(m) for m in metrics_t]
@@ -5346,7 +5595,14 @@ def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class
                 "EER": f"{means[0]:.4f} ± {stds[0]:.4f}", "AUC": f"{means[1]:.4f} ± {stds[1]:.4f}", 
                 "d-prime": f"{means[2]:.4f} ± {stds[2]:.4f}", "TAR@0.1%FAR": f"{means[3]:.4f} ± {stds[3]:.4f}"
             }
-            _log_experiment_results("Cross-Session Verification", metrics_dict, data_stats, hyperparams, loader)
+            _log_experiment_results(
+                "Cross-Session Verification",
+                metrics_dict,
+                data_stats,
+                hyperparams,
+                loader,
+                per_run_results=per_run_results,
+            )
         return tuple(zip(means, stds))
     # ----------------------------
 
@@ -5784,13 +6040,29 @@ def run_subject_disjoint_cross_session_identification(
             base_seed=base_seed,
             n_runs=n_runs,
         )
+
+        per_run_results = (
+            _build_per_run_results(
+                results=results,
+                seeds=hyperparams[
+                    "run_seeds"
+                ],
+            )
+        )
                 
         r1_mean, r1_std = np.mean([r[0] for r in results]), np.std([r[0] for r in results])
         r5_mean, r5_std = np.mean([r[1] for r in results]), np.std([r[1] for r in results])
         
         if save_results_and_settings:
             metrics_dict = {"Rank-1 Accuracy": f"{r1_mean:.4f} ± {r1_std:.4f}", "Rank-5 Accuracy": f"{r5_mean:.4f} ± {r5_std:.4f}"}
-            _log_experiment_results("Subject-Disjoint Cross-Session ID", metrics_dict, data_stats, hyperparams, loader)
+            _log_experiment_results(
+                "Subject-Disjoint Cross-Session ID",
+                metrics_dict,
+                data_stats,
+                hyperparams,
+                loader,
+                per_run_results=per_run_results,
+            )
         return (r1_mean, r1_std), (r5_mean, r5_std)
     # ----------------------------
 
@@ -6210,6 +6482,15 @@ def run_subject_disjoint_cross_session_verification(
             base_seed=base_seed,
             n_runs=n_runs,
         )
+
+        per_run_results = (
+            _build_per_run_results(
+                results=results,
+                seeds=hyperparams[
+                    "run_seeds"
+                ],
+            )
+        )
                 
         metrics_t = list(zip(*results))
         means, stds = [np.mean(m) for m in metrics_t], [np.std(m) for m in metrics_t]
@@ -6219,7 +6500,17 @@ def run_subject_disjoint_cross_session_verification(
                 "EER": f"{means[0]:.4f} ± {stds[0]:.4f}", "AUC": f"{means[1]:.4f} ± {stds[1]:.4f}", 
                 "d-prime": f"{means[2]:.4f} ± {stds[2]:.4f}", "TAR@0.1%FAR": f"{means[3]:.4f} ± {stds[3]:.4f}"
             }
-            _log_experiment_results("Subject-Disjoint Cross-Session Verification", metrics_dict, data_stats, hyperparams, loader)
+            _log_experiment_results(
+                (
+                    "Subject-Disjoint "
+                    "Cross-Session Verification"
+                ),
+                metrics_dict,
+                data_stats,
+                hyperparams,
+                loader,
+                per_run_results=per_run_results,
+            )
         return tuple(zip(means, stds))
     # ----------------------------
 
