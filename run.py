@@ -1,3 +1,4 @@
+from contextvars import ContextVar
 # run.py
 # -----------------------------------------------------------------------------
 # UNIFIED TRAINING & EVALUATION UTILITY FOR ECG BIOMETRICS
@@ -49,6 +50,8 @@ from utils import (
     _apply_outlier_filter, _compute_sqi, _compute_score_matrix,
     _get_embeddings, _create_templates, _generate_pairs,
     _find_optimal_threshold, _evaluate_with_global_threshold, _summarize_verification_pairs,
+    _build_identification_curve_artifacts,
+    _build_verification_curve_artifacts,
     _compute_metrics_identification, _compute_metrics_verification,
     _run_training_loop, _run_train_loop_unseen_subjects, _train_epoch, _detect_channels,
     DEFAULT_CACHE_DIR, DEFAULT_RESULTS_DIR, resolve_artifact_path,
@@ -831,6 +834,8 @@ def _build_structured_experiment_record(
     source_revision,
     runtime_profile,
     per_run_results=None,
+    evaluation_artifacts=None,
+    per_run_evaluation_artifacts=None,
 ):
     """
     Build one self-contained machine-readable experiment record.
@@ -885,6 +890,23 @@ def _build_structured_experiment_record(
                 )
             )
         ),
+        "evaluation_artifacts": {
+            "single_run": (
+                _to_json_compatible(
+                    evaluation_artifacts
+                )
+            ),
+            "per_run": (
+                _to_json_compatible(
+                    (
+                        []
+                        if per_run_evaluation_artifacts
+                        is None
+                        else per_run_evaluation_artifacts
+                    )
+                )
+            ),
+        },
         "results": {
             str(key): (
                 _to_structured_result_value(
@@ -940,6 +962,8 @@ def _log_experiment_results(
     hyperparams,
     loader=None,
     per_run_results=None,
+    evaluation_artifacts=None,
+    per_run_evaluation_artifacts=None,
 ):
     """
     Dynamically writes experiment configurations and results to a text file.
@@ -1076,6 +1100,12 @@ def _log_experiment_results(
             source_revision=source_revision,
             runtime_profile=runtime_profile,
             per_run_results=per_run_results,
+            evaluation_artifacts=(
+                evaluation_artifacts
+            ),
+            per_run_evaluation_artifacts=(
+                per_run_evaluation_artifacts
+            ),
         )
     )
 
@@ -3005,6 +3035,102 @@ def _build_per_run_results(
     return per_run_results
 
 
+def _build_per_run_evaluation_artifacts(
+    artifacts,
+    seeds,
+):
+    """
+    Build seed-labelled curve and operating-point artifacts.
+
+    Curves are preserved independently for each run. They are not averaged,
+    interpolated across seeds, or treated as aggregate curves.
+    """
+    artifacts = list(
+        artifacts
+    )
+    seeds = list(
+        seeds
+    )
+
+    if len(artifacts) != len(
+        seeds
+    ):
+        raise ValueError(
+            "The number of evaluation artifacts "
+            "must match the number of run seeds."
+        )
+
+    per_run_artifacts = []
+
+    for run_index, (
+        seed,
+        artifact,
+    ) in enumerate(
+        zip(
+            seeds,
+            artifacts,
+        ),
+        start=1,
+    ):
+        if not isinstance(
+            artifact,
+            Mapping,
+        ):
+            raise ValueError(
+                "Every per-run evaluation artifact "
+                "must be a mapping."
+            )
+
+        if not artifact:
+            raise ValueError(
+                "Per-run evaluation artifacts "
+                "cannot be empty."
+            )
+
+        per_run_artifacts.append(
+            {
+                "run_index": int(
+                    run_index
+                ),
+                "seed": int(
+                    seed
+                ),
+                "artifact": (
+                    _to_json_compatible(
+                        artifact
+                    )
+                ),
+            }
+        )
+
+    return per_run_artifacts
+
+
+_EVALUATION_ARTIFACT_SINK = ContextVar(
+    "_EVALUATION_ARTIFACT_SINK",
+    default=None,
+)
+
+
+def _record_evaluation_artifact(
+    artifact,
+):
+    """
+    Record one task artifact in the active multi-run context.
+
+    Direct single-run calls have no active sink and therefore retain their
+    established public return contract without storing additional state.
+    """
+    sink = (
+        _EVALUATION_ARTIFACT_SINK.get()
+    )
+
+    if sink is not None:
+        sink.append(
+            artifact
+        )
+
+
 def _add_seed_metadata(
     hyperparams,
     base_seed,
@@ -3120,6 +3246,7 @@ def run_closed_set_identification(x, y, model_class, epochs=150, batch_size=256,
         call_args = _prepare_multi_run_arguments(locals())
         base_seed = call_args.get('seed', 42)
         results = []
+        evaluation_artifact_runs = []
         
         print(f"\n[INFO] Starting Multi-Seed Execution ({n_runs} runs) for Statistical Validation...")
         for i in range(n_runs):
@@ -3130,7 +3257,19 @@ def run_closed_set_identification(x, y, model_class, epochs=150, batch_size=256,
             
             # Recursive call to execute a single seed
             run_wall_clock_started = _start_runtime_stage()
-            res, d_stats, h_params = run_closed_set_identification(**call_args) 
+            artifact_sink_token = (
+                _EVALUATION_ARTIFACT_SINK.set(
+                    evaluation_artifact_runs
+                )
+            )
+            try:
+                res, d_stats, h_params = run_closed_set_identification(
+                    **call_args
+                )
+            finally:
+                _EVALUATION_ARTIFACT_SINK.reset(
+                    artifact_sink_token
+                )
             _record_multi_run_time(
                 run_index=i + 1,
                 seed=call_args["seed"],
@@ -3151,6 +3290,15 @@ def run_closed_set_identification(x, y, model_class, epochs=150, batch_size=256,
         per_run_results = (
             _build_per_run_results(
                 results=results,
+                seeds=hyperparams[
+                    "run_seeds"
+                ],
+            )
+        )
+
+        per_run_evaluation_artifacts = (
+            _build_per_run_evaluation_artifacts(
+                artifacts=evaluation_artifact_runs,
                 seeds=hyperparams[
                     "run_seeds"
                 ],
@@ -3178,6 +3326,7 @@ def run_closed_set_identification(x, y, model_class, epochs=150, batch_size=256,
                 hyperparams,
                 loader,
                 per_run_results=per_run_results,
+                per_run_evaluation_artifacts=per_run_evaluation_artifacts,
             )
         
         # Return the aggregated statistics
@@ -3495,6 +3644,17 @@ def run_closed_set_identification(x, y, model_class, epochs=150, batch_size=256,
 
     rank1, rank5 = _compute_metrics_identification(final_scores, final_labels)
 
+    evaluation_artifacts = (
+        _build_identification_curve_artifacts(
+            final_scores,
+            final_labels,
+        )
+    )
+
+    _record_evaluation_artifact(
+        evaluation_artifacts
+    )
+
     # Update hyperparams dictionary dynamically
     hyperparams['epochs'] = f"{epochs} (stopped at {model.actual_epochs})" if model.actual_epochs < epochs else epochs
 
@@ -3518,6 +3678,7 @@ def run_closed_set_identification(x, y, model_class, epochs=150, batch_size=256,
             data_stats,
             hyperparams,
             loader,
+            evaluation_artifacts=evaluation_artifacts,
         )
 
     return rank1, rank5
@@ -3613,6 +3774,7 @@ def run_closed_set_verification(x, y, model_class, epochs=150, batch_size=256, l
         call_args = _prepare_multi_run_arguments(locals())
         base_seed = call_args.get('seed', 42)
         results = []
+        evaluation_artifact_runs = []
         
         print(f"\n[INFO] Starting Multi-Seed Execution ({n_runs} runs)...")
         for i in range(n_runs):
@@ -3620,7 +3782,19 @@ def run_closed_set_verification(x, y, model_class, epochs=150, batch_size=256, l
             call_args['visualize'] = False 
             print(f"\n{'='*40}\n RUN {i+1}/{n_runs} (Seed: {call_args['seed']})\n{'='*40}")
             run_wall_clock_started = _start_runtime_stage()
-            res, d_stats, h_params = run_closed_set_verification(**call_args) 
+            artifact_sink_token = (
+                _EVALUATION_ARTIFACT_SINK.set(
+                    evaluation_artifact_runs
+                )
+            )
+            try:
+                res, d_stats, h_params = run_closed_set_verification(
+                    **call_args
+                )
+            finally:
+                _EVALUATION_ARTIFACT_SINK.reset(
+                    artifact_sink_token
+                )
             _record_multi_run_time(
                 run_index=i + 1,
                 seed=call_args["seed"],
@@ -3644,6 +3818,15 @@ def run_closed_set_verification(x, y, model_class, epochs=150, batch_size=256, l
                 ],
             )
         )
+
+        per_run_evaluation_artifacts = (
+            _build_per_run_evaluation_artifacts(
+                artifacts=evaluation_artifact_runs,
+                seeds=hyperparams[
+                    "run_seeds"
+                ],
+            )
+        )
                 
         metrics_t = list(zip(*results))
         means, stds = [np.mean(m) for m in metrics_t], [np.std(m) for m in metrics_t]
@@ -3660,6 +3843,7 @@ def run_closed_set_verification(x, y, model_class, epochs=150, batch_size=256, l
                 hyperparams,
                 loader,
                 per_run_results=per_run_results,
+                per_run_evaluation_artifacts=per_run_evaluation_artifacts,
             )
         return tuple(zip(means, stds))
     # ----------------------------
@@ -3971,6 +4155,17 @@ def run_closed_set_verification(x, y, model_class, epochs=150, batch_size=256, l
 
     eer, auc_val, dprime, tar = _compute_metrics_verification(scores, labels_pair)
 
+    evaluation_artifacts = (
+        _build_verification_curve_artifacts(
+            scores,
+            labels_pair,
+        )
+    )
+
+    _record_evaluation_artifact(
+        evaluation_artifacts
+    )
+
     # Update hyperparams dictionary dynamically
     hyperparams['epochs'] = f"{epochs} (stopped at {model.actual_epochs})" if model.actual_epochs < epochs else epochs
 
@@ -4015,6 +4210,7 @@ def run_closed_set_verification(x, y, model_class, epochs=150, batch_size=256, l
             data_stats,
             hyperparams,
             loader,
+            evaluation_artifacts=evaluation_artifacts,
         )
 
     return eer, auc_val, dprime, tar
@@ -4108,6 +4304,7 @@ def run_subject_disjoint_identification(x, y, model_class, epochs=150, batch_siz
         call_args = _prepare_multi_run_arguments(locals())
         base_seed = call_args.get('seed', 42)
         results = []
+        evaluation_artifact_runs = []
         
         print(f"\n[INFO] Starting Multi-Seed Execution ({n_runs} runs)...")
         for i in range(n_runs):
@@ -4115,7 +4312,19 @@ def run_subject_disjoint_identification(x, y, model_class, epochs=150, batch_siz
             call_args['visualize'] = False 
             print(f"\n{'='*40}\n RUN {i+1}/{n_runs} (Seed: {call_args['seed']})\n{'='*40}")
             run_wall_clock_started = _start_runtime_stage()
-            res, d_stats, h_params = run_subject_disjoint_identification(**call_args) 
+            artifact_sink_token = (
+                _EVALUATION_ARTIFACT_SINK.set(
+                    evaluation_artifact_runs
+                )
+            )
+            try:
+                res, d_stats, h_params = run_subject_disjoint_identification(
+                    **call_args
+                )
+            finally:
+                _EVALUATION_ARTIFACT_SINK.reset(
+                    artifact_sink_token
+                )
             _record_multi_run_time(
                 run_index=i + 1,
                 seed=call_args["seed"],
@@ -4137,6 +4346,15 @@ def run_subject_disjoint_identification(x, y, model_class, epochs=150, batch_siz
                 ],
             )
         )
+
+        per_run_evaluation_artifacts = (
+            _build_per_run_evaluation_artifacts(
+                artifacts=evaluation_artifact_runs,
+                seeds=hyperparams[
+                    "run_seeds"
+                ],
+            )
+        )
                 
         r1_mean, r1_std = np.mean([r[0] for r in results]), np.std([r[0] for r in results])
         r5_mean, r5_std = np.mean([r[1] for r in results]), np.std([r[1] for r in results])
@@ -4150,6 +4368,7 @@ def run_subject_disjoint_identification(x, y, model_class, epochs=150, batch_siz
                 hyperparams,
                 loader,
                 per_run_results=per_run_results,
+                per_run_evaluation_artifacts=per_run_evaluation_artifacts,
             )
         return (r1_mean, r1_std), (r5_mean, r5_std)
     # ----------------------------
@@ -4485,6 +4704,17 @@ def run_subject_disjoint_identification(x, y, model_class, epochs=150, batch_siz
 
     rank1, rank5 = _compute_metrics_identification(final_scores, final_labels)
 
+    evaluation_artifacts = (
+        _build_identification_curve_artifacts(
+            final_scores,
+            final_labels,
+        )
+    )
+
+    _record_evaluation_artifact(
+        evaluation_artifacts
+    )
+
     data_stats = {
         "Train Subjects": len(train_subs),
         "Train Samples": len(X_train),
@@ -4516,6 +4746,7 @@ def run_subject_disjoint_identification(x, y, model_class, epochs=150, batch_siz
             data_stats,
             hyperparams,
             loader,
+            evaluation_artifacts=evaluation_artifacts,
         )
 
     # 11. Report Identification Metrics
@@ -4608,6 +4839,7 @@ def run_subject_disjoint_verification(x, y, model_class, epochs=150, batch_size=
         call_args = _prepare_multi_run_arguments(locals())
         base_seed = call_args.get('seed', 42)
         results = []
+        evaluation_artifact_runs = []
         
         print(f"\n[INFO] Starting Multi-Seed Execution ({n_runs} runs)...")
         for i in range(n_runs):
@@ -4615,7 +4847,19 @@ def run_subject_disjoint_verification(x, y, model_class, epochs=150, batch_size=
             call_args['visualize'] = False 
             print(f"\n{'='*40}\n RUN {i+1}/{n_runs} (Seed: {call_args['seed']})\n{'='*40}")
             run_wall_clock_started = _start_runtime_stage()
-            res, d_stats, h_params = run_subject_disjoint_verification(**call_args) 
+            artifact_sink_token = (
+                _EVALUATION_ARTIFACT_SINK.set(
+                    evaluation_artifact_runs
+                )
+            )
+            try:
+                res, d_stats, h_params = run_subject_disjoint_verification(
+                    **call_args
+                )
+            finally:
+                _EVALUATION_ARTIFACT_SINK.reset(
+                    artifact_sink_token
+                )
             _record_multi_run_time(
                 run_index=i + 1,
                 seed=call_args["seed"],
@@ -4637,6 +4881,15 @@ def run_subject_disjoint_verification(x, y, model_class, epochs=150, batch_size=
                 ],
             )
         )
+
+        per_run_evaluation_artifacts = (
+            _build_per_run_evaluation_artifacts(
+                artifacts=evaluation_artifact_runs,
+                seeds=hyperparams[
+                    "run_seeds"
+                ],
+            )
+        )
                 
         metrics_t = list(zip(*results))
         means, stds = [np.mean(m) for m in metrics_t], [np.std(m) for m in metrics_t]
@@ -4653,6 +4906,7 @@ def run_subject_disjoint_verification(x, y, model_class, epochs=150, batch_size=
                 hyperparams,
                 loader,
                 per_run_results=per_run_results,
+                per_run_evaluation_artifacts=per_run_evaluation_artifacts,
             )
         return tuple(zip(means, stds))
     # ----------------------------
@@ -5009,6 +5263,17 @@ def run_subject_disjoint_verification(x, y, model_class, epochs=150, batch_size=
 
     eer, auc_val, dprime, tar = _compute_metrics_verification(scores, labels_pair)
 
+    evaluation_artifacts = (
+        _build_verification_curve_artifacts(
+            scores,
+            labels_pair,
+        )
+    )
+
+    _record_evaluation_artifact(
+        evaluation_artifacts
+    )
+
     # Update hyperparams dictionary dynamically using the local 'ep' variable
     # hyperparams['epochs'] = f"{epochs} (stopped at {ep + 1})" if (ep + 1) < epochs else epochs
     
@@ -5056,6 +5321,7 @@ def run_subject_disjoint_verification(x, y, model_class, epochs=150, batch_size=
             data_stats,
             hyperparams,
             loader,
+            evaluation_artifacts=evaluation_artifacts,
         )
 
     return eer, auc_val, dprime, tar
@@ -5138,6 +5404,7 @@ def run_cross_session_identification(x_train, y_train, x_test, y_test, model_cla
         call_args = _prepare_multi_run_arguments(locals())
         base_seed = call_args.get('seed', 42)
         results = []
+        evaluation_artifact_runs = []
         
         print(f"\n[INFO] Starting Multi-Seed Execution ({n_runs} runs)...")
         for i in range(n_runs):
@@ -5145,7 +5412,19 @@ def run_cross_session_identification(x_train, y_train, x_test, y_test, model_cla
             call_args['visualize'] = False 
             print(f"\n{'='*40}\n RUN {i+1}/{n_runs} (Seed: {call_args['seed']})\n{'='*40}")
             run_wall_clock_started = _start_runtime_stage()
-            res, d_stats, h_params = run_cross_session_identification(**call_args) 
+            artifact_sink_token = (
+                _EVALUATION_ARTIFACT_SINK.set(
+                    evaluation_artifact_runs
+                )
+            )
+            try:
+                res, d_stats, h_params = run_cross_session_identification(
+                    **call_args
+                )
+            finally:
+                _EVALUATION_ARTIFACT_SINK.reset(
+                    artifact_sink_token
+                )
             _record_multi_run_time(
                 run_index=i + 1,
                 seed=call_args["seed"],
@@ -5167,6 +5446,15 @@ def run_cross_session_identification(x_train, y_train, x_test, y_test, model_cla
                 ],
             )
         )
+
+        per_run_evaluation_artifacts = (
+            _build_per_run_evaluation_artifacts(
+                artifacts=evaluation_artifact_runs,
+                seeds=hyperparams[
+                    "run_seeds"
+                ],
+            )
+        )
                 
         r1_mean, r1_std = np.mean([r[0] for r in results]), np.std([r[0] for r in results])
         r5_mean, r5_std = np.mean([r[1] for r in results]), np.std([r[1] for r in results])
@@ -5180,6 +5468,7 @@ def run_cross_session_identification(x_train, y_train, x_test, y_test, model_cla
                 hyperparams,
                 loader,
                 per_run_results=per_run_results,
+                per_run_evaluation_artifacts=per_run_evaluation_artifacts,
             )
         return (r1_mean, r1_std), (r5_mean, r5_std)
     # ----------------------------
@@ -5443,6 +5732,17 @@ def run_cross_session_identification(x_train, y_train, x_test, y_test, model_cla
 
     rank1, rank5 = _compute_metrics_identification(final_scores, final_labels)
 
+    evaluation_artifacts = (
+        _build_identification_curve_artifacts(
+            final_scores,
+            final_labels,
+        )
+    )
+
+    _record_evaluation_artifact(
+        evaluation_artifacts
+    )
+
     # Update hyperparams dictionary dynamically
     hyperparams['epochs'] = f"{epochs} (stopped at {model.actual_epochs})" if model.actual_epochs < epochs else epochs
 
@@ -5465,6 +5765,7 @@ def run_cross_session_identification(x_train, y_train, x_test, y_test, model_cla
             data_stats,
             hyperparams,
             loader,
+            evaluation_artifacts=evaluation_artifacts,
         )
 
     # 8. Report Identification Metrics
@@ -5557,6 +5858,7 @@ def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class
         call_args = _prepare_multi_run_arguments(locals())
         base_seed = call_args.get('seed', 42)
         results = []
+        evaluation_artifact_runs = []
         
         print(f"\n[INFO] Starting Multi-Seed Execution ({n_runs} runs)...")
         for i in range(n_runs):
@@ -5564,7 +5866,19 @@ def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class
             call_args['visualize'] = False 
             print(f"\n{'='*40}\n RUN {i+1}/{n_runs} (Seed: {call_args['seed']})\n{'='*40}")
             run_wall_clock_started = _start_runtime_stage()
-            res, d_stats, h_params = run_cross_session_verification(**call_args) 
+            artifact_sink_token = (
+                _EVALUATION_ARTIFACT_SINK.set(
+                    evaluation_artifact_runs
+                )
+            )
+            try:
+                res, d_stats, h_params = run_cross_session_verification(
+                    **call_args
+                )
+            finally:
+                _EVALUATION_ARTIFACT_SINK.reset(
+                    artifact_sink_token
+                )
             _record_multi_run_time(
                 run_index=i + 1,
                 seed=call_args["seed"],
@@ -5586,6 +5900,15 @@ def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class
                 ],
             )
         )
+
+        per_run_evaluation_artifacts = (
+            _build_per_run_evaluation_artifacts(
+                artifacts=evaluation_artifact_runs,
+                seeds=hyperparams[
+                    "run_seeds"
+                ],
+            )
+        )
                 
         metrics_t = list(zip(*results))
         means, stds = [np.mean(m) for m in metrics_t], [np.std(m) for m in metrics_t]
@@ -5602,6 +5925,7 @@ def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class
                 hyperparams,
                 loader,
                 per_run_results=per_run_results,
+                per_run_evaluation_artifacts=per_run_evaluation_artifacts,
             )
         return tuple(zip(means, stds))
     # ----------------------------
@@ -5893,6 +6217,17 @@ def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class
 
     eer, auc_val, dprime, tar = _compute_metrics_verification(scores, labels_pair)
 
+    evaluation_artifacts = (
+        _build_verification_curve_artifacts(
+            scores,
+            labels_pair,
+        )
+    )
+
+    _record_evaluation_artifact(
+        evaluation_artifacts
+    )
+
     # Update hyperparams dictionary dynamically
     hyperparams['epochs'] = f"{epochs} (stopped at {model.actual_epochs})" if model.actual_epochs < epochs else epochs
 
@@ -5939,6 +6274,7 @@ def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class
             data_stats,
             hyperparams,
             loader,
+            evaluation_artifacts=evaluation_artifacts,
         )
 
     # 9. Report Verification Metrics
@@ -6020,6 +6356,7 @@ def run_subject_disjoint_cross_session_identification(
         call_args = _prepare_multi_run_arguments(locals())
         base_seed = call_args.get('seed', 42)
         results = []
+        evaluation_artifact_runs = []
         
         print(f"\n[INFO] Starting Multi-Seed Execution ({n_runs} runs)...")
         for i in range(n_runs):
@@ -6027,7 +6364,19 @@ def run_subject_disjoint_cross_session_identification(
             call_args['visualize'] = False 
             print(f"\n{'='*40}\n RUN {i+1}/{n_runs} (Seed: {call_args['seed']})\n{'='*40}")
             run_wall_clock_started = _start_runtime_stage()
-            res, d_stats, h_params = run_subject_disjoint_cross_session_identification(**call_args) 
+            artifact_sink_token = (
+                _EVALUATION_ARTIFACT_SINK.set(
+                    evaluation_artifact_runs
+                )
+            )
+            try:
+                res, d_stats, h_params = run_subject_disjoint_cross_session_identification(
+                    **call_args
+                )
+            finally:
+                _EVALUATION_ARTIFACT_SINK.reset(
+                    artifact_sink_token
+                )
             _record_multi_run_time(
                 run_index=i + 1,
                 seed=call_args["seed"],
@@ -6049,6 +6398,15 @@ def run_subject_disjoint_cross_session_identification(
                 ],
             )
         )
+
+        per_run_evaluation_artifacts = (
+            _build_per_run_evaluation_artifacts(
+                artifacts=evaluation_artifact_runs,
+                seeds=hyperparams[
+                    "run_seeds"
+                ],
+            )
+        )
                 
         r1_mean, r1_std = np.mean([r[0] for r in results]), np.std([r[0] for r in results])
         r5_mean, r5_std = np.mean([r[1] for r in results]), np.std([r[1] for r in results])
@@ -6062,6 +6420,7 @@ def run_subject_disjoint_cross_session_identification(
                 hyperparams,
                 loader,
                 per_run_results=per_run_results,
+                per_run_evaluation_artifacts=per_run_evaluation_artifacts,
             )
         return (r1_mean, r1_std), (r5_mean, r5_std)
     # ----------------------------
@@ -6346,6 +6705,17 @@ def run_subject_disjoint_cross_session_identification(
 
     rank1, rank5 = _compute_metrics_identification(final_scores, final_labels)
 
+    evaluation_artifacts = (
+        _build_identification_curve_artifacts(
+            final_scores,
+            final_labels,
+        )
+    )
+
+    _record_evaluation_artifact(
+        evaluation_artifacts
+    )
+
     # Update hyperparams dictionary dynamically using the model's tracked epochs
     actual_ep = getattr(model, 'actual_epochs', epochs)
     hyperparams['epochs'] = f"{epochs} (stopped at {actual_ep})" if actual_ep < epochs else epochs
@@ -6371,6 +6741,7 @@ def run_subject_disjoint_cross_session_identification(
             data_stats,
             hyperparams,
             loader,
+            evaluation_artifacts=evaluation_artifacts,
         )
 
     return rank1, rank5
@@ -6462,6 +6833,7 @@ def run_subject_disjoint_cross_session_verification(
         call_args = _prepare_multi_run_arguments(locals())
         base_seed = call_args.get('seed', 42)
         results = []
+        evaluation_artifact_runs = []
         
         print(f"\n[INFO] Starting Multi-Seed Execution ({n_runs} runs)...")
         for i in range(n_runs):
@@ -6469,7 +6841,19 @@ def run_subject_disjoint_cross_session_verification(
             call_args['visualize'] = False 
             print(f"\n{'='*40}\n RUN {i+1}/{n_runs} (Seed: {call_args['seed']})\n{'='*40}")
             run_wall_clock_started = _start_runtime_stage()
-            res, d_stats, h_params = run_subject_disjoint_cross_session_verification(**call_args) 
+            artifact_sink_token = (
+                _EVALUATION_ARTIFACT_SINK.set(
+                    evaluation_artifact_runs
+                )
+            )
+            try:
+                res, d_stats, h_params = run_subject_disjoint_cross_session_verification(
+                    **call_args
+                )
+            finally:
+                _EVALUATION_ARTIFACT_SINK.reset(
+                    artifact_sink_token
+                )
             _record_multi_run_time(
                 run_index=i + 1,
                 seed=call_args["seed"],
@@ -6486,6 +6870,15 @@ def run_subject_disjoint_cross_session_verification(
         per_run_results = (
             _build_per_run_results(
                 results=results,
+                seeds=hyperparams[
+                    "run_seeds"
+                ],
+            )
+        )
+
+        per_run_evaluation_artifacts = (
+            _build_per_run_evaluation_artifacts(
+                artifacts=evaluation_artifact_runs,
                 seeds=hyperparams[
                     "run_seeds"
                 ],
@@ -6510,6 +6903,7 @@ def run_subject_disjoint_cross_session_verification(
                 hyperparams,
                 loader,
                 per_run_results=per_run_results,
+                per_run_evaluation_artifacts=per_run_evaluation_artifacts,
             )
         return tuple(zip(means, stds))
     # ----------------------------
@@ -6809,6 +7203,17 @@ def run_subject_disjoint_cross_session_verification(
 
     eer, auc_val, dprime, tar = _compute_metrics_verification(scores, labels_pair)
 
+    evaluation_artifacts = (
+        _build_verification_curve_artifacts(
+            scores,
+            labels_pair,
+        )
+    )
+
+    _record_evaluation_artifact(
+        evaluation_artifacts
+    )
+
     # Update hyperparams dictionary dynamically using the model's tracked epochs
     actual_ep = getattr(model, 'actual_epochs', epochs)
     hyperparams['epochs'] = f"{epochs} (stopped at {actual_ep})" if actual_ep < epochs else epochs
@@ -6860,6 +7265,7 @@ def run_subject_disjoint_cross_session_verification(
             data_stats,
             hyperparams,
             loader,
+            evaluation_artifacts=evaluation_artifacts,
         )
 
     return eer, auc_val, dprime, tar
