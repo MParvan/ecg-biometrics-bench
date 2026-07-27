@@ -952,6 +952,608 @@ def _append_structured_experiment_record(
         )
 
 
+
+def _write_csv_rows(
+    output_path,
+    rows,
+):
+    """Write dictionaries to CSV while preserving first-seen field order."""
+    rows = list(rows)
+
+    if not rows:
+        return None
+
+    import csv
+
+    fieldnames = []
+
+    for row in rows:
+        for fieldname in row:
+            if fieldname not in fieldnames:
+                fieldnames.append(fieldname)
+
+    with open(
+        output_path,
+        "w",
+        encoding="utf-8",
+        newline="",
+    ) as output_file:
+        writer = csv.DictWriter(
+            output_file,
+            fieldnames=fieldnames,
+        )
+        writer.writeheader()
+        writer.writerows(rows)
+
+    return Path(output_path)
+
+
+def _save_compact_evaluation_outputs(
+    results_dir,
+    safe_task_name,
+    experiment_time,
+    per_run_results=None,
+    evaluation_artifacts=None,
+    per_run_evaluation_artifacts=None,
+):
+    """
+    Save reviewer-relevant curve outputs without embedding large arrays in JSONL.
+
+    Scalar metrics, comparison counts, operating points, and compact CMC data
+    remain in the structured record. Full ROC/DET arrays and probe-level rank
+    arrays are stored in one compressed NumPy file. Plots and CSV summaries are
+    generated automatically whenever result logging is enabled.
+    """
+    if per_run_evaluation_artifacts:
+        artifact_items = copy.deepcopy(
+            list(per_run_evaluation_artifacts)
+        )
+        is_multi_run = True
+    elif evaluation_artifacts:
+        artifact_items = [
+            {
+                "run_index": 1,
+                "seed": None,
+                "artifact": copy.deepcopy(
+                    evaluation_artifacts
+                ),
+            }
+        ]
+        is_multi_run = False
+    else:
+        return (
+            evaluation_artifacts,
+            (
+                []
+                if per_run_evaluation_artifacts is None
+                else per_run_evaluation_artifacts
+            ),
+        )
+
+    experiment_id = experiment_time.strftime(
+        "%Y%m%dT%H%M%S_%f"
+    )
+
+    output_directory = (
+        Path(results_dir)
+        / "evaluation_outputs"
+        / safe_task_name
+        / experiment_id
+    )
+
+    curve_arrays = {}
+    compact_items = []
+    operating_point_rows = []
+    cmc_rows = []
+    artifact_type = None
+
+    for item in artifact_items:
+        run_index = int(
+            item.get(
+                "run_index",
+                1,
+            )
+        )
+        seed = item.get("seed")
+        artifact = copy.deepcopy(
+            item["artifact"]
+        )
+
+        current_type = artifact.get("type")
+
+        if current_type not in {
+            "verification",
+            "identification",
+        }:
+            compact_items.append(
+                {
+                    "run_index": run_index,
+                    "seed": seed,
+                    "artifact": artifact,
+                }
+            )
+            continue
+
+        if artifact_type is None:
+            artifact_type = current_type
+        elif artifact_type != current_type:
+            raise ValueError(
+                "One experiment cannot contain mixed "
+                "evaluation artifact types."
+            )
+
+        prefix = (
+            f"seed_{int(seed)}"
+            if seed is not None
+            else f"run_{run_index}"
+        )
+
+        if current_type == "verification":
+            roc_curve_data = artifact.pop(
+                "roc_curve",
+                None,
+            )
+            det_curve_data = artifact.pop(
+                "det_curve",
+                None,
+            )
+
+            if roc_curve_data:
+                curve_arrays[
+                    f"{prefix}_roc_false_accept_rates"
+                ] = np.asarray(
+                    roc_curve_data[
+                        "false_accept_rates"
+                    ],
+                    dtype=float,
+                )
+                curve_arrays[
+                    f"{prefix}_roc_true_accept_rates"
+                ] = np.asarray(
+                    roc_curve_data[
+                        "true_accept_rates"
+                    ],
+                    dtype=float,
+                )
+
+            if det_curve_data:
+                curve_arrays[
+                    f"{prefix}_det_false_accept_rates"
+                ] = np.asarray(
+                    det_curve_data[
+                        "false_accept_rates"
+                    ],
+                    dtype=float,
+                )
+                curve_arrays[
+                    f"{prefix}_det_false_reject_rates"
+                ] = np.asarray(
+                    det_curve_data[
+                        "false_reject_rates"
+                    ],
+                    dtype=float,
+                )
+
+            for operating_point in artifact.get(
+                "operating_points",
+                [],
+            ):
+                operating_point_rows.append(
+                    {
+                        "run_index": run_index,
+                        "seed": seed,
+                        **operating_point,
+                    }
+                )
+
+        else:
+            correct_match_ranks = artifact.pop(
+                "correct_match_ranks",
+                None,
+            )
+            cmc_curve_data = artifact.get(
+                "cmc_curve"
+            )
+
+            if correct_match_ranks is not None:
+                curve_arrays[
+                    f"{prefix}_correct_match_ranks"
+                ] = np.asarray(
+                    correct_match_ranks,
+                    dtype=int,
+                )
+
+            if cmc_curve_data:
+                curve_arrays[
+                    f"{prefix}_cmc_ranks"
+                ] = np.asarray(
+                    cmc_curve_data["ranks"],
+                    dtype=int,
+                )
+                curve_arrays[
+                    f"{prefix}_cmc_identification_rates"
+                ] = np.asarray(
+                    cmc_curve_data[
+                        "identification_rates"
+                    ],
+                    dtype=float,
+                )
+
+                for rank, rate in zip(
+                    cmc_curve_data["ranks"],
+                    cmc_curve_data[
+                        "identification_rates"
+                    ],
+                ):
+                    cmc_rows.append(
+                        {
+                            "run_index": run_index,
+                            "seed": seed,
+                            "rank": int(rank),
+                            "identification_rate": float(
+                                rate
+                            ),
+                        }
+                    )
+
+        compact_items.append(
+            {
+                "run_index": run_index,
+                "seed": seed,
+                "artifact": artifact,
+                "curve_prefix": prefix,
+            }
+        )
+
+    if not curve_arrays:
+        if is_multi_run:
+            return (
+                None,
+                [
+                    {
+                        "run_index": item[
+                            "run_index"
+                        ],
+                        "seed": item["seed"],
+                        "artifact": item[
+                            "artifact"
+                        ],
+                    }
+                    for item in compact_items
+                ],
+            )
+
+        return (
+            compact_items[0]["artifact"],
+            [],
+        )
+
+    output_directory.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    curve_file = output_directory / "curves.npz"
+
+    np.savez_compressed(
+        curve_file,
+        **curve_arrays,
+    )
+
+    relative_curve_file = curve_file.relative_to(
+        results_dir
+    ).as_posix()
+
+    per_seed_metric_rows = []
+
+    for result in per_run_results or []:
+        per_seed_metric_rows.append(
+            {
+                "run_index": result.get(
+                    "run_index"
+                ),
+                "seed": result.get("seed"),
+                **result.get(
+                    "metrics",
+                    {},
+                ),
+            }
+        )
+
+    _write_csv_rows(
+        output_directory
+        / "per_seed_metrics.csv",
+        per_seed_metric_rows,
+    )
+
+    _write_csv_rows(
+        output_directory
+        / "verification_operating_points.csv",
+        operating_point_rows,
+    )
+
+    _write_csv_rows(
+        output_directory
+        / "identification_cmc.csv",
+        cmc_rows,
+    )
+
+    plot_paths = {}
+
+    try:
+        import matplotlib.pyplot as plt
+        from sklearn.metrics import DetCurveDisplay
+
+        if artifact_type == "verification":
+            roc_figure, roc_axis = plt.subplots(
+                figsize=(7, 6)
+            )
+            det_figure, det_axis = plt.subplots(
+                figsize=(7, 6)
+            )
+            tar_figure, tar_axis = plt.subplots(
+                figsize=(7, 6)
+            )
+
+            for item in artifact_items:
+                artifact = item["artifact"]
+                seed = item.get("seed")
+                run_index = item.get(
+                    "run_index",
+                    1,
+                )
+                label = (
+                    f"Seed {seed}"
+                    if seed is not None
+                    else f"Run {run_index}"
+                )
+
+                roc_curve_data = artifact.get(
+                    "roc_curve"
+                )
+                det_curve_data = artifact.get(
+                    "det_curve"
+                )
+
+                if roc_curve_data:
+                    roc_axis.plot(
+                        roc_curve_data[
+                            "false_accept_rates"
+                        ],
+                        roc_curve_data[
+                            "true_accept_rates"
+                        ],
+                        label=(
+                            f"{label} "
+                            f"(AUC={artifact['roc_auc']:.3f})"
+                        ),
+                    )
+
+                if det_curve_data:
+                    DetCurveDisplay(
+                        fpr=np.asarray(
+                            det_curve_data[
+                                "false_accept_rates"
+                            ],
+                            dtype=float,
+                        ),
+                        fnr=np.asarray(
+                            det_curve_data[
+                                "false_reject_rates"
+                            ],
+                            dtype=float,
+                        ),
+                        estimator_name=label,
+                    ).plot(
+                        ax=det_axis
+                    )
+
+                ordered_points = sorted(
+                    artifact.get(
+                        "operating_points",
+                        [],
+                    ),
+                    key=lambda point: point[
+                        "target_far"
+                    ],
+                )
+
+                if ordered_points:
+                    tar_axis.semilogx(
+                        [
+                            point["target_far"]
+                            for point in ordered_points
+                        ],
+                        [
+                            point["tar"]
+                            for point in ordered_points
+                        ],
+                        marker="o",
+                        label=label,
+                    )
+
+            roc_axis.plot(
+                [0.0, 1.0],
+                [0.0, 1.0],
+                linestyle="--",
+                label="Random",
+            )
+            roc_axis.set_xlabel(
+                "False Accept Rate"
+            )
+            roc_axis.set_ylabel(
+                "True Accept Rate"
+            )
+            roc_axis.set_title(
+                "Verification ROC Curves"
+            )
+            roc_axis.legend()
+            roc_figure.tight_layout()
+
+            roc_path = output_directory / "roc.png"
+            roc_figure.savefig(
+                roc_path,
+                dpi=300,
+                bbox_inches="tight",
+            )
+            plt.close(roc_figure)
+            plot_paths["roc"] = roc_path
+
+            det_axis.set_title(
+                "Verification DET Curves"
+            )
+            det_figure.tight_layout()
+
+            det_path = output_directory / "det.png"
+            det_figure.savefig(
+                det_path,
+                dpi=300,
+                bbox_inches="tight",
+            )
+            plt.close(det_figure)
+            plot_paths["det"] = det_path
+
+            tar_axis.set_xlabel(
+                "Target FAR"
+            )
+            tar_axis.set_ylabel(
+                "True Accept Rate"
+            )
+            tar_axis.set_title(
+                "TAR at Requested FARs"
+            )
+            tar_axis.set_ylim(
+                0.0,
+                1.0,
+            )
+            tar_axis.grid(
+                True,
+                which="both",
+            )
+            tar_axis.legend()
+            tar_figure.tight_layout()
+
+            tar_path = (
+                output_directory
+                / "tar_at_far.png"
+            )
+            tar_figure.savefig(
+                tar_path,
+                dpi=300,
+                bbox_inches="tight",
+            )
+            plt.close(tar_figure)
+            plot_paths["tar_at_far"] = tar_path
+
+        elif artifact_type == "identification":
+            cmc_figure, cmc_axis = plt.subplots(
+                figsize=(7, 6)
+            )
+
+            for item in artifact_items:
+                artifact = item["artifact"]
+                seed = item.get("seed")
+                run_index = item.get(
+                    "run_index",
+                    1,
+                )
+                label = (
+                    f"Seed {seed}"
+                    if seed is not None
+                    else f"Run {run_index}"
+                )
+                cmc_curve_data = artifact.get(
+                    "cmc_curve"
+                )
+
+                if cmc_curve_data:
+                    cmc_axis.plot(
+                        cmc_curve_data["ranks"],
+                        cmc_curve_data[
+                            "identification_rates"
+                        ],
+                        label=label,
+                    )
+
+            cmc_axis.set_xlabel("Rank")
+            cmc_axis.set_ylabel(
+                "Identification Rate"
+            )
+            cmc_axis.set_title(
+                "Cumulative Match Characteristic"
+            )
+            cmc_axis.set_ylim(
+                0.0,
+                1.0,
+            )
+            cmc_axis.grid(True)
+            cmc_axis.legend()
+            cmc_figure.tight_layout()
+
+            cmc_path = output_directory / "cmc.png"
+            cmc_figure.savefig(
+                cmc_path,
+                dpi=300,
+                bbox_inches="tight",
+            )
+            plt.close(cmc_figure)
+            plot_paths["cmc"] = cmc_path
+
+    except (
+        ImportError,
+        OSError,
+        RuntimeError,
+        ValueError,
+    ) as error:
+        print(
+            "[WARN] Evaluation curves were saved, "
+            "but plot generation failed: "
+            f"{error}"
+        )
+
+    relative_plot_paths = {
+        plot_name: plot_path.relative_to(
+            results_dir
+        ).as_posix()
+        for plot_name, plot_path in (
+            plot_paths.items()
+        )
+    }
+
+    for item in compact_items:
+        item["artifact"][
+            "curve_storage"
+        ] = {
+            "file": relative_curve_file,
+            "prefix": item.pop(
+                "curve_prefix"
+            ),
+        }
+
+        if relative_plot_paths:
+            item["artifact"][
+                "plots"
+            ] = dict(
+                relative_plot_paths
+            )
+
+    print(
+        "[INFO] Evaluation curves and summaries "
+        f"saved to: {output_directory}"
+    )
+
+    if is_multi_run:
+        return (
+            None,
+            compact_items,
+        )
+
+    return (
+        compact_items[0]["artifact"],
+        [],
+    )
+
+
 # =============================================================================
 # AUTOMATED EXPERIMENT LOGGER
 # =============================================================================
@@ -1025,6 +1627,20 @@ def _log_experiment_results(
     software_environment = _collect_software_environment()
     source_revision = _collect_source_revision()
     runtime_profile = _collect_runtime_profile()
+
+    (
+        compact_evaluation_artifacts,
+        compact_per_run_evaluation_artifacts,
+    ) = _save_compact_evaluation_outputs(
+        results_dir=results_dir,
+        safe_task_name=safe_task_name,
+        experiment_time=experiment_time,
+        per_run_results=per_run_results,
+        evaluation_artifacts=evaluation_artifacts,
+        per_run_evaluation_artifacts=(
+            per_run_evaluation_artifacts
+        ),
+    )
     
     # 6. Format and Append
     with open(log_file, "a", encoding="utf-8") as f:
@@ -1101,10 +1717,10 @@ def _log_experiment_results(
             runtime_profile=runtime_profile,
             per_run_results=per_run_results,
             evaluation_artifacts=(
-                evaluation_artifacts
+                compact_evaluation_artifacts
             ),
             per_run_evaluation_artifacts=(
-                per_run_evaluation_artifacts
+                compact_per_run_evaluation_artifacts
             ),
         )
     )
