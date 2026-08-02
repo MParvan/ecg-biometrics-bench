@@ -44,6 +44,7 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import roc_curve, auc
 from scipy.optimize import brentq
 from scipy.interpolate import interp1d
+from scipy import stats
 
 from utils import (
     _apply_score_fusion, _make_loader, _encode_labels, _get_device, _set_seed,
@@ -57,6 +58,8 @@ from utils import (
     DEFAULT_CACHE_DIR, DEFAULT_RESULTS_DIR, resolve_artifact_path,
     _build_loader_cache_identity, _fingerprint_array_collection,
 )
+
+from load_dataset import summarize_partition_log
 
 import torch
 import torch.nn as nn
@@ -777,22 +780,31 @@ def _to_json_compatible(value):
     return value
 
 
+# Separators accepted when splitting an aggregate "mean +/- std" string.
+# The task runners emit U+00B1; the ASCII spellings are accepted so that
+# logs written by a terminal or editor that cannot represent U+00B1 remain
+# machine-readable.
+_AGGREGATE_METRIC_SEPARATORS = (
+    "±",
+    "+/-",
+    "+-",
+)
+
+
 def _to_structured_result_value(value):
     """
     Preserve numeric metrics and normalize mean-plus-std result strings.
 
-    Existing multi-run text reports store aggregate metrics as strings such
-    as ``0.9500 ? 0.0100``. The structured output exposes their numeric mean
-    and standard deviation while retaining the original display value.
+    Multi-run task runners report aggregate metrics as strings such as
+    ``0.9500 ± 0.0100``. The structured output exposes their numeric
+    mean and standard deviation while retaining the original display value,
+    so downstream analysis never has to re-parse formatted text.
     """
     if isinstance(
         value,
         str,
     ):
-        for separator in (
-            "?",
-            "?",
-        ):
+        for separator in _AGGREGATE_METRIC_SEPARATORS:
             if value.count(separator) != 1:
                 continue
 
@@ -887,6 +899,13 @@ def _build_structured_experiment_record(
                     []
                     if per_run_results is None
                     else per_run_results
+                )
+            )
+        ),
+        "across_seed_uncertainty": (
+            _to_json_compatible(
+                _summarize_per_run_uncertainty(
+                    per_run_results
                 )
             )
         ),
@@ -997,7 +1016,7 @@ def _save_compact_evaluation_outputs(
     per_run_evaluation_artifacts=None,
 ):
     """
-    Save reviewer-relevant curve outputs without embedding large arrays in JSONL.
+    Save curve outputs without embedding large arrays in the JSONL record.
 
     Scalar metrics, comparison counts, operating points, and compact CMC data
     remain in the structured record. Full ROC/DET arrays and probe-level rank
@@ -1589,13 +1608,26 @@ def _log_experiment_results(
         dataset_kwargs.update(user_prep) 
         
         # 3. Extract other useful loader attributes dynamically
-        # We ignore backend objects, large paths, and redundant dictionaries
-        ignore_keys = ['preprocessor', 'cfg', 'data_root', 'dataset_root', 
-                       'zip_path', 'url', 'prep_params', 'cleanup_zip']
-        
+        # We ignore backend objects, large paths, and redundant dictionaries.
+        # The raw per-subject partition log is replaced below by its compact
+        # summary so that large cohorts do not bloat every experiment record.
+        ignore_keys = ['preprocessor', 'cfg', 'data_root', 'dataset_root',
+                       'zip_path', 'url', 'prep_params', 'cleanup_zip',
+                       'partition_assignment_log']
+
         for k, v in vars(loader).items():
             if k not in ignore_keys and not k.startswith('_'):
                 dataset_kwargs[k] = v
+
+        # 3b. Record the enrollment/probe causality evidence for this run.
+        causality_summary = summarize_partition_log(
+            loader
+        )
+
+        if causality_summary is not None:
+            dataset_kwargs[
+                "temporal_causality_audit"
+            ] = causality_summary
 
     # 4. Resolve the configured external result directory.
     configured_results_dir = getattr(
@@ -1701,8 +1733,54 @@ def _log_experiment_results(
                 f.write(f"  {k:<28}: {v:.4f}\n")
             else:
                 f.write(f"  {k:<28}: {v}\n")
+
+        # Across-seed intervals are reported alongside, never instead of, the
+        # aggregate values above.
+        uncertainty_summary = (
+            _summarize_per_run_uncertainty(
+                per_run_results
+            )
+        )
+
+        if uncertainty_summary is not None:
+            confidence_percentage = (
+                uncertainty_summary["confidence_level"]
+                * 100.0
+            )
+
+            f.write(f"{'-'*70}\n")
+            f.write(
+                "[ACROSS-SEED UNCERTAINTY] "
+                f"{confidence_percentage:g}% confidence "
+                f"over {uncertainty_summary['runs']} run(s)\n"
+            )
+
+            for (
+                metric_name,
+                metric_summary,
+            ) in uncertainty_summary["metrics"].items():
+                t_interval = metric_summary["t_interval"]
+                bootstrap_interval = metric_summary[
+                    "bootstrap_interval"
+                ]
+
+                if t_interval is None:
+                    f.write(
+                        f"  {metric_name:<28}: "
+                        "single run, no interval\n"
+                    )
+                    continue
+
+                f.write(
+                    f"  {metric_name:<28}: "
+                    f"t [{t_interval['lower']:.4f}, "
+                    f"{t_interval['upper']:.4f}]  "
+                    f"bootstrap [{bootstrap_interval['lower']:.4f}, "
+                    f"{bootstrap_interval['upper']:.4f}]\n"
+                )
+
         f.write(f"{'='*70}\n")
-    
+
     structured_record = (
         _build_structured_experiment_record(
             experiment_time=experiment_time,
@@ -3651,6 +3729,213 @@ def _build_per_run_results(
     return per_run_results
 
 
+_DEFAULT_CONFIDENCE_LEVEL = 0.95
+
+# Bootstrap resampling is deterministic so a reported interval can be
+# regenerated exactly from the same per-seed values.
+_BOOTSTRAP_RESAMPLES = 10000
+_BOOTSTRAP_SEED = 12345
+
+
+def _summarize_metric_uncertainty(
+    values,
+    confidence_level=_DEFAULT_CONFIDENCE_LEVEL,
+):
+    """
+    Summarize the across-seed uncertainty of one metric.
+
+    Two intervals are reported because neither alone is sufficient with the
+    small number of seeds typical of this benchmark:
+
+    - A Student-t interval, which is the conventional choice but assumes the
+      per-seed values are approximately normal.
+    - A percentile bootstrap interval, which makes no distributional
+      assumption and is more honest when five seeds produce a skewed spread.
+
+    Both standard deviations are reported. The aggregate ``mean +/- std``
+    strings use the population form; the intervals use the sample form,
+    which is the correct estimator for the standard error of a mean.
+    """
+    values = np.asarray(
+        [
+            float(value)
+            for value in values
+        ],
+        dtype=float,
+    )
+
+    if values.size == 0:
+        return None
+
+    if not np.all(np.isfinite(values)):
+        return None
+
+    if not 0.0 < confidence_level < 1.0:
+        raise ValueError(
+            "confidence_level must satisfy 0 < level < 1."
+        )
+
+    run_count = int(values.size)
+    mean_value = float(np.mean(values))
+
+    summary = {
+        "runs": run_count,
+        "mean": mean_value,
+        "population_std": float(
+            np.std(values)
+        ),
+        "min": float(np.min(values)),
+        "max": float(np.max(values)),
+        "confidence_level": float(
+            confidence_level
+        ),
+    }
+
+    if run_count < 2:
+        # A single seed carries no information about run-to-run spread.
+        summary.update(
+            {
+                "sample_std": None,
+                "standard_error": None,
+                "t_interval": None,
+                "bootstrap_interval": None,
+            }
+        )
+
+        return summary
+
+    sample_std = float(
+        np.std(values, ddof=1)
+    )
+    standard_error = sample_std / np.sqrt(run_count)
+
+    summary["sample_std"] = sample_std
+    summary["standard_error"] = float(
+        standard_error
+    )
+
+    tail_probability = 1.0 - (
+        1.0 - confidence_level
+    ) / 2.0
+    critical_value = float(
+        stats.t.ppf(
+            tail_probability,
+            df=run_count - 1,
+        )
+    )
+
+    margin = critical_value * standard_error
+
+    summary["t_interval"] = {
+        "lower": float(mean_value - margin),
+        "upper": float(mean_value + margin),
+        "critical_value": critical_value,
+        "degrees_of_freedom": run_count - 1,
+        "margin_of_error": float(margin),
+    }
+
+    generator = np.random.default_rng(
+        _BOOTSTRAP_SEED
+    )
+    resampled_means = np.mean(
+        generator.choice(
+            values,
+            size=(
+                _BOOTSTRAP_RESAMPLES,
+                run_count,
+            ),
+            replace=True,
+        ),
+        axis=1,
+    )
+
+    lower_percentile = (
+        1.0 - confidence_level
+    ) / 2.0 * 100.0
+    upper_percentile = 100.0 - lower_percentile
+
+    summary["bootstrap_interval"] = {
+        "lower": float(
+            np.percentile(
+                resampled_means,
+                lower_percentile,
+            )
+        ),
+        "upper": float(
+            np.percentile(
+                resampled_means,
+                upper_percentile,
+            )
+        ),
+        "resamples": _BOOTSTRAP_RESAMPLES,
+        "seed": _BOOTSTRAP_SEED,
+        "method": "percentile",
+    }
+
+    return summary
+
+
+def _summarize_per_run_uncertainty(
+    per_run_results,
+    confidence_level=_DEFAULT_CONFIDENCE_LEVEL,
+):
+    """
+    Build across-seed confidence intervals for every recorded metric.
+
+    This is derived purely from the seed-level values already stored in
+    ``per_run_results``. It does not recompute, rescale, or replace the
+    aggregate metrics reported elsewhere in the record.
+    """
+    if not per_run_results:
+        return None
+
+    values_by_metric = {}
+
+    for run_record in per_run_results:
+        metrics = run_record.get("metrics", {})
+
+        for metric_name, metric_value in metrics.items():
+            values_by_metric.setdefault(
+                str(metric_name),
+                [],
+            ).append(metric_value)
+
+    if not values_by_metric:
+        return None
+
+    metric_summaries = {}
+
+    for metric_name, values in values_by_metric.items():
+        try:
+            summary = _summarize_metric_uncertainty(
+                values,
+                confidence_level=confidence_level,
+            )
+        except (TypeError, ValueError):
+            summary = None
+
+        if summary is not None:
+            metric_summaries[metric_name] = summary
+
+    if not metric_summaries:
+        return None
+
+    return {
+        "confidence_level": float(
+            confidence_level
+        ),
+        "runs": len(per_run_results),
+        "note": (
+            "Intervals describe the across-seed uncertainty of the mean. "
+            "The aggregate 'mean +/- std' values use the population "
+            "standard deviation; the intervals use the sample standard "
+            "deviation, which is the correct estimator for the standard "
+            "error of a mean."
+        ),
+        "metrics": metric_summaries,
+    }
+
+
 def _build_per_run_evaluation_artifacts(
     artifacts,
     seeds,
@@ -4309,7 +4594,8 @@ def run_closed_set_verification(x, y, model_class, epochs=150, batch_size=256, l
                                 template_size=None, matching_method='cosine',
                                 outlier_filtering_on_train=False, outlier_filtering_on_test=False, 
                                 sqi_scores=None, sqi_threshold=0.05, sqi_keep_pct=0.8, 
-                                use_deployment_evaluation=False, save_results_and_settings=False, 
+                                use_deployment_evaluation=False, target_fars=None,
+                                save_results_and_settings=False, 
                                 loader=None, n_runs=1, _return_stats=False,
                                 intelligent_weight_loading=True,
                                 augmentation_config=None):
@@ -4775,6 +5061,7 @@ def run_closed_set_verification(x, y, model_class, epochs=150, batch_size=256, l
         _build_verification_curve_artifacts(
             scores,
             labels_pair,
+            target_fars=target_fars,
         )
     )
 
@@ -5378,7 +5665,8 @@ def run_subject_disjoint_verification(x, y, model_class, epochs=150, batch_size=
                                       template_size=1, matching_method='cosine',
                                       outlier_filtering_on_train=False, outlier_filtering_on_test=False, 
                                       sqi_scores=None, sqi_threshold=0.05, sqi_keep_pct=0.8, 
-                                      use_deployment_evaluation=False, save_results_and_settings=False, 
+                                      use_deployment_evaluation=False, target_fars=None,
+                                      save_results_and_settings=False, 
                                       loader=None, n_runs=1, _return_stats=False,
                                       intelligent_weight_loading=True,
                                       augmentation_config=None):
@@ -5883,6 +6171,7 @@ def run_subject_disjoint_verification(x, y, model_class, epochs=150, batch_size=
         _build_verification_curve_artifacts(
             scores,
             labels_pair,
+            target_fars=target_fars,
         )
     )
 
@@ -6396,7 +6685,8 @@ def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class
                                    use_template=False, template_fusion_method='mean', template_size=None, 
                                    matching_method='cosine', outlier_filtering_on_train=False, 
                                    outlier_filtering_on_test=False, sqi_train=None, sqi_test=None, 
-                                   sqi_threshold=0.05, sqi_keep_pct=0.8, use_deployment_evaluation=False, 
+                                   sqi_threshold=0.05, sqi_keep_pct=0.8, use_deployment_evaluation=False,
+                                   target_fars=None,
                                    save_results_and_settings=False, loader=None, 
                                    n_runs=1, _return_stats=False,
                                    intelligent_weight_loading=True,
@@ -6837,6 +7127,7 @@ def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class
         _build_verification_curve_artifacts(
             scores,
             labels_pair,
+            target_fars=target_fars,
         )
     )
 
@@ -7371,7 +7662,8 @@ def run_subject_disjoint_cross_session_verification(
         num_pairs=10000, sampling_mode="all", seed=42, device=None, visualize=False, use_template=False, 
         template_fusion_method='mean', template_size=None, matching_method='cosine', outlier_filtering_on_train=False, 
         outlier_filtering_on_test=False, sqi_s1=None, sqi_s2=None, sqi_threshold=0.05, sqi_keep_pct=0.8,
-        use_deployment_evaluation=False, save_results_and_settings=False, loader=None, n_runs=1, _return_stats=False,
+        use_deployment_evaluation=False, target_fars=None,
+        save_results_and_settings=False, loader=None, n_runs=1, _return_stats=False,
         intelligent_weight_loading=True,
         augmentation_config=None):
     """
@@ -7823,6 +8115,7 @@ def run_subject_disjoint_cross_session_verification(
         _build_verification_curve_artifacts(
             scores,
             labels_pair,
+            target_fars=target_fars,
         )
     )
 
