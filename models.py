@@ -1093,3 +1093,403 @@ class TripletLoss(nn.Module):
 
 #         triplet_loss = F.relu(hardest_positive_dist - hardest_negative_dist + self.margin)
 #         return triplet_loss.mean()
+
+# =============================================================================
+# 7. Literature Baselines
+# =============================================================================
+# Re-implementations of published ECG biometric architectures, added so the
+# benchmark can compare methods rather than only architectural families.
+#
+# Each is written from the architecture described in its source publication.
+# These are re-implementations, not the authors' released code, and two
+# adaptations are applied uniformly so every model can be evaluated under the
+# identical protocol the framework enforces:
+#
+#   1. Global average pooling replaces any flatten-then-dense stage. Beat
+#      length varies from 76 samples (NSRDB at 128 Hz) to 600 (PTB at 1 kHz),
+#      and a fixed flatten would restrict each model to a single dataset.
+#   2. The classifier head is separable via include_top, so one trained
+#      network supplies both closed-set logits and verification embeddings.
+#
+# Reported numbers for these baselines therefore characterise the architecture
+# under this benchmark's protocol. They are not claims about the originally
+# published results, which used different preprocessing and different splits.
+
+
+class _DepthwiseSeparableConv1d(nn.Module):
+    """
+    Depthwise separable 1D convolution.
+
+    A per-channel spatial filter followed by a pointwise channel mix. Shared
+    by the MobileNet and separable-residual baselines.
+    """
+
+    def __init__(self, in_channels, out_channels, kernel_size=3, stride=1):
+        super(_DepthwiseSeparableConv1d, self).__init__()
+
+        self.depthwise = nn.Conv1d(
+            in_channels,
+            in_channels,
+            kernel_size=kernel_size,
+            stride=stride,
+            padding=kernel_size // 2,
+            groups=in_channels,
+            bias=False,
+        )
+        self.bn_depthwise = nn.BatchNorm1d(in_channels)
+
+        self.pointwise = nn.Conv1d(
+            in_channels,
+            out_channels,
+            kernel_size=1,
+            bias=False,
+        )
+        self.bn_pointwise = nn.BatchNorm1d(out_channels)
+
+    def forward(self, x):
+        x = F.relu(self.bn_depthwise(self.depthwise(x)))
+        x = F.relu(self.bn_pointwise(self.pointwise(x)))
+
+        return x
+
+
+class ECGXtractor(nn.Module):
+    """
+    Autoencoder-style convolutional feature extractor.
+
+    Ref: P. Melzi, R. Tolosana, R. Vera-Rodriguez, "ECG biometric
+    recognition: Review, system proposal, and benchmark evaluation",
+    IEEE Access 11 (2023) 15555-15566.
+
+    The published system pre-trains a convolutional autoencoder on unlabelled
+    heartbeats and reuses its encoder as the biometric feature extractor. This
+    implementation provides that encoder together with the classification head
+    used for supervised training. The decode() method exposes the
+    reconstruction branch so the autoencoder objective can be reproduced
+    separately; only the encoder participates in biometric matching, which
+    matches the role the published system assigns it.
+    """
+
+    def __init__(self, in_channels: int = 1, num_classes: int = 10,
+                 include_top: bool = True, embedding_dim: int = 128,
+                 include_decoder: bool = False):
+        super(ECGXtractor, self).__init__()
+
+        self.include_top = include_top
+        self.embedding_dim = embedding_dim
+        self.include_decoder = include_decoder
+
+        self.encoder = nn.Sequential(
+            nn.Conv1d(in_channels, 32, kernel_size=9, padding=4, bias=False),
+            nn.BatchNorm1d(32),
+            nn.ReLU(inplace=True),
+            nn.MaxPool1d(kernel_size=2),
+
+            nn.Conv1d(32, 64, kernel_size=7, padding=3, bias=False),
+            nn.BatchNorm1d(64),
+            nn.ReLU(inplace=True),
+            nn.MaxPool1d(kernel_size=2),
+
+            nn.Conv1d(64, 128, kernel_size=5, padding=2, bias=False),
+            nn.BatchNorm1d(128),
+            nn.ReLU(inplace=True),
+            nn.MaxPool1d(kernel_size=2),
+
+            nn.Conv1d(128, 128, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm1d(128),
+            nn.ReLU(inplace=True),
+        )
+
+        # Built only when asked for. Supervised training never propagates
+        # gradient through the decoder, so constructing it unconditionally
+        # would add optimizer state that is never updated and would inflate
+        # the parameter count reported in the computational profile.
+        self.decoder = None
+
+        if include_decoder:
+            self.decoder = nn.Sequential(
+                nn.ConvTranspose1d(128, 64, kernel_size=4, stride=2,
+                                   padding=1),
+                nn.ReLU(inplace=True),
+                nn.ConvTranspose1d(64, 32, kernel_size=4, stride=2,
+                                   padding=1),
+                nn.ReLU(inplace=True),
+                nn.ConvTranspose1d(32, in_channels, kernel_size=4, stride=2,
+                                   padding=1),
+            )
+
+        self.gap = nn.AdaptiveAvgPool1d(1)
+        self.embedding = nn.Linear(128, embedding_dim)
+
+        if self.include_top:
+            self.classifier = nn.Linear(embedding_dim, num_classes)
+
+    def encode(self, x):
+        """
+        Return the pooled encoder embedding used for biometric matching.
+        """
+        features = self.encoder(x)
+        pooled = self.gap(features).squeeze(-1)
+
+        return F.relu(self.embedding(pooled))
+
+    def decode(self, x):
+        """
+        Reconstruct the input, for optional autoencoder pre-training.
+
+        Requires the model to have been built with include_decoder=True.
+        """
+        if self.decoder is None:
+            raise RuntimeError(
+                "This ECGXtractor was built without a decoder. Construct it "
+                "with include_decoder=True to use the reconstruction branch."
+            )
+
+        return self.decoder(self.encoder(x))
+
+    def forward(self, x):
+        embedding = self.encode(x)
+
+        if self.include_top:
+            return self.classifier(embedding)
+
+        return embedding
+
+
+class MobileNetGRU(nn.Module):
+    """
+    Lightweight depthwise-separable CNN followed by a recurrent stage.
+
+    Ref: D. H. Rai, S. Kafley, "Lightweight MobileNetV1+GRU for ECG biometric
+    authentication: Federated and adversarial evaluation", arXiv preprint
+    arXiv:2509.20382 (2025).
+
+    The convolutional trunk follows the MobileNetV1 pattern of one standard
+    convolution followed by stacked depthwise separable blocks, and the GRU
+    models the sequential structure that survives pooling. Channel widths are
+    scaled by width_multiplier, as in MobileNetV1.
+    """
+
+    def __init__(self, in_channels: int = 1, num_classes: int = 10,
+                 include_top: bool = True, width_multiplier: float = 1.0,
+                 gru_hidden: int = 64):
+        super(MobileNetGRU, self).__init__()
+
+        self.include_top = include_top
+
+        def width(channels):
+            return max(8, int(channels * width_multiplier))
+
+        self.stem = nn.Sequential(
+            nn.Conv1d(in_channels, width(32), kernel_size=7, stride=2,
+                      padding=3, bias=False),
+            nn.BatchNorm1d(width(32)),
+            nn.ReLU(inplace=True),
+        )
+
+        self.blocks = nn.Sequential(
+            _DepthwiseSeparableConv1d(width(32), width(64)),
+            _DepthwiseSeparableConv1d(width(64), width(128), stride=2),
+            _DepthwiseSeparableConv1d(width(128), width(128)),
+            _DepthwiseSeparableConv1d(width(128), width(256), stride=2),
+        )
+
+        self.gru = nn.GRU(
+            input_size=width(256),
+            hidden_size=gru_hidden,
+            num_layers=1,
+            batch_first=True,
+            bidirectional=True,
+        )
+
+        self.embedding_dim = gru_hidden * 2
+
+        if self.include_top:
+            self.classifier = nn.Linear(self.embedding_dim, num_classes)
+
+    def forward(self, x):
+        x = self.blocks(self.stem(x))
+
+        # (B, C, T) -> (B, T, C) for the recurrent stage.
+        sequence = x.transpose(1, 2)
+        outputs, _ = self.gru(sequence)
+
+        # Mean over time keeps the embedding independent of beat length.
+        embedding = outputs.mean(dim=1)
+
+        if self.include_top:
+            return self.classifier(embedding)
+
+        return embedding
+
+
+class MultiScaleCNN(nn.Module):
+    """
+    Parallel multi-scale 1D CNN.
+
+    Ref: Y. Chu, H. Shen, K. Huang, "ECG authentication method based on
+    parallel multi-scale one-dimensional residual network with center and
+    margin loss", IEEE Access 7 (2019) 51598-51607.
+
+    Parallel branches with different receptive fields capture the sharp QRS
+    complex and the slower P and T waves simultaneously, rather than forcing a
+    single kernel size to serve both. Branch outputs are concatenated before
+    the shared trunk.
+    """
+
+    def __init__(self, in_channels: int = 1, num_classes: int = 10,
+                 include_top: bool = True, branch_channels: int = 32,
+                 kernel_sizes=(3, 7, 15)):
+        super(MultiScaleCNN, self).__init__()
+
+        self.include_top = include_top
+
+        self.branches = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.Conv1d(in_channels, branch_channels,
+                              kernel_size=kernel_size,
+                              padding=kernel_size // 2, bias=False),
+                    nn.BatchNorm1d(branch_channels),
+                    nn.ReLU(inplace=True),
+                    nn.Conv1d(branch_channels, branch_channels,
+                              kernel_size=kernel_size,
+                              padding=kernel_size // 2, bias=False),
+                    nn.BatchNorm1d(branch_channels),
+                    nn.ReLU(inplace=True),
+                )
+                for kernel_size in kernel_sizes
+            ]
+        )
+
+        fused_channels = branch_channels * len(kernel_sizes)
+
+        self.trunk = nn.Sequential(
+            nn.MaxPool1d(kernel_size=2),
+            nn.Conv1d(fused_channels, 128, kernel_size=5, padding=2,
+                      bias=False),
+            nn.BatchNorm1d(128),
+            nn.ReLU(inplace=True),
+            nn.MaxPool1d(kernel_size=2),
+            nn.Conv1d(128, 256, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm1d(256),
+            nn.ReLU(inplace=True),
+        )
+
+        self.gap = nn.AdaptiveAvgPool1d(1)
+        self.embedding = nn.Linear(256, 128)
+        self.embedding_dim = 128
+
+        if self.include_top:
+            self.classifier = nn.Linear(128, num_classes)
+
+    def forward(self, x):
+        fused = torch.cat(
+            [branch(x) for branch in self.branches],
+            dim=1,
+        )
+
+        features = self.trunk(fused)
+        pooled = self.gap(features).squeeze(-1)
+        embedding = F.relu(self.embedding(pooled))
+
+        if self.include_top:
+            return self.classifier(embedding)
+
+        return embedding
+
+
+class _SeparableResidualBlock(nn.Module):
+    """
+    Residual block built from depthwise separable convolutions.
+    """
+
+    def __init__(self, in_channels, out_channels, stride=1):
+        super(_SeparableResidualBlock, self).__init__()
+
+        self.conv1 = _DepthwiseSeparableConv1d(
+            in_channels,
+            out_channels,
+            kernel_size=3,
+            stride=stride,
+        )
+        self.conv2 = _DepthwiseSeparableConv1d(
+            out_channels,
+            out_channels,
+            kernel_size=3,
+        )
+
+        self.shortcut = None
+
+        if stride != 1 or in_channels != out_channels:
+            self.shortcut = nn.Sequential(
+                nn.Conv1d(in_channels, out_channels, kernel_size=1,
+                          stride=stride, bias=False),
+                nn.BatchNorm1d(out_channels),
+            )
+
+    def forward(self, x):
+        identity = x if self.shortcut is None else self.shortcut(x)
+        out = self.conv2(self.conv1(x))
+
+        return F.relu(out + identity)
+
+
+class SeparableResNet(nn.Module):
+    """
+    Residual depthwise-separable CNN for low-latency authentication.
+
+    Ref: N. Ihsanto, K. Ramli, D. Sudiana, T. S. Gunawan, "Fast and accurate
+    algorithm for ECG authentication using residual depthwise separable
+    convolutional neural networks", Applied Sciences 10 (9) (2020) 3304.
+
+    Depthwise separable convolutions cut the parameter count by roughly an
+    order of magnitude relative to a standard residual network of the same
+    depth, which is what makes the architecture attractive for on-device
+    authentication.
+    """
+
+    def __init__(self, in_channels: int = 1, num_classes: int = 10,
+                 include_top: bool = True, base_channels: int = 32):
+        super(SeparableResNet, self).__init__()
+
+        self.include_top = include_top
+
+        self.stem = nn.Sequential(
+            nn.Conv1d(in_channels, base_channels, kernel_size=7, stride=2,
+                      padding=3, bias=False),
+            nn.BatchNorm1d(base_channels),
+            nn.ReLU(inplace=True),
+        )
+
+        self.stage1 = _SeparableResidualBlock(
+            base_channels,
+            base_channels * 2,
+            stride=2,
+        )
+        self.stage2 = _SeparableResidualBlock(
+            base_channels * 2,
+            base_channels * 4,
+            stride=2,
+        )
+        self.stage3 = _SeparableResidualBlock(
+            base_channels * 4,
+            base_channels * 8,
+        )
+
+        self.gap = nn.AdaptiveAvgPool1d(1)
+        self.embedding_dim = base_channels * 8
+
+        if self.include_top:
+            self.classifier = nn.Linear(self.embedding_dim, num_classes)
+
+    def forward(self, x):
+        x = self.stem(x)
+        x = self.stage3(self.stage2(self.stage1(x)))
+
+        embedding = self.gap(x).squeeze(-1)
+
+        if self.include_top:
+            return self.classifier(embedding)
+
+        return embedding
