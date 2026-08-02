@@ -2,12 +2,20 @@
 __pycache__/
 *.py[cod]
 
+# Datasets. Downloaded automatically by the loaders on first use, and
+# distributed by their original hosts under their own licence terms.
+datasets/
+
 # Generated experiment artifacts
 precomputed/
 cache/
 results/
 validation_runs/
 ecg-biometrics-artifacts/
+reproduced_tables/
+model_comparison_tables/
+figures/
+ARTIFACTS.md
 
 # Model, cache, and array payloads
 *.pth
