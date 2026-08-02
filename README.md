@@ -218,6 +218,38 @@ cd ecg-biometrics-bench
 pip install -r requirements.txt
 ```
 
+Dependency versions are pinned to those used to produce the reported results,
+and were verified on Python 3.12.
+
+**CPU and GPU.** The same installation runs on either. The framework detects
+the available device at runtime and falls back to CPU, and `--device cpu`
+forces it. For GPU acceleration, install the CUDA build of PyTorch *before*
+the requirements file, because the default PyPI wheel is CPU-only on Windows:
+
+```bash
+pip install torch==2.8.0 torchvision==0.23.0 --index-url https://download.pytorch.org/whl/cu128
+pip install -r requirements.txt
+```
+
+Match the index URL to your CUDA version; see
+[pytorch.org](https://pytorch.org/get-started/locally/). On CPU the framework
+is fully functional but slow, so prefer a single dataset or a reduced epoch
+count when exploring:
+
+```bash
+python -m scripts.reproduce_tables --dataset ecgid --run --smoke
+```
+
+**Optional representations.** The two-dimensional time–frequency
+representations in `representation.py` (Mel-spectrogram, Gramian angular
+fields, S-transform, Wigner–Ville) need extra packages that the core pipeline
+never imports. They are kept separate because one of them builds a C
+extension, and a failed build would otherwise abort the whole installation:
+
+```bash
+pip install -r requirements-representations.txt
+```
+
 The framework includes main.py which can simply be used as CLI. Some examples are as follows:
 
 Experiment 1: Baseline Closed-Set Identification (Task 1)
