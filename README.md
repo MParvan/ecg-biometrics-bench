@@ -1,6 +1,10 @@
 # ECG-Biometrics-Bench  
 ### A Unified Framework for Realistic and Reproducible ECG Biometrics Evaluation
 
+[![tests](https://github.com/MParvan/ecg-biometrics-bench/actions/workflows/tests.yml/badge.svg)](https://github.com/MParvan/ecg-biometrics-bench/actions/workflows/tests.yml)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+
 ---
 
 ## 🚨 The Problem
@@ -549,6 +553,69 @@ Cohen's *d_z*. Use `--font-size` to scale all type at once.
 
 ---
 
+## 🧪 Tests
+
+The framework ships **544 tests across 64 modules**, covering the parts where a
+silent error would corrupt a result rather than raise: enrollment/probe
+separation, cache identity, metric arithmetic, and configuration validation.
+
+```bash
+pip install -r requirements-dev.txt
+python -m pytest tests -q
+```
+
+No test reads the ECG datasets. Loaders are either mocked or given a synthetic
+WFDB fixture, so the suite runs on a clean checkout in seconds without the
+multi-gigabyte download.
+
+Some tests exist specifically to stop a class of mistake recurring:
+
+| Test module | Guards against |
+|---|---|
+| `test_continuous_temporal_partitions.py` | Enrollment and probe windows overlapping in a continuous recording |
+| `test_temporal_causality_audit.py` | A template being built from data at or after the probe |
+| `test_cache_identity_stability.py` | A new option silently invalidating every cached array and weight file |
+| `test_across_seed_uncertainty.py` | Aggregate metrics being stored as unparseable text |
+| `test_literature_baselines.py` | A model that cannot accept every dataset's beat length |
+| `test_requirements.py` | An import that is not declared, or a dependency that is not pinned |
+| `test_tutorial_notebooks.py` | Tutorials drifting out of step with the API |
+
+## 🐳 Container
+
+A CPU image is defined in [Dockerfile](Dockerfile), for running the benchmark
+without installing anything locally.
+
+```bash
+docker build -t ecg-biometrics-bench .
+docker run --rm ecg-biometrics-bench -m pytest tests -q
+```
+
+Mount the dataset and artifact directories so downloads and results persist
+between runs:
+
+```bash
+docker run --rm \
+    -v "$(pwd)/datasets:/app/datasets" \
+    -v "$(pwd)/artifacts:/artifacts" \
+    ecg-biometrics-bench \
+    main.py --config configs/paper_reproduction/ecgid/ecgid_all_available_closed_set_task01_identification.yaml
+```
+
+The image installs the CPU build of PyTorch. For GPU execution, run on the
+host using the CUDA build described above, or derive an image from an
+`nvidia/cuda` base.
+
+## ⚙️ Continuous integration
+
+[`.github/workflows/tests.yml`](.github/workflows/tests.yml) runs on every push
+and pull request:
+
+- the test suite on Python 3.10 and 3.12
+- validation that all 234 shipped configurations still parse
+- a container build, with the suite executed inside the resulting image
+
+---
+
 ## Tutorials
 
 See [experiments/README.md](experiments/README.md) for the full index.
@@ -583,7 +650,17 @@ published ECG biometric methods. See
 
 ## Citation
 
-If you use ECG-Biometrics-Bench in your research, please cite our paper:
+If you use ECG-Biometrics-Bench in your research, please cite:
+
+```bibtex
+@article{parvan2026ecg,
+  title   = {ECG-biometrics-bench: A Unified Framework for Reproducible
+             Benchmarking of ECG Biometrics},
+  author  = {Parvan, Milad},
+  journal = {arXiv preprint arXiv:2605.01548},
+  year    = {2026}
+}
+```
 
 
 
