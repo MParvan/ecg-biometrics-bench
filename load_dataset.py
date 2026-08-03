@@ -380,6 +380,770 @@ def _preprocess_signal(preprocessor, signal, fs, preprocessing_config):
     )
 
 # =============================================================================
+# CONTINUOUS-RECORDING TEMPORAL PARTITIONS
+# =============================================================================
+# MIT-BIH and NSRDB are single continuous recordings per subject rather than
+# session-structured datasets. Their biometric partitions are therefore defined
+# as explicit minute windows into one timeline, which makes it possible for a
+# careless configuration to place the same physical samples in both the
+# enrollment and the probe partition. The helpers below make the realized
+# windows explicit and reject overlapping enrollment/probe definitions.
+
+_CONTINUOUS_PARTITION_ROLES = (
+    "train",
+    "enrol",
+    "test",
+)
+
+
+def _normalize_minute_ranges(ranges, role):
+    """
+    Validate one partition definition and return sorted (start, end) minutes.
+
+    ``None`` and empty definitions are returned as an empty list because not
+    every regime populates every partition.
+    """
+    if ranges is None:
+        return []
+
+    if isinstance(ranges, Mapping):
+        raise ValueError(
+            f"{role}_parts must be a sequence of "
+            "(start_minute, end_minute) pairs."
+        )
+
+    normalized = []
+
+    for entry in ranges:
+        if isinstance(entry, (str, bytes)) or not hasattr(entry, "__iter__"):
+            raise ValueError(
+                f"Every {role}_parts entry must be a "
+                "(start_minute, end_minute) pair."
+            )
+
+        bounds = list(entry)
+
+        if len(bounds) != 2:
+            raise ValueError(
+                f"Every {role}_parts entry must contain exactly two "
+                f"minute boundaries, received {bounds!r}."
+            )
+
+        try:
+            start_minute = float(bounds[0])
+            end_minute = float(bounds[1])
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                f"Every {role}_parts boundary must be numeric, "
+                f"received {bounds!r}."
+            ) from error
+
+        if not (np.isfinite(start_minute) and np.isfinite(end_minute)):
+            raise ValueError(
+                f"Every {role}_parts boundary must be finite, "
+                f"received {bounds!r}."
+            )
+
+        if start_minute < 0.0:
+            raise ValueError(
+                f"{role}_parts cannot start before minute 0, "
+                f"received {bounds!r}."
+            )
+
+        if start_minute >= end_minute:
+            raise ValueError(
+                f"Every {role}_parts entry must satisfy "
+                f"start_minute < end_minute, received {bounds!r}."
+            )
+
+        normalized.append((start_minute, end_minute))
+
+    normalized.sort()
+
+    return normalized
+
+
+def _merge_minute_ranges(ranges):
+    """
+    Collapse sorted minute ranges into their minimal disjoint coverage.
+    """
+    coverage = []
+
+    for start_minute, end_minute in sorted(ranges):
+        if coverage and start_minute <= coverage[-1][1]:
+            previous_start, previous_end = coverage[-1]
+            coverage[-1] = (
+                previous_start,
+                max(previous_end, end_minute),
+            )
+        else:
+            coverage.append((start_minute, end_minute))
+
+    return coverage
+
+
+def _minute_range_intersections(first_ranges, second_ranges):
+    """
+    Return every non-empty intersection between two minute coverages.
+    """
+    intersections = []
+
+    for first_start, first_end in first_ranges:
+        for second_start, second_end in second_ranges:
+            overlap_start = max(first_start, second_start)
+            overlap_end = min(first_end, second_end)
+
+            if overlap_start < overlap_end:
+                intersections.append(
+                    (overlap_start, overlap_end)
+                )
+
+    return _merge_minute_ranges(intersections)
+
+
+def _minute_range_separation(first_ranges, second_ranges):
+    """
+    Return the smallest temporal gap in minutes between two coverages.
+
+    Touching-but-disjoint coverages such as (0, 5) and (5, 10) return 0.0.
+    ``None`` is returned when either coverage is empty.
+    """
+    if not first_ranges or not second_ranges:
+        return None
+
+    separations = []
+
+    for first_start, first_end in first_ranges:
+        for second_start, second_end in second_ranges:
+            if first_end <= second_start:
+                separations.append(second_start - first_end)
+            elif second_end <= first_start:
+                separations.append(first_start - second_end)
+            else:
+                separations.append(0.0)
+
+    return min(separations)
+
+
+def _total_covered_minutes(ranges):
+    """
+    Return the total duration in minutes spanned by a merged coverage.
+    """
+    return float(
+        sum(
+            end_minute - start_minute
+            for start_minute, end_minute in ranges
+        )
+    )
+
+
+def audit_continuous_temporal_partitions(
+    train_parts=None,
+    enrol_parts=None,
+    test_parts=None,
+    temporal_guard_minutes=0.0,
+):
+    """
+    Audit the enrollment and probe windows of a continuous-recording split.
+
+    ``train_parts`` and ``enrol_parts`` together form the enrollment side of
+    the protocol. The framework uses the training partition as the gallery
+    partition, so the two are frequently identical by design and overlap
+    between them is reported but never treated as leakage. Overlap between
+    either of them and ``test_parts`` places identical physical samples on
+    both sides of the comparison and is rejected.
+
+    Args:
+        train_parts: Minute ranges used for representation learning.
+        enrol_parts: Minute ranges used for gallery/template construction.
+        test_parts: Minute ranges used for probes.
+        temporal_guard_minutes: Minimum required separation in minutes
+            between the enrollment coverage and the probe coverage. The
+            default of 0.0 permits directly adjacent windows and only
+            rejects true overlap.
+
+    Returns:
+        dict: The realized coverages, their durations, the achieved
+        separation, and the guard that was enforced.
+
+    Raises:
+        ValueError: If any partition is malformed, if enrollment and probe
+            windows overlap, or if the achieved separation is smaller than
+            ``temporal_guard_minutes``.
+    """
+    try:
+        temporal_guard_minutes = float(temporal_guard_minutes)
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            "temporal_guard_minutes must be numeric."
+        ) from error
+
+    if not np.isfinite(temporal_guard_minutes):
+        raise ValueError(
+            "temporal_guard_minutes must be finite."
+        )
+
+    if temporal_guard_minutes < 0.0:
+        raise ValueError(
+            "temporal_guard_minutes cannot be negative."
+        )
+
+    normalized_parts = {
+        "train": _normalize_minute_ranges(train_parts, "train"),
+        "enrol": _normalize_minute_ranges(enrol_parts, "enrol"),
+        "test": _normalize_minute_ranges(test_parts, "test"),
+    }
+
+    coverage = {
+        role: _merge_minute_ranges(normalized_parts[role])
+        for role in _CONTINUOUS_PARTITION_ROLES
+    }
+
+    enrollment_coverage = _merge_minute_ranges(
+        normalized_parts["train"] + normalized_parts["enrol"]
+    )
+    probe_coverage = coverage["test"]
+
+    # Reported separately so a response letter can cite either check.
+    leakage_checks = {
+        "train_vs_test": _minute_range_intersections(
+            coverage["train"],
+            probe_coverage,
+        ),
+        "enrol_vs_test": _minute_range_intersections(
+            coverage["enrol"],
+            probe_coverage,
+        ),
+    }
+
+    violations = []
+
+    for check_name, intersections in leakage_checks.items():
+        if intersections:
+            violations.append(
+                f"{check_name.replace('_', ' ')} overlap at "
+                + ", ".join(
+                    f"[{start:g}, {end:g}) minutes"
+                    for start, end in intersections
+                )
+            )
+
+    if violations:
+        raise ValueError(
+            "Continuous-recording partitions share samples between "
+            "enrollment and probe windows: "
+            + "; ".join(violations)
+            + ". Enrollment and probe minute ranges must be disjoint so "
+            "that reported performance is not inflated by evaluating on "
+            "signal already seen during training or enrollment."
+        )
+
+    achieved_separation = _minute_range_separation(
+        enrollment_coverage,
+        probe_coverage,
+    )
+
+    if (
+        temporal_guard_minutes > 0.0
+        and achieved_separation is not None
+        and achieved_separation < temporal_guard_minutes
+    ):
+        raise ValueError(
+            "Continuous-recording partitions are separated by only "
+            f"{achieved_separation:g} minutes, which is below the "
+            f"requested guard band of {temporal_guard_minutes:g} minutes. "
+            "Widen the gap between the enrollment and probe windows or "
+            "lower temporal_guard_minutes."
+        )
+
+    return {
+        "partitions": {
+            role: [list(window) for window in coverage[role]]
+            for role in _CONTINUOUS_PARTITION_ROLES
+        },
+        "enrollment_coverage": [
+            list(window) for window in enrollment_coverage
+        ],
+        "probe_coverage": [
+            list(window) for window in probe_coverage
+        ],
+        "covered_minutes": {
+            "enrollment": _total_covered_minutes(enrollment_coverage),
+            "probe": _total_covered_minutes(probe_coverage),
+        },
+        "train_enrol_shared_coverage": [
+            list(window)
+            for window in _minute_range_intersections(
+                coverage["train"],
+                coverage["enrol"],
+            )
+        ],
+        "achieved_separation_minutes": achieved_separation,
+        "temporal_guard_minutes": temporal_guard_minutes,
+        "overlap_free": True,
+    }
+
+
+# =============================================================================
+# RECORD-ORDER REGIME SELECTION
+# =============================================================================
+# ECG-ID, PTB, and PTB-XL contain a variable number of recordings per subject
+# without a uniform session structure, so their regimes are derived from the
+# deterministic record order. The selection rules are defined once here and
+# used by every loader, which means the temporal-causality audit reports the
+# same assignment the pipeline actually trains and evaluates on rather than a
+# re-implementation of it.
+
+RECORD_ORDER_SPLIT_MODES = (
+    "single-cross-session",
+    "single-shot-short-term",
+    "leave-last-out-short-term",
+    "single-shot-long-term",
+    "leave-last-out-long-term",
+)
+
+
+def select_record_order_partition(records, data_split_mode, is_enrollment):
+    """
+    Select the recordings assigned to one partition of a record-order regime.
+
+    Args:
+        records: Recordings for a single subject, already sorted by
+            (date, record order).
+        data_split_mode: One of ``RECORD_ORDER_SPLIT_MODES``.
+        is_enrollment: True for the training/enrollment partition, False for
+            the probe partition.
+
+    Returns:
+        tuple: ``(selected_records, subject_is_eligible)``. Subjects that lack
+        the structure a regime requires yield ``([], False)`` and are dropped
+        by the caller.
+    """
+    if data_split_mode not in RECORD_ORDER_SPLIT_MODES:
+        raise ValueError(
+            f"Unsupported record-order split mode: {data_split_mode!r}. "
+            f"Use one of {list(RECORD_ORDER_SPLIT_MODES)}."
+        )
+
+    if not records:
+        return [], False
+
+    unique_dates = sorted({record["date"] for record in records})
+    day1_date = unique_dates[0]
+    day1_records = [
+        record
+        for record in records
+        if record["date"] == day1_date
+    ]
+
+    if data_split_mode == "single-cross-session":
+        if len(records) < 2:
+            return [], False
+
+        return (
+            [records[0]] if is_enrollment else [records[1]],
+            True,
+        )
+
+    if data_split_mode == "single-shot-short-term":
+        if len(day1_records) < 2:
+            return [], False
+
+        return (
+            [day1_records[0]]
+            if is_enrollment
+            else day1_records[1:],
+            True,
+        )
+
+    if data_split_mode == "leave-last-out-short-term":
+        if len(day1_records) < 2:
+            return [], False
+
+        return (
+            day1_records[:-1]
+            if is_enrollment
+            else [day1_records[-1]],
+            True,
+        )
+
+    if data_split_mode == "single-shot-long-term":
+        if len(unique_dates) < 2:
+            return [], False
+
+        return (
+            day1_records
+            if is_enrollment
+            else [
+                record
+                for record in records
+                if record["date"] > day1_date
+            ],
+            True,
+        )
+
+    # leave-last-out-long-term
+    if len(unique_dates) < 2:
+        return [], False
+
+    last_date = unique_dates[-1]
+
+    return (
+        [
+            record
+            for record in records
+            if record["date"] < last_date
+        ]
+        if is_enrollment
+        else [
+            record
+            for record in records
+            if record["date"] == last_date
+        ],
+        True,
+    )
+
+
+def _record_sort_key(record, records):
+    """
+    Return the deterministic (date, position) ordering key of one recording.
+    """
+    return (
+        record["date"],
+        records.index(record),
+    )
+
+
+def _record_partition_assignment(loader, is_enrollment, subject_id, records):
+    """
+    Log which recordings a live run assigned to enrollment or to probes.
+
+    ``load_session`` is called once per partition, so the two sides of the
+    protocol accumulate into a single log that ``summarize_partition_log``
+    can check afterwards. The log holds only identifiers and dates, never
+    signal data.
+    """
+    partition_log = getattr(
+        loader,
+        "partition_assignment_log",
+        None,
+    )
+
+    if partition_log is None:
+        partition_log = {
+            "enrollment": {},
+            "probe": {},
+        }
+        loader.partition_assignment_log = partition_log
+
+    role = "enrollment" if is_enrollment else "probe"
+
+    partition_log[role][str(subject_id)] = [
+        {
+            "filename": str(
+                record.get("filename", "")
+            ),
+            "date": str(
+                record.get("date", "")
+            ),
+        }
+        for record in records
+    ]
+
+
+def summarize_partition_log(loader):
+    """
+    Summarize the enrollment/probe assignment recorded during a live run.
+
+    Returns ``None`` when no record-order partitions were built, which is the
+    case for single-session regimes and for runs served entirely from the
+    dataset cache.
+    """
+    partition_log = getattr(
+        loader,
+        "partition_assignment_log",
+        None,
+    )
+
+    if not partition_log:
+        return None
+
+    enrollment_by_subject = partition_log.get(
+        "enrollment",
+        {},
+    )
+    probe_by_subject = partition_log.get(
+        "probe",
+        {},
+    )
+
+    shared_subjects = sorted(
+        set(enrollment_by_subject)
+        & set(probe_by_subject)
+    )
+
+    violations = []
+
+    for subject_id in shared_subjects:
+        enrollment_entries = enrollment_by_subject[
+            subject_id
+        ]
+        probe_entries = probe_by_subject[subject_id]
+
+        enrollment_files = {
+            entry["filename"]
+            for entry in enrollment_entries
+        }
+        probe_files = {
+            entry["filename"]
+            for entry in probe_entries
+        }
+
+        shared_files = enrollment_files & probe_files
+
+        if shared_files:
+            violations.append(
+                {
+                    "subject": subject_id,
+                    "reasons": [
+                        "enrollment and probe partitions share "
+                        f"recording(s): {sorted(shared_files)}"
+                    ],
+                }
+            )
+            continue
+
+        enrollment_dates = [
+            entry["date"]
+            for entry in enrollment_entries
+        ]
+        probe_dates = [
+            entry["date"] for entry in probe_entries
+        ]
+
+        if not (enrollment_dates and probe_dates):
+            continue
+
+        if max(enrollment_dates) > min(probe_dates):
+            violations.append(
+                {
+                    "subject": subject_id,
+                    "reasons": [
+                        "an enrollment recording is dated after the "
+                        "first probe recording"
+                    ],
+                }
+            )
+
+    return {
+        "data_split_mode": getattr(
+            loader,
+            "data_split_mode",
+            None,
+        ),
+        "subjects_enrolled": len(enrollment_by_subject),
+        "subjects_probed": len(probe_by_subject),
+        "subjects_audited": len(shared_subjects),
+        "violations": violations,
+        "enrollment_precedes_probe": not violations,
+    }
+
+
+def audit_record_order_causality(records_by_subject, data_split_mode):
+    """
+    Verify that enrollment recordings strictly precede probe recordings.
+
+    The audit re-uses ``select_record_order_partition``, so it reflects the
+    assignment the pipeline performs rather than an independent restatement
+    of the protocol. A regime is causal when, for every eligible subject, the
+    latest enrollment recording occurs no later than the earliest probe
+    recording and the two partitions share no recording.
+
+    Args:
+        records_by_subject: Mapping of subject identifier to its recordings,
+            sorted by (date, record order). Only ``date`` and an identifying
+            key such as ``filename`` are required, so the audit can run on
+            header metadata without loading any signal.
+        data_split_mode: One of ``RECORD_ORDER_SPLIT_MODES``.
+
+    Returns:
+        dict: Per-subject assignment, aggregate counts, and any violations.
+    """
+    subject_reports = []
+    violations = []
+    eligible_subjects = 0
+
+    for subject_id in sorted(records_by_subject):
+        records = list(records_by_subject[subject_id])
+
+        (
+            enrollment_records,
+            enrollment_eligible,
+        ) = select_record_order_partition(
+            records,
+            data_split_mode,
+            is_enrollment=True,
+        )
+        (
+            probe_records,
+            probe_eligible,
+        ) = select_record_order_partition(
+            records,
+            data_split_mode,
+            is_enrollment=False,
+        )
+
+        if not (enrollment_eligible and probe_eligible):
+            continue
+
+        eligible_subjects += 1
+
+        enrollment_keys = [
+            _record_sort_key(record, records)
+            for record in enrollment_records
+        ]
+        probe_keys = [
+            _record_sort_key(record, records)
+            for record in probe_records
+        ]
+
+        subject_violations = []
+
+        shared_positions = {
+            key[1] for key in enrollment_keys
+        } & {
+            key[1] for key in probe_keys
+        }
+
+        if shared_positions:
+            subject_violations.append(
+                "enrollment and probe partitions share "
+                f"{len(shared_positions)} recording(s)"
+            )
+
+        if enrollment_keys and probe_keys:
+            latest_enrollment = max(enrollment_keys)
+            earliest_probe = min(probe_keys)
+
+            if latest_enrollment >= earliest_probe:
+                subject_violations.append(
+                    "an enrollment recording is not earlier than the "
+                    "first probe recording"
+                )
+
+        if subject_violations:
+            violations.append(
+                {
+                    "subject": subject_id,
+                    "reasons": subject_violations,
+                }
+            )
+
+        subject_reports.append(
+            {
+                "subject": subject_id,
+                "enrollment_records": [
+                    str(record.get("filename", ""))
+                    for record in enrollment_records
+                ],
+                "probe_records": [
+                    str(record.get("filename", ""))
+                    for record in probe_records
+                ],
+                "latest_enrollment_date": (
+                    str(max(enrollment_keys)[0])
+                    if enrollment_keys
+                    else None
+                ),
+                "earliest_probe_date": (
+                    str(min(probe_keys)[0])
+                    if probe_keys
+                    else None
+                ),
+            }
+        )
+
+    return {
+        "data_split_mode": data_split_mode,
+        "subjects_supplied": len(records_by_subject),
+        "subjects_eligible": eligible_subjects,
+        "subjects_audited": len(subject_reports),
+        "violations": violations,
+        "enrollment_precedes_probe": not violations,
+        "subject_reports": subject_reports,
+    }
+
+
+# =============================================================================
+# BEAT-MERGE WINDOWING
+# =============================================================================
+# Merging `num_beats_to_merge` consecutive beats into one sample slides the
+# merge window one beat at a time by default, so neighbouring samples share
+# beats. That is harmless when the neighbours stay inside a single partition,
+# but it means a downstream random split can place two nearly identical
+# samples on opposite sides of the train/test boundary. Configuring a stride
+# equal to the merge width produces strictly non-overlapping windows.
+
+def _normalize_beat_merge_stride(beat_merge_stride, num_beats_to_merge):
+    """
+    Validate the merge stride and return it as a positive integer.
+    """
+    if beat_merge_stride is None:
+        return 1
+
+    if isinstance(beat_merge_stride, bool):
+        raise ValueError(
+            "beat_merge_stride must be an integer, not a Boolean."
+        )
+
+    try:
+        stride = int(beat_merge_stride)
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            "beat_merge_stride must be an integer."
+        ) from error
+
+    if stride != beat_merge_stride:
+        raise ValueError(
+            "beat_merge_stride must be a whole number."
+        )
+
+    if stride < 1:
+        raise ValueError(
+            "beat_merge_stride must be at least 1."
+        )
+
+    try:
+        merge_width = int(num_beats_to_merge)
+    except (TypeError, ValueError):
+        merge_width = 1
+
+    if merge_width >= 1 and stride > merge_width:
+        raise ValueError(
+            "beat_merge_stride cannot exceed num_beats_to_merge, "
+            f"received stride {stride} for a merge width of "
+            f"{merge_width}. A larger stride would silently discard "
+            "beats between consecutive samples."
+        )
+
+    return stride
+
+
+def _beat_merge_start_indices(beat_count, num_beats_to_merge, beat_merge_stride):
+    """
+    Return the start index of every merge window over a beat sequence.
+    """
+    if beat_count < num_beats_to_merge:
+        return range(0)
+
+    return range(
+        0,
+        beat_count - num_beats_to_merge + 1,
+        beat_merge_stride,
+    )
+
+
+# =============================================================================
 # SHARED UTILITIES
 # =============================================================================
 
@@ -485,6 +1249,10 @@ class load_ecgid_dataset():
             Options: 
                 - 'average': Averages the morphology of N beats.
                 - 'concat': Flattens N beats into a single continuous vector.
+        beat_merge_stride (int): Step between consecutive merge windows.
+            The default of 1 slides one beat at a time, so merged samples
+            share beats with their neighbours. Set it equal to
+            `num_beats_to_merge` for strictly non-overlapping windows.
         data_split_mode (str): Evaluation regime mapping to strictly partition records.
             Options:
                 - 'all-available': Loads every record (used for random beat-level splitting).
@@ -502,7 +1270,8 @@ class load_ecgid_dataset():
         **preprocessing_params: kwargs passed directly to the Preprocessing class.
             Common options: mode='beat'|'blind', bandpass=True, normalize=True, window_len=5.0
     """
-    def __init__(self, num_beats_to_merge=1, beat_merge_method="average", 
+    def __init__(self, num_beats_to_merge=1, beat_merge_method="average",
+                 beat_merge_stride=1,
                  data_split_mode="all-available", signal_type="filtered",
                  cleanup_zip=False, preprocessing_config=None,
                  **preprocessing_params):
@@ -528,6 +1297,10 @@ class load_ecgid_dataset():
         )
         self.num_beats = num_beats_to_merge
         self.merge_strategy = beat_merge_method
+        self.beat_merge_stride = _normalize_beat_merge_stride(
+            beat_merge_stride,
+            num_beats_to_merge,
+        )
         self.cleanup_zip = cleanup_zip
         
         valid_modes = [
@@ -555,10 +1328,17 @@ class load_ecgid_dataset():
         """
         return 0 if self.signal_type == "raw" else 1
 
-    def load_raw_data(self):
+    def load_raw_data(self, metadata_only=False):
         """
         Scans the directory structure, reads WFDB headers, and parses recording dates.
         Returns a dictionary: { 'patient_id': [list of recording dicts sorted by time] }
+
+        Args:
+            metadata_only (bool): If True, skips signal reading and returns
+                only the record identity and date of each recording. Date
+                parsing and sorting are unchanged, so a metadata-only pass
+                reports the same partition assignment the full pipeline
+                produces.
         """
         if not self.dataset_root.exists() or not any(self.dataset_root.iterdir()):
             self.download()
@@ -571,7 +1351,11 @@ class load_ecgid_dataset():
             
             for hea_path in hea_files:
                 try:
-                    record = wfdb.rdrecord(str(hea_path.with_suffix("")))
+                    record = (
+                        wfdb.rdheader(str(hea_path.with_suffix("")))
+                        if metadata_only
+                        else wfdb.rdrecord(str(hea_path.with_suffix("")))
+                    )
                     rec_date = record.base_date
                     
                     # Robust date parsing from comments if base_date is missing
@@ -584,14 +1368,22 @@ class load_ecgid_dataset():
                                 except: pass
                     if rec_date is None: rec_date = datetime.date.min
 
+                    if metadata_only:
+                        recs.append({
+                            'date': rec_date,
+                            'fs': record.fs,
+                            'filename': hea_path.name
+                        })
+                        continue
+
                     channel_idx = self._get_channel_index()
-                    
+
                     # Safety check just in case a file has only 1 channel
                     if record.p_signal.shape[1] <= channel_idx:
                         channel_idx = 0
 
                     recs.append({
-                        'signal': record.p_signal[:, channel_idx], 
+                        'signal': record.p_signal[:, channel_idx],
                         'date': rec_date,
                         'fs': record.fs,
                         'filename': hea_path.name
@@ -615,7 +1407,12 @@ class load_ecgid_dataset():
         if len(beats) < self.num_beats: return np.empty((0, beats.shape[1])) 
         
         processed_samples = []
-        for i in range(0, len(beats) - self.num_beats + 1):
+        merge_starts = _beat_merge_start_indices(
+            len(beats),
+            self.num_beats,
+            self.beat_merge_stride,
+        )
+        for i in merge_starts:
             group = beats[i : i + self.num_beats] 
             if self.merge_strategy == "average":
                 processed_samples.append(np.mean(group, axis=0))
@@ -671,63 +1468,27 @@ class load_ecgid_dataset():
         for sid, recs in tqdm(data.items(), desc=f"Processing {log_name}"):
             if not recs: continue
             
-            target_recs = []
-            
-            unique_dates = sorted(list(set(r['date'] for r in recs)))
-            day1_date = unique_dates[0]
-            day1_recs = [r for r in recs if r['date'] == day1_date]
+            (
+                target_recs,
+                subject_is_eligible,
+            ) = select_record_order_partition(
+                recs,
+                self.data_split_mode,
+                is_enrollment,
+            )
 
-            # --- TASK 3: SINGLE CROSS-SESSION ---
-            if self.data_split_mode == "single-cross-session":
-                if len(recs) < 2:
-                    dropped_subjects += 1
-                    continue
+            if not subject_is_eligible:
+                dropped_subjects += 1
+                continue
 
-                kept_subjects += 1
-                target_recs = [recs[0]] if is_enrollment else [recs[1]]
+            kept_subjects += 1
 
-            # --- TASK 4: SINGLE-SHOT SHORT-TERM ---
-            elif self.data_split_mode == "single-shot-short-term":
-                if len(day1_recs) < 2:
-                    dropped_subjects += 1
-                    continue
-
-                kept_subjects += 1
-                target_recs = (
-                    [day1_recs[0]]
-                    if is_enrollment
-                    else day1_recs[1:]
-                )
-
-            # --- TASK 5: LEAVE-LAST-OUT SHORT-TERM ---
-            elif self.data_split_mode == "leave-last-out-short-term":
-                if len(day1_recs) < 2:
-                    dropped_subjects += 1
-                    continue
-
-                kept_subjects += 1
-                target_recs = (
-                    day1_recs[:-1]
-                    if is_enrollment
-                    else [day1_recs[-1]]
-                )
-
-            # --- TASK 6: SINGLE-SHOT LONG-TERM ---
-            elif self.data_split_mode == "single-shot-long-term":
-                if len(unique_dates) < 2: 
-                    dropped_subjects += 1
-                    continue
-                kept_subjects += 1
-                target_recs = day1_recs if is_enrollment else [r for r in recs if r['date'] > day1_date]
-
-            # --- TASK 7: LEAVE-LAST-OUT LONG-TERM ---
-            elif self.data_split_mode == "leave-last-out-long-term":
-                if len(unique_dates) < 2:
-                    dropped_subjects += 1
-                    continue
-                kept_subjects += 1
-                last_date = unique_dates[-1]
-                target_recs = [r for r in recs if r['date'] < last_date] if is_enrollment else [r for r in recs if r['date'] == last_date]
+            _record_partition_assignment(
+                self,
+                is_enrollment,
+                sid,
+                target_recs,
+            )
 
             # --- EXTRACTION & SPLITTING ---
             for rec in target_recs:
@@ -778,6 +1539,10 @@ class load_heartprint_dataset():
             Example: 'session3l'
         num_beats_to_merge (int): Number of consecutive beats to fuse into a single sample.
         beat_merge_method (str): Strategy for fusing beats. Options: ['average', 'concat']
+        beat_merge_stride (int): Step between consecutive merge windows.
+            The default of 1 slides one beat at a time, so merged samples
+            share beats with their neighbours. Set it equal to
+            `num_beats_to_merge` for strictly non-overlapping windows.
         cleanup_zip (bool): If True, deletes the downloaded zip file after extraction.
         **preprocessing_params: kwargs passed directly to the Preprocessing class.
     """
@@ -785,8 +1550,9 @@ class load_heartprint_dataset():
                  session_for_single_session_evaluation=["session1"],
                  train_sessions=["session1"], 
                  enroll_sessions=["session1"],
-                 probe_sessions=["session2"], 
-                 num_beats_to_merge=1, beat_merge_method="average", 
+                 probe_sessions=["session2"],
+                 num_beats_to_merge=1, beat_merge_method="average",
+                 beat_merge_stride=1,
                  cleanup_zip=False, preprocessing_config=None,
                  **preprocessing_params):
        
@@ -806,6 +1572,10 @@ class load_heartprint_dataset():
         )
         self.num_beats = num_beats_to_merge
         self.merge_strategy = beat_merge_method
+        self.beat_merge_stride = _normalize_beat_merge_stride(
+            beat_merge_stride,
+            num_beats_to_merge,
+        )
         self.cleanup_zip = cleanup_zip
         
         valid_modes = ["single-session", "cross-session"]
@@ -943,7 +1713,12 @@ class load_heartprint_dataset():
         if len(beats) < self.num_beats: return np.empty((0, beats.shape[1]))
         
         processed_samples = []
-        for i in range(0, len(beats) - self.num_beats + 1):
+        merge_starts = _beat_merge_start_indices(
+            len(beats),
+            self.num_beats,
+            self.beat_merge_stride,
+        )
+        for i in merge_starts:
             group = beats[i : i + self.num_beats]
             if self.merge_strategy == "average": processed_samples.append(np.mean(group, axis=0))
             elif self.merge_strategy == "concat": processed_samples.append(group.flatten())
@@ -1049,11 +1824,16 @@ class load_ptb_dataset():
                              keeping only the ~52 healthy control volunteers.
         num_beats_to_merge (int): Number of consecutive beats to fuse into a single sample.
         beat_merge_method (str): Strategy for fusing beats. Options: ['average', 'concat']
+        beat_merge_stride (int): Step between consecutive merge windows.
+            The default of 1 slides one beat at a time, so merged samples
+            share beats with their neighbours. Set it equal to
+            `num_beats_to_merge` for strictly non-overlapping windows.
         cleanup_zip (bool): If True, deletes the downloaded zip file after extraction.
         **preprocessing_params: kwargs passed directly to the Preprocessing class.
     """
     def __init__(self, leads=['i'], data_split_mode="all-available",
-                 only_healthy=False, num_beats_to_merge=1, beat_merge_method="average", 
+                 only_healthy=False, num_beats_to_merge=1, beat_merge_method="average",
+                 beat_merge_stride=1,
                  cleanup_zip=False, preprocessing_config=None,
                  **preprocessing_params):
        
@@ -1074,6 +1854,10 @@ class load_ptb_dataset():
         self.only_healthy = only_healthy
         self.num_beats = num_beats_to_merge
         self.merge_strategy = beat_merge_method
+        self.beat_merge_stride = _normalize_beat_merge_stride(
+            beat_merge_stride,
+            num_beats_to_merge,
+        )
         self.cleanup_zip = cleanup_zip
         
         valid_modes = [
@@ -1122,10 +1906,17 @@ class load_ptb_dataset():
             except ValueError: pass 
         return indices
 
-    def load_raw_data(self):
+    def load_raw_data(self, metadata_only=False):
         """
         Loads all WFDB records, parses metadata, and sorts chronologically.
         Injects synthetic dates for records missing timestamps to preserve them for evaluation.
+
+        Args:
+            metadata_only (bool): If True, skips signal reading and returns
+                only the record identity and date of each recording. Date
+                parsing, synthetic-date injection, and sorting are unchanged,
+                so a metadata-only pass reports the same partition assignment
+                the full pipeline produces.
         """
         if not self.dataset_root.exists() or not any(self.dataset_root.iterdir()):
             self.download()
@@ -1158,19 +1949,31 @@ class load_ptb_dataset():
                     rec_header = wfdb.rdheader(str(hea.with_suffix("")))
                     lead_indices = self._get_lead_indices(rec_header.sig_name)
                     if not lead_indices: continue
-                    
-                    data, _ = wfdb.rdsamp(str(hea.with_suffix("")), channels=lead_indices)
-                    
+
+                    data = None
+                    if not metadata_only:
+                        data, _ = wfdb.rdsamp(str(hea.with_suffix("")), channels=lead_indices)
+
                     dt = rec_header.base_date
                     if dt is None: dt = self._parse_date_from_comments(rec_header.comments)
-                    
+
                     # Assign a synthetic sequential date if none is found
                     if dt is None:
                         dt = dummy_date
                         dummy_date += datetime.timedelta(days=1)
-                        
+
                     full_dt = datetime.datetime.combine(dt, datetime.time.min)
-                    recs.append({"signal": data, "fs": rec_header.fs, "date": full_dt, "filename": hea.name})
+
+                    record_entry = {
+                        "fs": rec_header.fs,
+                        "date": full_dt,
+                        "filename": hea.name,
+                    }
+
+                    if not metadata_only:
+                        record_entry["signal"] = data
+
+                    recs.append(record_entry)
                 except Exception: pass
             
             if recs:
@@ -1200,7 +2003,12 @@ class load_ptb_dataset():
         if len(beats_multi) < self.num_beats: return np.empty((0, n_channels, 0))
         
         merged_samples = []
-        for i in range(0, len(beats_multi) - self.num_beats + 1):
+        merge_starts = _beat_merge_start_indices(
+            len(beats_multi),
+            self.num_beats,
+            self.beat_merge_stride,
+        )
+        for i in merge_starts:
             group = beats_multi[i : i + self.num_beats]
             if self.merge_strategy == "average":
                 merged = np.mean(group, axis=0)
@@ -1260,52 +2068,27 @@ class load_ptb_dataset():
         for sid, recs in tqdm(data.items(), desc=f"Processing {log_name}"):
             if not recs: continue
             
-            target_recs = []
-            
-            unique_dates = sorted(list(set(r['date'] for r in recs)))
-            day1_date = unique_dates[0]
-            day1_recs = [r for r in recs if r['date'] == day1_date]
+            (
+                target_recs,
+                subject_is_eligible,
+            ) = select_record_order_partition(
+                recs,
+                self.data_split_mode,
+                is_enrollment,
+            )
 
-            # --- TASK 3: SINGLE CROSS-SESSION ---
-            if self.data_split_mode == "single-cross-session":
-                if len(recs) < 2: 
-                    dropped_subjects += 1
-                    continue
-                kept_subjects += 1
-                target_recs = [recs[0]] if is_enrollment else [recs[1]]
+            if not subject_is_eligible:
+                dropped_subjects += 1
+                continue
 
-            # --- TASK 4: SINGLE-SHOT SHORT-TERM ---
-            elif self.data_split_mode == "single-shot-short-term":
-                if len(day1_recs) < 2: 
-                    dropped_subjects += 1
-                    continue
-                kept_subjects += 1
-                target_recs = [day1_recs[0]] if is_enrollment else day1_recs[1:]
+            kept_subjects += 1
 
-            # --- TASK 5: LEAVE-LAST-OUT SHORT-TERM ---
-            elif self.data_split_mode == "leave-last-out-short-term":
-                if len(day1_recs) < 2: 
-                    dropped_subjects += 1
-                    continue
-                kept_subjects += 1
-                target_recs = day1_recs[:-1] if is_enrollment else [day1_recs[-1]]
-
-            # --- TASK 6: SINGLE-SHOT LONG-TERM ---
-            elif self.data_split_mode == "single-shot-long-term":
-                if len(unique_dates) < 2: 
-                    dropped_subjects += 1
-                    continue
-                kept_subjects += 1
-                target_recs = day1_recs if is_enrollment else [r for r in recs if r['date'] > day1_date]
-
-            # --- TASK 7: LEAVE-LAST-OUT LONG-TERM ---
-            elif self.data_split_mode == "leave-last-out-long-term":
-                if len(unique_dates) < 2:
-                    dropped_subjects += 1
-                    continue
-                kept_subjects += 1
-                last_date = unique_dates[-1]
-                target_recs = [r for r in recs if r['date'] < last_date] if is_enrollment else [r for r in recs if r['date'] == last_date]
+            _record_partition_assignment(
+                self,
+                is_enrollment,
+                sid,
+                target_recs,
+            )
 
             # --- EXTRACTION & SIGNAL PROCESSING ---
             for rec in target_recs:
@@ -1356,6 +2139,10 @@ class load_cybhi_dataset():
             Example: 'long-term_S2'
         num_beats_to_merge (int): Number of consecutive beats to fuse into a single sample.
         beat_merge_method (str): Strategy for fusing beats. Options: ['average', 'concat']
+        beat_merge_stride (int): Step between consecutive merge windows.
+            The default of 1 slides one beat at a time, so merged samples
+            share beats with their neighbours. Set it equal to
+            `num_beats_to_merge` for strictly non-overlapping windows.
         cleanup_zip (bool): If True, deletes the downloaded zip file after extraction.
         **preprocessing_params: kwargs passed directly to the Preprocessing class.
     """
@@ -1363,8 +2150,9 @@ class load_cybhi_dataset():
                  session_for_single_session_evaluation=["long-term_S1"],
                  train_sessions=["long-term_S1"], 
                  enroll_sessions=["long-term_S1"],
-                 probe_sessions=["long-term_S2"], 
-                 num_beats_to_merge=1, beat_merge_method="average", 
+                 probe_sessions=["long-term_S2"],
+                 num_beats_to_merge=1, beat_merge_method="average",
+                 beat_merge_stride=1,
                  cleanup_zip=False, preprocessing_config=None,
                  **preprocessing_params):
         
@@ -1383,6 +2171,10 @@ class load_cybhi_dataset():
         )
         self.num_beats = num_beats_to_merge
         self.merge_strategy = beat_merge_method
+        self.beat_merge_stride = _normalize_beat_merge_stride(
+            beat_merge_stride,
+            num_beats_to_merge,
+        )
         self.cleanup_zip = cleanup_zip
         
         valid_modes = ["single-session", "cross-session"]
@@ -1530,7 +2322,12 @@ class load_cybhi_dataset():
         if len(beats) < self.num_beats: return np.empty((0, beats.shape[1]))
         
         processed_samples = []
-        for i in range(0, len(beats) - self.num_beats + 1):
+        merge_starts = _beat_merge_start_indices(
+            len(beats),
+            self.num_beats,
+            self.beat_merge_stride,
+        )
+        for i in merge_starts:
             group = beats[i : i + self.num_beats]
             if self.merge_strategy == "average": processed_samples.append(np.mean(group, axis=0))
             elif self.merge_strategy == "concat": processed_samples.append(group.flatten())
@@ -1630,15 +2427,24 @@ class load_mitbih_dataset():
             Example: [(25, 30)] extracts the last 5 minutes of the tape.
         num_beats_to_merge (int): Number of consecutive beats to fuse.
         beat_merge_method (str): Strategy for fusing beats. Options: ['average', 'concat']
+        beat_merge_stride (int): Step between consecutive merge windows.
+            The default of 1 slides one beat at a time, so merged samples
+            share beats with their neighbours. Set it equal to
+            `num_beats_to_merge` for strictly non-overlapping windows.
+        temporal_guard_minutes (float): Minimum separation enforced between
+            the enrollment coverage and the probe coverage in 'custom-split'
+            mode. The default of 0.0 permits adjacent windows and rejects
+            only true overlap.
         cleanup_zip (bool): If True, deletes the downloaded zip file after extraction.
         **preprocessing_params: kwargs passed directly to the Preprocessing class.
     """
-    def __init__(self, leads=['MLII'], data_split_mode="all-available", 
-                 single_segment_range=(0, 5), train_parts=None, enrol_parts=None, 
-                 test_parts=None, num_beats_to_merge=1, beat_merge_method="average", 
+    def __init__(self, leads=['MLII'], data_split_mode="all-available",
+                 single_segment_range=(0, 5), train_parts=None, enrol_parts=None,
+                 test_parts=None, num_beats_to_merge=1, beat_merge_method="average",
+                 beat_merge_stride=1, temporal_guard_minutes=0.0,
                  cleanup_zip=False, preprocessing_config=None,
                  **preprocessing_params):
-        
+
         self.preprocessor = Preprocessing()
         self.cfg = CONFIG["datasets"]["mitbih"]
         project_dir = Path(__file__).resolve().parent
@@ -1655,19 +2461,25 @@ class load_mitbih_dataset():
         self.target_leads = [l.lower() for l in leads] if isinstance(leads, list) else leads
         self.num_beats = num_beats_to_merge
         self.merge_strategy = beat_merge_method
+        self.beat_merge_stride = _normalize_beat_merge_stride(
+            beat_merge_stride,
+            num_beats_to_merge,
+        )
+        self.temporal_guard_minutes = float(temporal_guard_minutes)
         self.cleanup_zip = cleanup_zip
-        
+
         valid_modes = ["all-available", "single-segment", "custom-split"]
         if data_split_mode not in valid_modes:
             raise ValueError(f"Invalid mode: {data_split_mode}. Use {valid_modes}")
         self.data_split_mode = data_split_mode
-        
+
         # Segment mappings (in minutes)
         self.single_segment_range = single_segment_range
         self.train_parts = train_parts
         self.enrol_parts = enrol_parts
         self.test_parts = test_parts
-        
+        self.temporal_partition_audit = None
+
         # Strict validation for custom-split
         if self.data_split_mode == "custom-split":
             if not self.train_parts or not self.test_parts:
@@ -1675,6 +2487,15 @@ class load_mitbih_dataset():
                     "For 'custom-split' mode, `train_parts` and `test_parts` cannot be None. "
                     "Please provide minute ranges. Example: train_parts=[(0, 5)], test_parts=[(25, 30)]"
                 )
+
+            self.temporal_partition_audit = (
+                audit_continuous_temporal_partitions(
+                    train_parts=self.train_parts,
+                    enrol_parts=self.enrol_parts,
+                    test_parts=self.test_parts,
+                    temporal_guard_minutes=self.temporal_guard_minutes,
+                )
+            )
 
     def download(self):
         """Downloads and extracts the dataset if missing."""
@@ -1737,7 +2558,12 @@ class load_mitbih_dataset():
         if len(beats_multi) < self.num_beats: return np.empty((0, n_channels, 0))
         
         merged_samples = []
-        for i in range(0, len(beats_multi) - self.num_beats + 1):
+        merge_starts = _beat_merge_start_indices(
+            len(beats_multi),
+            self.num_beats,
+            self.beat_merge_stride,
+        )
+        for i in merge_starts:
             group = beats_multi[i : i + self.num_beats]
             if self.merge_strategy == "average":
                 merged = np.mean(group, axis=0)
@@ -1881,15 +2707,24 @@ class load_nsrdb_dataset():
             Example: [(1380, 1440)] extracts the final hour of the 24-hour tape.
         num_beats_to_merge (int): Number of consecutive beats to fuse.
         beat_merge_method (str): Strategy for fusing beats. Options: ['average', 'concat']
+        beat_merge_stride (int): Step between consecutive merge windows.
+            The default of 1 slides one beat at a time, so merged samples
+            share beats with their neighbours. Set it equal to
+            `num_beats_to_merge` for strictly non-overlapping windows.
+        temporal_guard_minutes (float): Minimum separation enforced between
+            the enrollment coverage and the probe coverage in 'custom-split'
+            mode. The default of 0.0 permits adjacent windows and rejects
+            only true overlap.
         cleanup_zip (bool): If True, deletes the downloaded zip file after extraction.
         **preprocessing_params: kwargs passed directly to the Preprocessing class.
     """
-    def __init__(self, leads=['ECG1'], data_split_mode="all-available", 
-                 single_segment_range=(0, 60), train_parts=None, enrol_parts=None, 
-                 test_parts=None, num_beats_to_merge=1, beat_merge_method="average", 
+    def __init__(self, leads=['ECG1'], data_split_mode="all-available",
+                 single_segment_range=(0, 60), train_parts=None, enrol_parts=None,
+                 test_parts=None, num_beats_to_merge=1, beat_merge_method="average",
+                 beat_merge_stride=1, temporal_guard_minutes=0.0,
                  cleanup_zip=False, preprocessing_config=None,
                  **preprocessing_params):
-       
+
         self.preprocessor = Preprocessing()
         self.cfg = CONFIG["datasets"]["nsrdb"]
         project_dir = Path(__file__).resolve().parent
@@ -1906,19 +2741,25 @@ class load_nsrdb_dataset():
         self.target_leads = [l.lower() for l in leads] if isinstance(leads, list) else leads
         self.num_beats = num_beats_to_merge
         self.merge_strategy = beat_merge_method
+        self.beat_merge_stride = _normalize_beat_merge_stride(
+            beat_merge_stride,
+            num_beats_to_merge,
+        )
+        self.temporal_guard_minutes = float(temporal_guard_minutes)
         self.cleanup_zip = cleanup_zip
-        
+
         valid_modes = ["all-available", "single-segment", "custom-split"]
         if data_split_mode not in valid_modes:
             raise ValueError(f"Invalid mode: {data_split_mode}. Use {valid_modes}")
         self.data_split_mode = data_split_mode
-        
+
         # Segment mappings (in minutes)
         self.single_segment_range = single_segment_range
         self.train_parts = train_parts
         self.enrol_parts = enrol_parts
         self.test_parts = test_parts
-        
+        self.temporal_partition_audit = None
+
         # Strict validation for custom-split
         if self.data_split_mode == "custom-split":
             if not self.train_parts or not self.test_parts:
@@ -1926,6 +2767,15 @@ class load_nsrdb_dataset():
                     "For 'custom-split' mode, `train_parts` and `test_parts` cannot be None. "
                     "Please provide minute ranges. Example: train_parts=[(0, 60)], test_parts=[(1380, 1440)]"
                 )
+
+            self.temporal_partition_audit = (
+                audit_continuous_temporal_partitions(
+                    train_parts=self.train_parts,
+                    enrol_parts=self.enrol_parts,
+                    test_parts=self.test_parts,
+                    temporal_guard_minutes=self.temporal_guard_minutes,
+                )
+            )
 
     def download(self):
         """Downloads and extracts dataset."""
@@ -2011,7 +2861,12 @@ class load_nsrdb_dataset():
         if len(beats_multi) < self.num_beats: return np.empty((0, n_channels, 0))
         
         merged_samples = []
-        for i in range(0, len(beats_multi) - self.num_beats + 1):
+        merge_starts = _beat_merge_start_indices(
+            len(beats_multi),
+            self.num_beats,
+            self.beat_merge_stride,
+        )
+        for i in merge_starts:
             group = beats_multi[i : i + self.num_beats]
             if self.merge_strategy == "average":
                 merged = np.mean(group, axis=0)
@@ -2128,13 +2983,18 @@ class load_ptbxl_dataset():
                 - 'leave-last-out-long-term': Last recording day = Probe, all past days = Enroll.
         num_beats_to_merge (int): Number of consecutive beats to fuse into a single sample.
         beat_merge_method (str): Strategy for fusing beats. Options: ['average', 'concat']
+        beat_merge_stride (int): Step between consecutive merge windows.
+            The default of 1 slides one beat at a time, so merged samples
+            share beats with their neighbours. Set it equal to
+            `num_beats_to_merge` for strictly non-overlapping windows.
         limit_records (int, optional): Hard limit on the number of patients to process (useful for fast debugging).
         cleanup_zip (bool): If True, deletes the downloaded zip file after extraction.
         **preprocessing_params: kwargs passed directly to the Preprocessing class.
     """
     def __init__(self, leads=['i'], resolution='high', only_healthy=False, 
-                 data_split_mode="all-available", num_beats_to_merge=1, 
-                 beat_merge_method="average", limit_records=None, 
+                 data_split_mode="all-available", num_beats_to_merge=1,
+                 beat_merge_method="average", beat_merge_stride=1,
+                 limit_records=None,
                  cleanup_zip=False, preprocessing_config=None,
                  **preprocessing_params):
        
@@ -2156,6 +3016,10 @@ class load_ptbxl_dataset():
         self.only_healthy = only_healthy
         self.num_beats = num_beats_to_merge
         self.merge_strategy = beat_merge_method
+        self.beat_merge_stride = _normalize_beat_merge_stride(
+            beat_merge_stride,
+            num_beats_to_merge,
+        )
         self.limit_records = limit_records
         self.cleanup_zip = cleanup_zip
         
@@ -2192,10 +3056,17 @@ class load_ptbxl_dataset():
         """
         return "NORM" in str(scp_codes_str)
 
-    def load_raw_data(self):
+    def load_raw_data(self, metadata_only=False):
         """
         Parses the official ptbxl_database.csv, loads WFDB records, and groups by patient.
         Ensures strict chronological sorting using official metadata timestamps.
+
+        Args:
+            metadata_only (bool): If True, skips signal reading and returns
+                only the record identity and date of each recording. The
+                grouping, ordering, and eligibility logic is identical, so a
+                metadata-only pass reports the same partition assignment the
+                full pipeline produces.
         """
         if not self.dataset_root.exists() or not any(self.dataset_root.iterdir()):
             self.download()
@@ -2235,12 +3106,26 @@ class load_ptbxl_dataset():
                     rec_header = wfdb.rdheader(str(full_path))
                     lead_indices = self._get_lead_indices(rec_header.sig_name)
                     if not lead_indices: continue
-                    
-                    data, _ = wfdb.rdsamp(str(full_path), channels=lead_indices)
-                    
+
                     # Store exact datetime for Day 1 splits
                     rec_dt = pd.to_datetime(row['recording_date']).date()
-                    recs_list.append({"signal": data, "fs": rec_header.fs, "date": rec_dt})
+
+                    if metadata_only:
+                        recs_list.append({
+                            "fs": rec_header.fs,
+                            "date": rec_dt,
+                            "filename": str(fname_rel),
+                        })
+                        continue
+
+                    data, _ = wfdb.rdsamp(str(full_path), channels=lead_indices)
+
+                    recs_list.append({
+                        "signal": data,
+                        "fs": rec_header.fs,
+                        "date": rec_dt,
+                        "filename": str(fname_rel),
+                    })
                 except Exception: pass
             
             if recs_list: recordings[str(pid)] = recs_list
@@ -2267,7 +3152,12 @@ class load_ptbxl_dataset():
         if len(beats_multi) < self.num_beats: return np.empty((0, n_channels, 0))
         
         merged_samples = []
-        for i in range(0, len(beats_multi) - self.num_beats + 1):
+        merge_starts = _beat_merge_start_indices(
+            len(beats_multi),
+            self.num_beats,
+            self.beat_merge_stride,
+        )
+        for i in merge_starts:
             group = beats_multi[i : i + self.num_beats]
             if self.merge_strategy == "average":
                 merged = np.mean(group, axis=0)
@@ -2327,57 +3217,27 @@ class load_ptbxl_dataset():
         for sid, recs in tqdm(data.items(), desc=f"Processing {log_name}"):
             if not recs: continue
             
-            target_recs = []
-            
-            unique_dates = sorted(list(set(r['date'] for r in recs)))
-            day1_date = unique_dates[0]
-            day1_recs = [r for r in recs if r['date'] == day1_date]
+            (
+                target_recs,
+                subject_is_eligible,
+            ) = select_record_order_partition(
+                recs,
+                self.data_split_mode,
+                is_enrollment,
+            )
 
-            # --- TASK 3: SINGLE CROSS-SESSION ---
-            # Objective: Test immediate cross-record variation (Rec 1 vs Rec 2).
-            if self.data_split_mode == "single-cross-session":
-                if len(recs) < 2: 
-                    dropped_subjects += 1
-                    continue
-                kept_subjects += 1
-                target_recs = [recs[0]] if is_enrollment else [recs[1]]
+            if not subject_is_eligible:
+                dropped_subjects += 1
+                continue
 
-            # --- TASK 4: SINGLE-SHOT SHORT-TERM ---
-            # Objective: Single-shot enrollment vs all subsequent intra-day probes.
-            elif self.data_split_mode == "single-shot-short-term":
-                if len(day1_recs) < 2: 
-                    dropped_subjects += 1
-                    continue
-                kept_subjects += 1
-                target_recs = [day1_recs[0]] if is_enrollment else day1_recs[1:]
+            kept_subjects += 1
 
-            # --- TASK 5: LEAVE-LAST-OUT SHORT-TERM ---
-            # Objective: Multi-shot enrollment vs a single final intra-day probe.
-            elif self.data_split_mode == "leave-last-out-short-term":
-                if len(day1_recs) < 2: 
-                    dropped_subjects += 1
-                    continue
-                kept_subjects += 1
-                target_recs = day1_recs[:-1] if is_enrollment else [day1_recs[-1]]
-
-            # --- TASK 6: SINGLE-SHOT LONG-TERM ---
-            # Objective: Day 1 template aging tested against all future days.
-            elif self.data_split_mode == "single-shot-long-term":
-                if len(unique_dates) < 2: 
-                    dropped_subjects += 1
-                    continue
-                kept_subjects += 1
-                target_recs = day1_recs if is_enrollment else [r for r in recs if r['date'] > day1_date]
-
-            # --- TASK 7: LEAVE-LAST-OUT LONG-TERM ---
-            # Objective: Historical longitudinal data enrolled vs final day probe.
-            elif self.data_split_mode == "leave-last-out-long-term":
-                if len(unique_dates) < 2:
-                    dropped_subjects += 1
-                    continue
-                kept_subjects += 1
-                last_date = unique_dates[-1]
-                target_recs = [r for r in recs if r['date'] < last_date] if is_enrollment else [r for r in recs if r['date'] == last_date]
+            _record_partition_assignment(
+                self,
+                is_enrollment,
+                sid,
+                target_recs,
+            )
 
             # --- EXTRACTION & SIGNAL PROCESSING ---
             for rec in target_recs:

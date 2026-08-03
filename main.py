@@ -30,7 +30,25 @@ from run import (
 )
 
 # Import Models
-from models import DeepECG, ResNet1D, RNN_ECG, HybridCNNLSTM, ECGTransformer
+from models import (
+    DeepECG, ResNet1D, RNN_ECG, HybridCNNLSTM, ECGTransformer,
+    ECGXtractor, MobileNetGRU, MultiScaleCNN, SeparableResNet,
+)
+
+# Architectures selectable with --model. Adding an entry here is all that is
+# required to benchmark a new model under every evaluation protocol; see
+# experiments/Custom_Model.ipynb for the full contract a model must satisfy.
+MODEL_REGISTRY = {
+    'deepecg': DeepECG,
+    'resnet1d': ResNet1D,
+    'rnn': RNN_ECG,
+    'hybrid': HybridCNNLSTM,
+    'transformer': ECGTransformer,
+    'ecgxtractor': ECGXtractor,
+    'mobilenet_gru': MobileNetGRU,
+    'multiscale_cnn': MultiScaleCNN,
+    'separable_resnet': SeparableResNet,
+}
 
 # =============================================================================
 # EXPERIMENT CONFIGURATION
@@ -69,6 +87,33 @@ def _parse_json_mapping(value):
         )
 
     return parsed_value
+
+
+def _add_negation_flags(parser, option_names):
+    """
+    Add a ``--no_<option>`` counterpart for each boolean switch.
+
+    Boolean options are declared with ``store_true`` and can therefore be
+    enabled by a YAML configuration but never disabled from the command line.
+    Each negation flag writes ``False`` to the same destination, so ordinary
+    command-line precedence applies and the last flag wins.
+
+    The negations are hidden from the help listing to keep it readable; they
+    are documented in the README instead.
+
+    Their default is suppressed deliberately. A ``store_false`` action carries
+    an implicit default of ``True``, which would otherwise overwrite the real
+    ``store_true`` default of ``False`` when defaults are collected by
+    destination.
+    """
+    for option_name in option_names:
+        parser.add_argument(
+            f"--no_{option_name}",
+            dest=option_name,
+            action="store_false",
+            default=argparse.SUPPRESS,
+            help=argparse.SUPPRESS,
+        )
 
 
 def _collect_parser_defaults(parser):
@@ -467,12 +512,22 @@ def validate_experiment_arguments(args, parser):
         "n_runs",
         "num_pairs",
         "num_beats_to_merge",
+        "beat_merge_stride",
         "probe_fusion_size",
         "augmentation_copies",
     ]:
         require_integer(
             argument_name,
             minimum=1,
+        )
+
+    if args.beat_merge_stride > args.num_beats_to_merge:
+        parser.error(
+            "'beat_merge_stride' cannot exceed "
+            "'num_beats_to_merge', received stride "
+            f"{args.beat_merge_stride!r} for a merge width of "
+            f"{args.num_beats_to_merge!r}. A larger stride would "
+            "silently discard beats between consecutive samples."
         )
 
     require_integer("seed")
@@ -651,6 +706,32 @@ def validate_experiment_arguments(args, parser):
                 f"'{argument_name}' must contain only non-empty strings."
             )
 
+    # Cross-session regimes must not draw probes from a session that also
+    # supplied training or enrollment data. Ordering is deliberately not
+    # checked here: reverse protocols that enrol on a later session and probe
+    # an earlier one are a legitimate way to measure directional drift.
+    if args.task in [5, 6, 7, 8] and args.probe_sessions:
+        enrollment_sessions = set(
+            args.train_sessions or []
+        ) | set(
+            args.enroll_sessions or []
+        )
+
+        shared_sessions = enrollment_sessions & set(
+            args.probe_sessions
+        )
+
+        if shared_sessions:
+            parser.error(
+                "Cross-session Task "
+                f"{args.task} would probe session(s) "
+                f"{sorted(shared_sessions)}, which also supply "
+                "training or enrollment data. Enrollment and probe "
+                "sessions must be disjoint so that reported "
+                "performance is not inflated by evaluating on a "
+                "session the template was built from."
+            )
+
     # ---------------------------------------------------------
     # 9. Continuous-recording minute ranges
     # ---------------------------------------------------------
@@ -678,6 +759,50 @@ def validate_experiment_arguments(args, parser):
         parser.error(
             "Minute-range arguments are supported only for "
             "the MIT-BIH and NSRDB datasets."
+        )
+
+    require_real(
+        "temporal_guard_minutes",
+        minimum=0.0,
+    )
+
+    if args.target_fars is not None:
+        if not args.target_fars:
+            parser.error(
+                "'target_fars' cannot be an empty list."
+            )
+
+        for target_far in args.target_fars:
+            if not np.isfinite(target_far):
+                parser.error(
+                    "Every 'target_fars' entry must be finite, "
+                    f"received {target_far!r}."
+                )
+
+            if not 0.0 < target_far < 1.0:
+                parser.error(
+                    "Every 'target_fars' entry must satisfy "
+                    f"0 < FAR < 1, received {target_far!r}."
+                )
+
+        if len(set(args.target_fars)) != len(args.target_fars):
+            parser.error(
+                "'target_fars' entries must be unique."
+            )
+
+        if args.task not in [2, 4, 6, 8]:
+            parser.error(
+                "'target_fars' applies only to the verification "
+                "tasks 2, 4, 6, and 8."
+            )
+
+    if (
+        args.dataset not in continuous_datasets
+        and args.temporal_guard_minutes != 0.0
+    ):
+        parser.error(
+            "'temporal_guard_minutes' applies only to the "
+            "MIT-BIH and NSRDB continuous recordings."
         )
 
     if args.single_segment_range is not None:
@@ -943,9 +1068,23 @@ def get_parser():
                             help="Target database to load.")
     core_group.add_argument('--task', type=int, default=None, choices=[1, 2, 3, 4, 5, 6, 7, 8],
                             help="Biometric Evaluation Task Number (1 to 8).")
-    core_group.add_argument('--model', type=str, default='deepecg', 
-                            choices=['deepecg', 'resnet1d', 'rnn', 'hybrid', 'transformer'],
-                            help="Neural Network Architecture (default: deepecg).")
+    core_group.add_argument('--model', type=str, default='deepecg',
+                            choices=sorted(MODEL_REGISTRY),
+                            help=(
+                                "Neural network architecture "
+                                "(default: deepecg). Architectures marked "
+                                "[lit] are re-implementations of published "
+                                "ECG biometric methods:\n"
+                                "  deepecg           Deep-ECG CNN [lit]\n"
+                                "  ecgxtractor       autoencoder encoder [lit]\n"
+                                "  mobilenet_gru     MobileNetV1 + GRU [lit]\n"
+                                "  multiscale_cnn    parallel multi-scale CNN [lit]\n"
+                                "  separable_resnet  residual separable CNN [lit]\n"
+                                "  resnet1d          1D ResNet\n"
+                                "  hybrid            CNN-LSTM\n"
+                                "  transformer       ECG Transformer\n"
+                                "  rnn               LSTM/GRU"
+                            ))
     core_group.add_argument('--config', type=str, default=None,
                             help="Path to a YAML file providing experiment defaults. Explicit CLI values take precedence.")
     
@@ -965,6 +1104,18 @@ def get_parser():
                             help="Target session if running intra-session tasks (1-4) on multi-session datasets.")
     data_group.add_argument('--num_beats_to_merge', type=int, default=1,
                             help="Consecutive beats to fuse natively in the loader (default: 1).")
+    data_group.add_argument(
+        '--beat_merge_stride',
+        type=int,
+        default=1,
+        help=(
+            "Step between consecutive beat-merge windows "
+            "(default: 1). The default slides one beat at a "
+            "time, so merged samples share beats with their "
+            "neighbours. Set it equal to --num_beats_to_merge "
+            "for strictly non-overlapping samples."
+        ),
+    )
     data_group.add_argument(
         '--preprocessing_parameters',
         type=_parse_json_mapping,
@@ -1043,6 +1194,20 @@ def get_parser():
             "Probe/test minute range for MIT-BIH or NSRDB "
             "custom splits. Repeat the option to provide "
             "multiple ranges."
+        ),
+    )
+
+    data_group.add_argument(
+        "--temporal_guard_minutes",
+        type=float,
+        default=0.0,
+        help=(
+            "Minimum separation in minutes required between the "
+            "enrollment coverage and the probe coverage of a "
+            "MIT-BIH or NSRDB custom split (default: 0.0). "
+            "Overlapping enrollment and probe windows are always "
+            "rejected; a positive value additionally rejects "
+            "directly adjacent windows."
         ),
     )
 
@@ -1165,6 +1330,22 @@ def get_parser():
         help="Calibrate a verification threshold on validation data and apply it to test data."
     )
 
+    eval_group.add_argument(
+        '--target_fars',
+        type=float,
+        nargs='+',
+        default=None,
+        metavar='FAR',
+        help=(
+            "False-acceptance operating points reported for "
+            "verification tasks, as fractions in (0, 1). "
+            "Defaults to 0.1 0.01 0.001 0.0001, which yields "
+            "TAR@10%%FAR, TAR@1%%FAR, TAR@0.1%%FAR, and "
+            "TAR@0.01%%FAR. The headline metric TAR@0.1%%FAR is "
+            "unaffected unless 0.001 is removed."
+        ),
+    )
+
     # ----------------------------------------------------
     # SQI & FILTERING SETTINGS
     # ----------------------------------------------------
@@ -1194,6 +1375,24 @@ def get_parser():
                             help="If set, saves/loads precomputed data arrays based on hyperparameters.")
     misc_group.add_argument('--intelligent_weight_loading', action='store_true',
                             help="If set, saves/loads pre-trained model weights based on hyperparameters.")
+
+    # A YAML file can switch any store_true option on, so each one needs a
+    # command-line way to switch it back off. Without these, a configuration
+    # that enables caching could not be overridden without editing the file.
+    _add_negation_flags(
+        parser,
+        [
+            'save_results',
+            'visualize',
+            'use_template',
+            'use_augmentation',
+            'use_deployment_evaluation',
+            'outlier_filtering_on_train',
+            'outlier_filtering_on_test',
+            'intelligent_data_loading',
+            'intelligent_weight_loading',
+        ],
+    )
     misc_group.add_argument(
         '--cache_dir',
         type=str,
@@ -1234,14 +1433,7 @@ def main():
     # ==========================================
     # 1. MODEL SELECTION
     # ==========================================
-    model_mapping = {
-        'deepecg': DeepECG,
-        'resnet1d': ResNet1D,
-        'rnn': RNN_ECG,
-        'hybrid': HybridCNNLSTM,
-        'transformer': ECGTransformer
-    }
-    selected_model_class = model_mapping[args.model.lower()]
+    selected_model_class = MODEL_REGISTRY[args.model.lower()]
 
     # ==========================================
     # 2. DATASET INSTANTIATION
@@ -1250,11 +1442,12 @@ def main():
     loader_kwargs = {
         'data_split_mode': args.data_split_mode,
         'num_beats_to_merge': args.num_beats_to_merge,
+        'beat_merge_stride': args.beat_merge_stride,
         'preprocessing_config': (
             args.preprocessing_parameters
         ),
     }
-    
+
     if args.train_sessions: loader_kwargs['train_sessions'] = args.train_sessions
     if args.enroll_sessions: loader_kwargs['enroll_sessions'] = args.enroll_sessions
     if args.probe_sessions: loader_kwargs['probe_sessions'] = args.probe_sessions
@@ -1289,6 +1482,10 @@ def main():
             loader_kwargs[
                 "test_parts"
             ] = args.test_parts
+
+        loader_kwargs[
+            "temporal_guard_minutes"
+        ] = args.temporal_guard_minutes
 
     print(f"\n[INFO] Initializing {args.dataset.upper()} Dataset...")
     
@@ -1515,6 +1712,7 @@ def main():
                 num_pairs=args.num_pairs,
                 sampling_mode=args.sampling_mode,
                 use_deployment_evaluation=args.use_deployment_evaluation,
+                target_fars=args.target_fars,
                 sqi_scores=args.sqi_method,
                 **common_args
             )
@@ -1537,6 +1735,7 @@ def main():
                 num_pairs=args.num_pairs,
                 sampling_mode=args.sampling_mode,
                 use_deployment_evaluation=args.use_deployment_evaluation,
+                target_fars=args.target_fars,
                 sqi_scores=args.sqi_method,
                 **common_args
             )
@@ -1558,6 +1757,7 @@ def main():
                 num_pairs=args.num_pairs,
                 sampling_mode=args.sampling_mode,
                 use_deployment_evaluation=args.use_deployment_evaluation,
+                target_fars=args.target_fars,
                 sqi_train=args.sqi_method,
                 sqi_test=args.sqi_method,
                 **common_args
@@ -1582,6 +1782,7 @@ def main():
                 num_pairs=args.num_pairs,
                 sampling_mode=args.sampling_mode,
                 use_deployment_evaluation=args.use_deployment_evaluation,
+                target_fars=args.target_fars,
                 sqi_s1=args.sqi_method,
                 sqi_s2=args.sqi_method,
                 **common_args

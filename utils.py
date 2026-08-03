@@ -1690,6 +1690,32 @@ _CACHE_RELEVANT_LOADER_ATTRIBUTES = (
 )
 
 
+# Loader options that are elided from the cache identity while they hold the
+# neutral default listed here. This keeps cache entries valid across the
+# introduction of a new option, while a deliberate non-default setting still
+# forces regeneration.
+_DEFAULT_ELIDED_LOADER_ATTRIBUTES = {
+    "beat_merge_stride": 1,
+    "temporal_guard_minutes": 0.0,
+}
+
+
+def _is_neutral_default(value, neutral_default):
+    """
+    Return True when a loader option still carries its neutral default.
+
+    Booleans are compared by identity of type because ``True == 1`` would
+    otherwise elide a genuinely different setting.
+    """
+    if isinstance(value, bool) != isinstance(neutral_default, bool):
+        return False
+
+    try:
+        return bool(value == neutral_default)
+    except (TypeError, ValueError):
+        return False
+
+
 def _build_loader_cache_identity(loader):
     """
     Build the effective dataset-loader identity used by data and weight caches.
@@ -1746,6 +1772,28 @@ def _build_loader_cache_identity(loader):
                     attribute_name,
                 )
             )
+
+    for (
+        attribute_name,
+        neutral_default,
+    ) in _DEFAULT_ELIDED_LOADER_ATTRIBUTES.items():
+        if not hasattr(loader, attribute_name):
+            continue
+
+        attribute_value = getattr(
+            loader,
+            attribute_name,
+        )
+
+        if _is_neutral_default(
+            attribute_value,
+            neutral_default,
+        ):
+            continue
+
+        loader_settings[attribute_name] = copy.deepcopy(
+            attribute_value
+        )
 
     return {
         "loader_class": type(loader).__name__,

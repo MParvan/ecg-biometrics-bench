@@ -87,7 +87,7 @@ class StructuredOutputLoggingTests(
                         accuracy
                     ),
                     "Aggregate Metric": (
-                        "0.9000 ? 0.0200"
+                        "0.9000 ± 0.0200"
                     ),
                 },
                 data_stats={

@@ -1,0 +1,68 @@
+# ============================================================================
+# Dataset: PTB
+# Paper protocol label: Single cross session
+# Paper setting label: Closed set
+# Framework terminology: Closed set
+# Executable task: 5 (identification)
+# Configuration target: corrected revised-paper protocol
+# Run with: python main.py --config "path/to/this_file.yaml"
+# ============================================================================
+dataset: ptb
+task: 5
+data_split_mode: single-cross-session
+num_beats_to_merge: 1
+train_sessions: null
+enroll_sessions: null
+probe_sessions: null
+session_for_single_session_evaluation: null
+single_segment_range: null
+train_parts: null
+enrol_parts: null
+test_parts: null
+model: deepecg
+epochs: 250
+batch_size: 256
+lr: 0.001
+test_split: 0.2
+val_split: 0.0
+seed: 42
+n_runs: 5
+preprocessing_parameters:
+  mode: beat
+  pre_s: 0.2
+  post_s: 0.4
+  resample_len: null
+  window_s: 5.0
+  stride_s: 1.0
+  rpeak_method: pantompkins
+  align_peak: true
+  filter_method: butter
+  filter_parameters:
+    low: 0.5
+    high: 40.0
+    order: 4
+  normalization_method: zscore
+use_augmentation: false
+augmentation_method: gaussian
+augmentation_copies: 1
+augmentation_parameters: {}
+use_template: true
+template_fusion_method: mean
+template_size: null
+probe_fusion_size: 3
+matching_method: cosine
+num_pairs: 10000
+sampling_mode: balanced
+use_deployment_evaluation: false
+outlier_filtering_on_train: false
+outlier_filtering_on_test: false
+sqi_method: kurtosis
+sqi_threshold: 0.05
+sqi_keep_pct: 0.8
+device: auto
+visualize: false
+save_results: true
+intelligent_data_loading: true
+intelligent_weight_loading: true
+cache_dir: ../ecg-biometrics-artifacts/cache
+results_dir: ../ecg-biometrics-artifacts/paper_results/ptb/single_cross_session/closed_set/task05_identification

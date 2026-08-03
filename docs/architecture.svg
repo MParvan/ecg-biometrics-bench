@@ -1,0 +1,206 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1180 1000" width="1180" height="1000" font-family="Helvetica, Arial, sans-serif">
+  <title>ECG-biometrics-bench system architecture</title>
+  <desc>Module-level architecture of the ECG-biometrics-bench framework, from configuration through dataset ingestion, partitioning, representation learning, biometric evaluation, and reporting.</desc>
+
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#1a1a1a"/>
+    </marker>
+    <marker id="arrowDashed" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#666666"/>
+    </marker>
+    <style>
+      .stage      { fill: #f4f6f8; stroke: #9aa5b1; stroke-width: 1.5; }
+      .stageLabel { font-size: 17px; font-weight: bold; fill: #1a1a1a; }
+      .mod        { fill: #ffffff; stroke: #3d4b5c; stroke-width: 1.6; }
+      .modAccent  { fill: #e4ebf2; stroke: #3d4b5c; stroke-width: 1.6; }
+      .modOut     { fill: #eef3ea; stroke: #4a5d3a; stroke-width: 1.6; }
+      .modName    { font-size: 15px; font-weight: bold; fill: #1a1a1a; }
+      .modDesc    { font-size: 13px; fill: #3a3a3a; }
+      .flow       { stroke: #1a1a1a; stroke-width: 2.2; fill: none; marker-end: url(#arrow); }
+      .side       { stroke: #666666; stroke-width: 1.8; fill: none; stroke-dasharray: 6 4; marker-end: url(#arrowDashed); }
+      .sideLabel  { font-size: 12px; fill: #555555; font-style: italic; }
+      .guard      { fill: #fdf3e7; stroke: #9c6a26; stroke-width: 1.6; }
+      .guardName  { font-size: 14px; font-weight: bold; fill: #7a4f16; }
+    </style>
+  </defs>
+
+  <rect x="0" y="0" width="1180" height="1000" fill="#ffffff"/>
+
+  <!-- ============ 1. CONFIGURATION ============ -->
+  <rect class="stage" x="30" y="24" width="800" height="112" rx="8"/>
+  <text class="stageLabel" x="46" y="48">1 · Configuration</text>
+
+  <rect class="mod" x="48" y="60" width="228" height="62" rx="5"/>
+  <text class="modName" x="62" y="82">config.yaml</text>
+  <text class="modDesc" x="62" y="102">dataset paths, preprocessing</text>
+  <text class="modDesc" x="62" y="116">defaults</text>
+
+  <rect class="mod" x="292" y="60" width="248" height="62" rx="5"/>
+  <text class="modName" x="306" y="82">configs/paper_reproduction/</text>
+  <text class="modDesc" x="306" y="102">150 executable experiment</text>
+  <text class="modDesc" x="306" y="116">configurations</text>
+
+  <rect class="modAccent" x="556" y="60" width="256" height="62" rx="5"/>
+  <text class="modName" x="570" y="82">main.py</text>
+  <text class="modDesc" x="570" y="102">CLI, argument validation,</text>
+  <text class="modDesc" x="570" y="116">enrollment/probe leakage guards</text>
+
+  <line class="flow" x1="276" y1="91" x2="290" y2="91"/>
+  <line class="flow" x1="540" y1="91" x2="554" y2="91"/>
+
+  <!-- ============ 2. INGESTION ============ -->
+  <rect class="stage" x="30" y="164" width="800" height="140" rx="8"/>
+  <text class="stageLabel" x="46" y="188">2 · Dataset ingestion and standardization</text>
+
+  <rect class="modAccent" x="48" y="200" width="248" height="88" rx="5"/>
+  <text class="modName" x="62" y="222">load_dataset.py</text>
+  <text class="modDesc" x="62" y="242">ECG-ID, PTB, PTB-XL, MIT-BIH,</text>
+  <text class="modDesc" x="62" y="258">NSRDB, Heartprint, CYBHi</text>
+  <text class="modDesc" x="62" y="278">unified loader API</text>
+
+  <rect class="mod" x="312" y="200" width="240" height="88" rx="5"/>
+  <text class="modName" x="326" y="222">Regime mapping protocol</text>
+  <text class="modDesc" x="326" y="242">record-order · session-structured</text>
+  <text class="modDesc" x="326" y="258">· continuous windowing</text>
+  <text class="modDesc" x="326" y="278">→ enrollment / probe partitions</text>
+
+  <rect class="mod" x="568" y="200" width="244" height="88" rx="5"/>
+  <text class="modName" x="582" y="222">preprocessing.py</text>
+  <text class="modDesc" x="582" y="242">R-peak detection, beat</text>
+  <text class="modDesc" x="582" y="258">segmentation, normalization</text>
+  <text class="modName" x="582" y="280">filtering.py</text>
+
+  <line class="flow" x1="296" y1="244" x2="310" y2="244"/>
+  <line class="flow" x1="552" y1="244" x2="566" y2="244"/>
+
+  <!-- ============ 3. PARTITIONING ============ -->
+  <rect class="stage" x="30" y="332" width="800" height="118" rx="8"/>
+  <text class="stageLabel" x="46" y="356">3 · Partitioning and augmentation</text>
+
+  <rect class="modAccent" x="48" y="368" width="380" height="66" rx="5"/>
+  <text class="modName" x="62" y="390">run.py — partition construction</text>
+  <text class="modDesc" x="62" y="410">subject-cohort split (closed-set vs subject-disjoint),</text>
+  <text class="modDesc" x="62" y="426">enrollment/probe embedding split</text>
+
+  <rect class="mod" x="444" y="368" width="368" height="66" rx="5"/>
+  <text class="modName" x="458" y="390">data_augmentation.py</text>
+  <text class="modDesc" x="458" y="410">8 methods, applied only to the final training</text>
+  <text class="modDesc" x="458" y="426">partition — never to gallery or probe samples</text>
+
+  <line class="flow" x1="428" y1="401" x2="442" y2="401"/>
+
+  <!-- ============ 4. LEARNING ============ -->
+  <rect class="stage" x="30" y="478" width="800" height="118" rx="8"/>
+  <text class="stageLabel" x="46" y="502">4 · Representation learning</text>
+
+  <rect class="mod" x="48" y="514" width="380" height="66" rx="5"/>
+  <text class="modName" x="62" y="536">models.py</text>
+  <text class="modDesc" x="62" y="556">DeepECG · ResNet1D · CNN-LSTM · Transformer</text>
+  <text class="modDesc" x="62" y="572">· RNN · 2D ResNet-18</text>
+
+  <rect class="modAccent" x="444" y="514" width="368" height="66" rx="5"/>
+  <text class="modName" x="458" y="536">run.py — 8 evaluation regimes</text>
+  <text class="modDesc" x="458" y="556">{closed-set, subject-disjoint} ×</text>
+  <text class="modDesc" x="458" y="572">{same-session, cross-session} × {ID, verification}</text>
+
+  <line class="flow" x1="442" y1="547" x2="430" y2="547"/>
+
+  <!-- ============ 5. EVALUATION ============ -->
+  <rect class="stage" x="30" y="624" width="800" height="140" rx="8"/>
+  <text class="stageLabel" x="46" y="648">5 · Biometric evaluation</text>
+
+  <rect class="modAccent" x="48" y="660" width="248" height="88" rx="5"/>
+  <text class="modName" x="62" y="682">utils.py</text>
+  <text class="modDesc" x="62" y="702">template fusion (mean, median,</text>
+  <text class="modDesc" x="62" y="718">geometric median, …), score</text>
+  <text class="modDesc" x="62" y="738">matrices, pair generation</text>
+
+  <rect class="modOut" x="312" y="660" width="240" height="88" rx="5"/>
+  <text class="modName" x="326" y="682">Identification</text>
+  <text class="modDesc" x="326" y="702">Rank-1, Rank-5</text>
+  <text class="modDesc" x="326" y="722">complete CMC curve</text>
+
+  <rect class="modOut" x="568" y="660" width="244" height="88" rx="5"/>
+  <text class="modName" x="582" y="682">Verification</text>
+  <text class="modDesc" x="582" y="702">EER, AUC, d′, TAR@FAR at</text>
+  <text class="modDesc" x="582" y="722">multiple operating points,</text>
+  <text class="modDesc" x="582" y="742">ROC and DET curves</text>
+
+  <line class="flow" x1="296" y1="704" x2="310" y2="704"/>
+  <line class="flow" x1="552" y1="704" x2="566" y2="704"/>
+
+  <!-- ============ 6. REPORTING ============ -->
+  <rect class="stage" x="30" y="792" width="800" height="176" rx="8"/>
+  <text class="stageLabel" x="46" y="816">6 · Reporting and analysis</text>
+
+  <rect class="modOut" x="48" y="828" width="248" height="82" rx="5"/>
+  <text class="modName" x="62" y="850">Structured JSONL + logs</text>
+  <text class="modDesc" x="62" y="870">per-seed metrics, confidence</text>
+  <text class="modDesc" x="62" y="886">intervals, runtime profile,</text>
+  <text class="modDesc" x="62" y="902">software revision, causality audit</text>
+
+  <rect class="mod" x="312" y="828" width="240" height="82" rx="5"/>
+  <text class="modName" x="326" y="850">scripts/</text>
+  <text class="modDesc" x="326" y="870">reproduce_tables.py</text>
+  <text class="modDesc" x="326" y="886">statistical_comparisons.py</text>
+  <text class="modDesc" x="326" y="902">build_artifact_manifest.py</text>
+
+  <rect class="guard" x="568" y="828" width="244" height="82" rx="5"/>
+  <text class="guardName" x="582" y="850">Verification scripts</text>
+  <text class="modDesc" x="582" y="870">audit_temporal_causality.py</text>
+  <text class="modDesc" x="582" y="886">run_augmentation_ablation.py</text>
+  <text class="modDesc" x="582" y="902">make_figures.py</text>
+
+  <line class="flow" x1="296" y1="869" x2="310" y2="869"/>
+  <line class="flow" x1="552" y1="869" x2="566" y2="869"/>
+
+  <text class="modDesc" x="48" y="940">Reported tables (CSV / Markdown), publication figures with paired significance annotation,</text>
+  <text class="modDesc" x="48" y="957">and a release manifest naming every weight file, seed, and the table row it supports.</text>
+
+  <!-- ============ VERTICAL STAGE FLOW ============ -->
+  <line class="flow" x1="430" y1="136" x2="430" y2="162"/>
+  <line class="flow" x1="430" y1="304" x2="430" y2="330"/>
+  <line class="flow" x1="430" y1="450" x2="430" y2="476"/>
+  <line class="flow" x1="430" y1="596" x2="430" y2="622"/>
+  <line class="flow" x1="430" y1="764" x2="430" y2="790"/>
+
+  <!-- ============ CROSS-CUTTING: CACHE ============ -->
+  <rect class="mod" x="878" y="200" width="272" height="104" rx="5"/>
+  <text class="modName" x="892" y="222">utils.CacheManager</text>
+  <text class="modDesc" x="892" y="243">content-addressed cache for</text>
+  <text class="modDesc" x="892" y="259">preprocessed arrays and trained</text>
+  <text class="modDesc" x="892" y="275">weights; identity covers loader,</text>
+  <text class="modDesc" x="892" y="291">preprocessing, and training config</text>
+
+  <path class="side" d="M 830 236 L 876 236"/>
+  <path class="side" d="M 876 268 L 830 268"/>
+  <text class="sideLabel" x="838" y="228">write</text>
+  <text class="sideLabel" x="838" y="288">read</text>
+
+  <path class="side" d="M 1014 304 L 1014 547 L 816 547"/>
+  <text class="sideLabel" x="1022" y="430">weight reuse</text>
+
+  <!-- ============ CROSS-CUTTING: LEAKAGE CONTROLS ============ -->
+  <rect class="guard" x="878" y="368" width="272" height="140" rx="5"/>
+  <text class="guardName" x="892" y="390">Leakage controls</text>
+  <text class="modDesc" x="892" y="412">· enrollment/probe minute windows</text>
+  <text class="modDesc" x="892" y="428">  validated disjoint (MIT-BIH, NSRDB)</text>
+  <text class="modDesc" x="892" y="448">· enrollment/probe sessions validated</text>
+  <text class="modDesc" x="892" y="464">  disjoint (CYBHi, Heartprint)</text>
+  <text class="modDesc" x="892" y="484">· templates built only from recordings</text>
+  <text class="modDesc" x="892" y="500">  preceding the probe</text>
+
+  <path class="side" d="M 876 400 L 830 400"/>
+  <path class="side" d="M 878 438 L 860 438 L 860 91 L 814 91"/>
+
+  <!-- ============ CROSS-CUTTING: REPRODUCIBILITY ============ -->
+  <rect class="mod" x="878" y="660" width="272" height="88" rx="5"/>
+  <text class="modName" x="892" y="682">Determinism</text>
+  <text class="modDesc" x="892" y="703">fixed seed schedule (42–46),</text>
+  <text class="modDesc" x="892" y="719">recorded software environment</text>
+  <text class="modDesc" x="892" y="735">and source revision per run</text>
+
+  <path class="side" d="M 876 704 L 830 704"/>
+  <path class="side" d="M 1014 748 L 1014 869 L 816 869"/>
+</svg>
