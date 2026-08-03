@@ -1,13 +1,14 @@
 name: tests
 
-# Runs on every push and pull request to the long-lived branches, and can be
-# triggered by hand from the Actions tab.
+# Work on a topic branch is covered by its pull request. Listing that branch
+# under `push` as well would run every job twice for the same commit, so the
+# push trigger is limited to the long-lived branches, where it validates the
+# merged result.
 on:
   push:
     branches:
       - main
       - "revision/**"
-      - "feature/**"
   pull_request:
     branches:
       - main
