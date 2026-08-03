@@ -1,8 +1,29 @@
 # ==============================================================================
-# 🫀 ECG BIOMETRICS FRAMEWORK - GLOBAL EXPERIMENT CONFIGURATION
+# ECG BIOMETRICS FRAMEWORK - SELF-CONTAINED EXPERIMENT CONFIGURATION
 # ==============================================================================
 
-# --- 1. CORE MODEL SETTINGS ---
+# --- 1. EXPERIMENT IDENTITY AND DATA ROUTING ---
+# These values make this file directly executable with:
+# python main.py --config experiment_settings.yaml
+dataset: 'ecgid'
+task: 1
+data_split_mode: 'all-available'
+signal_type: 'filtered'
+num_beats_to_merge: 1
+
+# Session-based datasets (HeartPrint and CYBHi).
+train_sessions: null
+enroll_sessions: null
+probe_sessions: null
+session_for_single_session_evaluation: null
+
+# Continuous datasets (MIT-BIH and NSRDB).
+single_segment_range: null
+train_parts: null
+enrol_parts: null
+test_parts: null
+
+# --- 2. CORE MODEL SETTINGS ---
 model: 'deepecg'
 # Available options:
 # - 'deepecg'     : DeepECG CNN architecture (Default, highly effective)
@@ -11,24 +32,64 @@ model: 'deepecg'
 # - 'hybrid'      : CNN-LSTM Hybrid architecture
 # - 'transformer' : ECG Transformer network
 
-# --- 2. TRAINING HYPERPARAMETERS ---
+# --- 3. TRAINING HYPERPARAMETERS ---
 epochs: 150             # Maximum number of training epochs
 batch_size: 256         # Number of ECG signals per training batch
 lr: 0.001               # Learning rate for the Adam optimizer (e.g., 1e-3)
 test_split: 0.2         # Fraction of subjects/data held out for testing (0.0 to 1.0)
-val_split: 0.1          # Validation split used for Verification tasks (ID tasks automatically override this to 0)
+val_split: 0.0          # No validation split by default
 seed: 42                # Random seed for reproducibility across splits and weights
 n_runs: 5               # Number of independent runs (with varying seeds) for robust statistical validation
 
-# --- 3. BIOMETRIC EVALUATION & TEMPLATE SETTINGS ---
+# --- 4. PREPROCESSING OVERRIDES ---
+# These settings make the submitted benchmark preprocessing explicit.
+# They preserve the numerical behaviour used to produce the original tables.
+preprocessing_parameters:
+  mode: 'beat'
+  pre_s: 0.2
+  post_s: 0.4
+  resample_len: null
+  window_s: 5.0
+  stride_s: 1.0
+  rpeak_method: 'pantompkins'
+  align_peak: true
+  filter_method: 'butter'
+  filter_parameters:
+    low: 0.5
+    high: 40.0
+    order: 4
+  normalization_method: 'zscore'
+
+# --- 5. TRAINING-ONLY DATA AUGMENTATION ---
+# Augmentation is applied only after the final training/validation split.
+# Validation, enrollment, gallery, calibration, test, and probe samples remain unchanged.
+use_augmentation: false
+augmentation_method: 'gaussian'
+# Available options:
+# - 'gaussian'
+# - 'amplitude'
+# - 'timeshift'
+# - 'baseline_wander'
+# - 'time_warp'
+# - 'cutout'
+# - 'emg_noise'
+# - 'istft_augment'
+augmentation_copies: 1
+# Optional method-specific settings. Empty braces use the method defaults.
+# Gaussian example: {std: 0.02, relative: true}
+augmentation_parameters: {}
+
+# --- 6. BIOMETRIC EVALUATION & TEMPLATE SETTINGS ---
 use_template: true      # true: Extract features for Gallery/Probe matching. false: Standard Softmax classification
 template_fusion_method: 'mean'
 # Available options:
-# - 'mean'          : Averages embeddings (Standard, fast)
-# - 'median'        : Median of embeddings (Robust to outliers)
-# - 'trimmed_mean'  : Removes top/bottom % before averaging
-# - 'representative': Selects the single beat closest to the class mean
-# - 'none'          : Keeps all individual beats in the gallery (no fusion)
+# - 'mean'             : Arithmetic mean of enrollment embeddings
+# - 'median'           : Coordinate-wise median
+# - 'trimmed_mean'     : Coordinate-wise 10% trimmed mean
+# - 'representative'   : Average of the most centrally consistent 50% of embeddings
+# - 'soft_centrality'  : Cosine-centrality-weighted average
+# - 'geometric_median' : Iterative geometric median
+# - 'none'             : Keep all enrollment embeddings without fusion
 
 template_size: null     # Number of beats to form the gallery template (e.g., 1, 5, or null/None to use all available)
 probe_fusion_size: 3    # Number of consecutive probe beats to average before searching the gallery (Score-Level Fusion)
@@ -41,7 +102,7 @@ matching_method: 'cosine'
 # - 'correlation' : Pearson correlation distance
 
 num_pairs: 10000        # Number of Genuine/Impostor pairs to generate for Verification evaluation
-sampling_mode: 'balanced'
+sampling_mode: 'all'
 # Available options:
 # - 'balanced'    : 50% Genuine, 50% Impostor pairs
 # - 'all'         : Exhaustive pairing of all possible combinations
@@ -49,14 +110,18 @@ sampling_mode: 'balanced'
 
 use_deployment_evaluation: false # true: Calculates Global Threshold on Validation set, applies to Test set
 
-# --- 4. SIGNAL QUALITY & OUTLIER FILTERING ---
+# --- 7. SIGNAL QUALITY & OUTLIER FILTERING ---
 outlier_filtering_on_train: false  # true: Filters noisy beats during representation learning/enrollment
 outlier_filtering_on_test: false   # true: Filters noisy beats from probes before matching
 sqi_method: 'kurtosis'             # SQI calculation metric (e.g., 'kurtosis')
 sqi_threshold: 0.05                # Absolute minimum SQI score required to keep a beat (0.0 to 1.0)
 sqi_keep_pct: 0.80                 # Top percentage of beats to keep per subject after filtering (e.g., 0.80 = 80%)
 
-# --- 5. HARDWARE & LOGGING ---
+# --- 8. HARDWARE & LOGGING ---
 device: 'auto'                  # 'cuda' (GPU), 'cpu', or 'auto' (detects available hardware)
 visualize: false                # true: Generates t-SNE scatter plots and confusion matrices (disable for multi-run loops)
 save_results_and_settings: true # true: Automatically writes params and metrics to .txt logs
+intelligent_data_loading: false   # true: cache preprocessed dataset arrays
+intelligent_weight_loading: false # true: cache trained model weights
+cache_dir: '../ecg-biometrics-artifacts/cache'
+results_dir: '../ecg-biometrics-artifacts/results'

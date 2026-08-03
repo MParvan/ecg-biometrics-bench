@@ -1,0 +1,75 @@
+%% ECG-biometrics-bench module architecture.
+%% Rendered form: docs/architecture.svg
+%% Edges follow the actual import and data-flow relationships in the source.
+flowchart TB
+    subgraph CFG["1 - Configuration"]
+        direction LR
+        A1["config.yaml<br/>dataset paths, defaults"]
+        A2["configs/paper_reproduction/<br/>150 experiment YAMLs"]
+        A3["main.py<br/>CLI, validation, leakage guards"]
+        A1 --> A3
+        A2 --> A3
+    end
+
+    subgraph ING["2 - Dataset ingestion and standardization"]
+        direction LR
+        B1["load_dataset.py<br/>7 unified loaders"]
+        B2["Regime mapping protocol<br/>record-order / session / continuous"]
+        B3["preprocessing.py<br/>filter, segment, normalize"]
+        B4["filtering.py<br/>bandpass, baseline removal"]
+        B1 --> B2
+        B1 --> B3
+        B3 --> B4
+    end
+
+    subgraph PART["3 - Partitioning and augmentation"]
+        direction LR
+        C1["run.py<br/>subject-cohort and sample partitioning"]
+        C2["data_augmentation.py<br/>training partition only"]
+        C1 --> C2
+    end
+
+    subgraph LEARN["4 - Representation learning"]
+        direction LR
+        D1["models.py<br/>DeepECG, ResNet1D, CNN-LSTM,<br/>Transformer, RNN"]
+        D2["run.py training loop<br/>8 evaluation regimes"]
+        D2 --> D1
+    end
+
+    subgraph EVAL["5 - Biometric evaluation"]
+        direction LR
+        E1["utils.py<br/>template fusion, matching"]
+        E2["Identification<br/>Rank-k, CMC"]
+        E3["Verification<br/>EER, AUC, d-prime, TAR@FAR, ROC/DET"]
+        E1 --> E2
+        E1 --> E3
+    end
+
+    subgraph REP["6 - Reporting and analysis"]
+        direction LR
+        F1["Structured JSONL + text logs<br/>metrics, seeds, runtime, environment"]
+        F2["scripts/reproduce_tables.py"]
+        F3["scripts/statistical_comparisons.py"]
+        F4["scripts/audit_temporal_causality.py"]
+        F5["scripts/build_artifact_manifest.py"]
+        F6["scripts/run_augmentation_ablation.py"]
+        F1 --> F2
+        F1 --> F3
+        F1 --> F5
+    end
+
+    CACHE["utils.CacheManager<br/>content-addressed arrays and weights"]
+
+    CFG --> ING
+    ING --> PART
+    PART --> LEARN
+    LEARN --> EVAL
+    EVAL --> REP
+
+    ING -.-> CACHE
+    LEARN -.-> CACHE
+    CACHE -.-> ING
+    CACHE -.-> LEARN
+
+    F4 -.-> ING
+    F6 -.-> PART

@@ -1,0 +1,18 @@
+# Optional dependencies for the two-dimensional time-frequency
+# representations in representation.py.
+#
+#   pip install -r requirements-representations.txt
+#
+# These are not needed to run any benchmark protocol. The Representation
+# class imports each one lazily, inside the method that uses it, so the core
+# pipeline runs without them and only the corresponding representation
+# raises if a package is absent.
+#
+# They are kept separate because stockwell builds a C extension and requires
+# a compiler toolchain, and tftb is unmaintained. A failure to build either
+# would otherwise abort installation of the entire framework.
+
+librosa==0.11.0     # Mel-spectrogram
+pyts==0.13.0        # Gramian angular fields, recurrence plots
+stockwell==1.2      # S-transform
+tftb==0.2.0         # Wigner-Ville distribution

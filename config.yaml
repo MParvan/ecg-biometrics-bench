@@ -9,14 +9,22 @@ datasets:
     url: "https://physionet.org/content/ecgiddb/get-zip/1.0.0/"
     sample_length: 20000
     fs: 500
-    signal_type: "filtered"        # Options: "filtered", "noisy", "both"
+    signal_type: "filtered"        # Options: "raw", "filtered"
     preprocessing:
+      mode: "beat"
       pre_s: 0.2
       post_s: 0.4
-      bandpass: true
-      lowcut: 0.5
-      highcut: 40.0
-      normalize: true
+      resample_len: null
+      window_s: 5.0
+      stride_s: 1.0
+      rpeak_method: "pantompkins"
+      align_peak: true
+      filter_method: "butter"
+      filter_parameters:
+        low: 0.5
+        high: 40.0
+        order: 4
+      normalization_method: "zscore"
 
   ptb:
     root_dir: "ptb"
@@ -25,12 +33,20 @@ datasets:
     sample_length: null            # Varies
     fs: 1000
     preprocessing:
+      mode: "beat"
       pre_s: 0.2
       post_s: 0.4
-      bandpass: true
-      lowcut: 0.5
-      highcut: 40.0
-      normalize: true
+      resample_len: null
+      window_s: 5.0
+      stride_s: 1.0
+      rpeak_method: "pantompkins"
+      align_peak: true
+      filter_method: "butter"
+      filter_parameters:
+        low: 0.5
+        high: 40.0
+        order: 4
+      normalization_method: "zscore"
 
   mitbih:
     root_dir: "mitbih"
@@ -39,12 +55,20 @@ datasets:
     sample_length: 650000
     fs: 360
     preprocessing:
+      mode: "beat"
       pre_s: 0.2
       post_s: 0.4
-      bandpass: true
-      lowcut: 0.5
-      highcut: 40.0
-      normalize: true
+      resample_len: null
+      window_s: 5.0
+      stride_s: 1.0
+      rpeak_method: "pantompkins"
+      align_peak: true
+      filter_method: "butter"
+      filter_parameters:
+        low: 0.5
+        high: 40.0
+        order: 4
+      normalization_method: "zscore"
 
   nsrdb:
     root_dir: "nsrdb"
@@ -53,12 +77,20 @@ datasets:
     sample_length: null            # Varies (24h)
     fs: 128
     preprocessing:
+      mode: "beat"
       pre_s: 0.2
       post_s: 0.4
-      bandpass: true
-      lowcut: 0.5
-      highcut: 40.0
-      normalize: true
+      resample_len: null
+      window_s: 5.0
+      stride_s: 1.0
+      rpeak_method: "pantompkins"
+      align_peak: true
+      filter_method: "butter"
+      filter_parameters:
+        low: 0.5
+        high: 40.0
+        order: 4
+      normalization_method: "zscore"
 
   ptbxl:
     root_dir: "ptbxl"
@@ -67,12 +99,20 @@ datasets:
     sample_length: 5000
     fs: 500
     preprocessing:
+      mode: "beat"
       pre_s: 0.2
       post_s: 0.4
-      bandpass: true
-      lowcut: 0.5
-      highcut: 40.0
-      normalize: true
+      resample_len: null
+      window_s: 5.0
+      stride_s: 1.0
+      rpeak_method: "pantompkins"
+      align_peak: true
+      filter_method: "butter"
+      filter_parameters:
+        low: 0.5
+        high: 40.0
+        order: 4
+      normalization_method: "zscore"
 
   heartprint:
     root_dir: "heartprint"
@@ -82,12 +122,20 @@ datasets:
     fs: 250
     sessions: ["Session-1", "Session-2", "Session-3L", "Session-3R"]
     preprocessing:
+      mode: "beat"
       pre_s: 0.2
       post_s: 0.4
-      bandpass: true
-      lowcut: 0.5
-      highcut: 40.0
-      normalize: true
+      resample_len: null
+      window_s: 5.0
+      stride_s: 1.0
+      rpeak_method: "pantompkins"
+      align_peak: true
+      filter_method: "butter"
+      filter_parameters:
+        low: 0.5
+        high: 40.0
+        order: 4
+      normalization_method: "zscore"
 
   cybhi:
     root_dir: "cybhi"
@@ -97,17 +145,25 @@ datasets:
     fs: 1000
     ecg_column: 3
     preprocessing:
+      mode: "beat"
       pre_s: 0.2
       post_s: 0.4
-      bandpass: true
-      lowcut: 0.5
-      highcut: 40.0
-      normalize: true
+      resample_len: null
+      window_s: 5.0
+      stride_s: 1.0
+      rpeak_method: "pantompkins"
+      align_peak: true
+      filter_method: "butter"
+      filter_parameters:
+        low: 0.5
+        high: 40.0
+        order: 4
+      normalization_method: "zscore"
 
 training_defaults:
   batch_size: 64
   epochs: 30
   lr: 1e-3
-  val_split: 0.2
+  val_split: 0.0
   crossvalidation: false
   n_folds: 5

@@ -1,175 +1,986 @@
-# data_augmentation.py
 import numpy as np
-from scipy.signal import stft, istft, butter, lfilter
+from scipy.signal import (
+    butter,
+    istft,
+    lfilter,
+    stft,
+)
+
 
 class ECGAugmentation:
     """
-    Robust ECG signal augmentation pipeline.
-    Expects input shape: (num_beats, length)
+    Controlled augmentation methods for one-dimensional ECG segments.
+
+    Input signals are represented as a two-dimensional array with shape:
+
+        (number_of_segments, signal_length)
+
+    A one-dimensional signal is accepted and converted to a single-item
+    batch. Every augmentation returns a float32 array and preserves the
+    number and length of the input segments.
     """
 
-    def __init__(self):
-        pass
+    SUPPORTED_METHODS = (
+        "gaussian",
+        "amplitude",
+        "timeshift",
+        "baseline_wander",
+        "time_warp",
+        "cutout",
+        "emg_noise",
+        "istft_augment",
+    )
 
-    def gaussian(self, beats: np.ndarray, std: float = 0.01, relative: bool = True) -> np.ndarray:
-        """Add zero-mean Gaussian noise (simulates thermal/sensor noise)."""
-        beats = np.asarray(beats, dtype=np.float32)
-        if beats.size == 0: return beats
+    def __init__(self, seed=None):
+        """
+        Create an ECG augmentation utility.
+
+        Args:
+            seed (int, optional):
+                Local random seed. When omitted, NumPy's global random
+                state is used, allowing the framework-level random seed
+                to control augmentation reproducibility.
+        """
+        if seed is not None:
+            if isinstance(
+                seed,
+                (
+                    bool,
+                    np.bool_,
+                ),
+            ) or not isinstance(
+                seed,
+                (
+                    int,
+                    np.integer,
+                ),
+            ):
+                raise ValueError(
+                    "seed must be an integer or None."
+                )
+
+            seed = int(seed)
+
+        self.seed = seed
+
+        self._rng = (
+            np.random.RandomState(seed)
+            if seed is not None
+            else None
+        )
+
+    def _get_rng(self):
+        """
+        Return either the local or global NumPy random generator.
+        """
+        if self._rng is not None:
+            return self._rng
+
+        return np.random
+
+    def _ensure_2d(self, signals):
+        """
+        Convert input signals to a validated float32 batch.
+        """
+        signals = np.asarray(
+            signals,
+            dtype=np.float32,
+        )
+
+        if signals.ndim == 1:
+            signals = signals[
+                np.newaxis,
+                :
+            ]
+
+        if signals.ndim != 2:
+            raise ValueError(
+                "ECG augmentation expects a one-dimensional "
+                "signal or a two-dimensional signal batch."
+            )
+
+        return signals
+
+    @staticmethod
+    def _validate_non_negative(
+        value,
+        parameter_name,
+    ):
+        """
+        Validate a finite numeric value greater than or equal to zero.
+        """
+        if isinstance(
+            value,
+            (
+                bool,
+                np.bool_,
+            ),
+        ):
+            raise ValueError(
+                f"{parameter_name} must be a non-negative number."
+            )
+
+        try:
+            value = float(value)
+        except (
+            TypeError,
+            ValueError,
+        ) as error:
+            raise ValueError(
+                f"{parameter_name} must be a non-negative number."
+            ) from error
+
+        if (
+            not np.isfinite(value)
+            or value < 0.0
+        ):
+            raise ValueError(
+                f"{parameter_name} must be a non-negative number."
+            )
+
+        return value
+
+    @staticmethod
+    def _validate_positive_integer(
+        value,
+        parameter_name,
+        allow_zero=False,
+    ):
+        """
+        Validate an integer parameter.
+        """
+        if isinstance(
+            value,
+            (
+                bool,
+                np.bool_,
+            ),
+        ) or not isinstance(
+            value,
+            (
+                int,
+                np.integer,
+            ),
+        ):
+            requirement = (
+                "a non-negative integer"
+                if allow_zero
+                else "a positive integer"
+            )
+
+            raise ValueError(
+                f"{parameter_name} must be {requirement}."
+            )
+
+        value = int(value)
+
+        minimum_value = (
+            0
+            if allow_zero
+            else 1
+        )
+
+        if value < minimum_value:
+            requirement = (
+                "a non-negative integer"
+                if allow_zero
+                else "a positive integer"
+            )
+
+            raise ValueError(
+                f"{parameter_name} must be {requirement}."
+            )
+
+        return value
+
+    def apply(
+        self,
+        signals,
+        method,
+        **kwargs,
+    ):
+        """
+        Apply one named augmentation operation.
+
+        Args:
+            signals (np.ndarray):
+                ECG signal or signal batch.
+            method (str):
+                Augmentation method name.
+            **kwargs:
+                Method-specific parameters.
+
+        Returns:
+            np.ndarray:
+                Augmented float32 ECG batch.
+        """
+        if not isinstance(
+            method,
+            str,
+        ):
+            raise ValueError(
+                "method must be a string."
+            )
+
+        normalized_method = (
+            method
+            .strip()
+            .lower()
+            .replace("-", "_")
+            .replace(" ", "_")
+        )
+
+        aliases = {
+            "time_shift": "timeshift",
+            "baseline": "baseline_wander",
+            "warp": "time_warp",
+            "emg": "emg_noise",
+            "istft": "istft_augment",
+        }
+
+        normalized_method = aliases.get(
+            normalized_method,
+            normalized_method,
+        )
+
+        methods = {
+            "gaussian": self.gaussian,
+            "amplitude": self.amplitude,
+            "timeshift": self.timeshift,
+            "baseline_wander": self.baseline_wander,
+            "time_warp": self.time_warp,
+            "cutout": self.cutout,
+            "emg_noise": self.emg_noise,
+            "istft_augment": self.istft_augment,
+        }
+
+        if normalized_method not in methods:
+            raise ValueError(
+                "Unknown augmentation method "
+                f"{method!r}. Supported methods are: "
+                f"{', '.join(self.SUPPORTED_METHODS)}."
+            )
+
+        return methods[
+            normalized_method
+        ](
+            signals,
+            **kwargs,
+        )
+
+    def gaussian(
+        self,
+        beats,
+        std=0.01,
+        relative=True,
+    ):
+        """
+        Add zero-mean Gaussian sensor noise.
+        """
+        beats = self._ensure_2d(
+            beats
+        )
+
+        std = self._validate_non_negative(
+            std,
+            "std",
+        )
+
+        if not isinstance(
+            relative,
+            (
+                bool,
+                np.bool_,
+            ),
+        ):
+            raise ValueError(
+                "relative must be Boolean."
+            )
+
+        if beats.size == 0:
+            return beats.copy()
+
+        rng = self._get_rng()
 
         if relative:
-            sig_std = beats.std(axis=1, keepdims=True) + 1e-8
-            noise = np.random.randn(*beats.shape).astype(np.float32) * (std * sig_std)
+            signal_std = (
+                beats.std(
+                    axis=1,
+                    keepdims=True,
+                )
+                + 1e-8
+            )
+
+            noise_scale = (
+                std * signal_std
+            )
         else:
-            noise = np.random.randn(*beats.shape).astype(np.float32) * std
+            noise_scale = std
 
-        return beats + noise
+        noise = rng.normal(
+            loc=0.0,
+            scale=1.0,
+            size=beats.shape,
+        ).astype(
+            np.float32
+        )
 
-    def amplitude(self, beats: np.ndarray, scale_range: tuple = (0.9, 1.1)) -> np.ndarray:
-        """Global amplitude scaling (simulates gain differences)."""
-        beats = np.asarray(beats, dtype=np.float32)
-        if beats.size == 0: return beats
-        
-        low, high = scale_range
-        factors = np.random.uniform(low, high, size=(beats.shape[0], 1)).astype(np.float32)
-        return beats * factors
+        augmented = (
+            beats
+            + noise * noise_scale
+        )
 
-    def timeshift(self, beats: np.ndarray, max_shift: int = 10) -> np.ndarray:
-        """
-        Circular time shift. 
-        Note: For segmented beats, ensure padding exists or shift is small 
-        to avoid moving the R-peak to the edge.
-        """
-        beats = np.asarray(beats, dtype=np.float32)
-        if beats.size == 0: return beats
+        return augmented.astype(
+            np.float32,
+            copy=False,
+        )
 
-        N, L = beats.shape
-        out = np.empty_like(beats)
-        for i in range(N):
-            shift = np.random.randint(-max_shift, max_shift + 1)
-            out[i] = np.roll(beats[i], shift)
-        return out
+    def amplitude(
+        self,
+        beats,
+        scale_range=(0.9, 1.1),
+    ):
+        """
+        Apply random global amplitude scaling.
+        """
+        beats = self._ensure_2d(
+            beats
+        )
 
-    def baseline_wander(self, beats, freq=0.3, amp=0.1, fs=250):
-        """Add low-frequency sinusoidal drift (simulates breathing)."""
-        beats = np.asarray(beats, dtype=np.float32)
-        if beats.size == 0: return beats
-        
-        t = np.arange(beats.shape[1]) / fs
-        # Randomize phase for each beat so they don't all drift identically
-        phase = np.random.uniform(0, 2*np.pi, size=(beats.shape[0], 1))
-        drift = amp * np.sin(2 * np.pi * freq * t + phase)
-        return beats + drift
+        if not isinstance(
+            scale_range,
+            (
+                tuple,
+                list,
+            ),
+        ) or len(scale_range) != 2:
+            raise ValueError(
+                "scale_range must contain exactly "
+                "two numeric values."
+            )
 
-    # --- FIXED FUNCTION ---
-    def time_warp(self, beats, sigma=0.2, num_knots=4):
-        """
-        Elastic deformation (Time Warping) using cubic spline interpolation.
-        Simulates Heart Rate Variability within a single beat.
-        """
-        beats = np.asarray(beats, dtype=np.float32)
-        if beats.size == 0: return beats
-        
-        N, L = beats.shape
-        out = np.empty_like(beats)
-        x = np.arange(L)
-        
-        for i in range(N):
-            # Generate random control points (knots) along the time axis
-            # We perturb these knots to stretch/squeeze time
-            knots_x = np.linspace(0, L, num_knots+2)
-            knots_y = knots_x + np.random.normal(0, sigma * (L/num_knots), size=num_knots+2)
-            
-            # Anchor endpoints to prevent shifting the whole beat out of frame
-            knots_y[0] = 0
-            knots_y[-1] = L
-            
-            # Interpolate to find the new time indices
-            # (We use linear here for speed, cubic is better but slower)
-            warped_x = np.interp(x, knots_x, knots_y)
-            
-            # Map original signal to warped time base
-            out[i] = np.interp(x, warped_x, beats[i])
-            
-        return out
+        try:
+            low = float(
+                scale_range[0]
+            )
 
-    # --- NEW FUNCTION: CUTOUT ---
-    def cutout(self, beats: np.ndarray, num_holes: int = 1, length: int = 20) -> np.ndarray:
-        """
-        Randomly zeroes out continuous sections (Masking).
-        Forces model to learn context rather than local features.
-        """
-        beats = np.asarray(beats, dtype=np.float32)
-        if beats.size == 0: return beats
-        
-        N, L = beats.shape
-        out = beats.copy()
-        
-        for i in range(N):
-            for _ in range(num_holes):
-                start = np.random.randint(0, L - length)
-                out[i, start:start+length] = 0.0
-        return out
+            high = float(
+                scale_range[1]
+            )
+        except (
+            TypeError,
+            ValueError,
+        ) as error:
+            raise ValueError(
+                "scale_range must contain exactly "
+                "two numeric values."
+            ) from error
 
-    # --- NEW FUNCTION: EMG NOISE ---
-    def emg_noise(self, beats, fs=250, std=0.05):
-        """
-        Simulates Muscle Artifact (EMG).
-        High-frequency noise (e.g., >20Hz).
-        """
-        beats = np.asarray(beats, dtype=np.float32)
-        if beats.size == 0: return beats
-        
-        N, L = beats.shape
-        noise = np.random.randn(N, L).astype(np.float32)
-        
-        # High-pass filter the noise to simulate EMG
-        b, a = butter(4, 20, btype='high', fs=fs)
-        colored_noise = lfilter(b, a, noise, axis=1)
-        
-        # Scale noise
-        sig_std = beats.std(axis=1, keepdims=True) + 1e-8
-        colored_noise = colored_noise * (std * sig_std / (colored_noise.std(axis=1, keepdims=True) + 1e-8))
-        
-        return beats + colored_noise
+        if (
+            not np.isfinite(low)
+            or not np.isfinite(high)
+            or low <= 0.0
+            or high <= 0.0
+            or low > high
+        ):
+            raise ValueError(
+                "scale_range must satisfy "
+                "0 < low <= high."
+            )
 
-    def _ensure_2d(self, x):
-        if x.ndim == 1: return x[np.newaxis, :]
-        return x
+        if beats.size == 0:
+            return beats.copy()
 
-    def istft_augment(self, x, fs, window="hann", nperseg=128, noverlap=64, noise_std=0.05, log_power=True):
+        rng = self._get_rng()
+
+        factors = rng.uniform(
+            low,
+            high,
+            size=(
+                beats.shape[0],
+                1,
+            ),
+        ).astype(
+            np.float32
+        )
+
+        return (
+            beats * factors
+        ).astype(
+            np.float32,
+            copy=False,
+        )
+
+    def timeshift(
+        self,
+        beats,
+        max_shift=10,
+    ):
         """
-        Spectrogram-based augmentation (Advanced).
-        Adds noise in the Frequency domain while preserving Phase.
+        Apply an independently sampled circular shift to each segment.
         """
-        x = self._ensure_2d(x)
+        beats = self._ensure_2d(
+            beats
+        )
+
+        max_shift = (
+            self._validate_positive_integer(
+                max_shift,
+                "max_shift",
+                allow_zero=True,
+            )
+        )
+
+        if beats.size == 0:
+            return beats.copy()
+
+        if max_shift == 0:
+            return beats.copy()
+
+        rng = self._get_rng()
+
+        augmented = np.empty_like(
+            beats
+        )
+
+        for sample_index in range(
+            len(beats)
+        ):
+            shift = rng.randint(
+                -max_shift,
+                max_shift + 1,
+            )
+
+            augmented[
+                sample_index
+            ] = np.roll(
+                beats[sample_index],
+                shift,
+            )
+
+        return augmented.astype(
+            np.float32,
+            copy=False,
+        )
+
+    def baseline_wander(
+        self,
+        beats,
+        freq=0.3,
+        amp=0.1,
+        fs=250,
+    ):
+        """
+        Add low-frequency sinusoidal baseline drift.
+        """
+        beats = self._ensure_2d(
+            beats
+        )
+
+        freq = self._validate_non_negative(
+            freq,
+            "freq",
+        )
+
+        amp = self._validate_non_negative(
+            amp,
+            "amp",
+        )
+
+        fs = self._validate_non_negative(
+            fs,
+            "fs",
+        )
+
+        if fs <= 0.0:
+            raise ValueError(
+                "fs must be greater than zero."
+            )
+
+        if beats.size == 0:
+            return beats.copy()
+
+        rng = self._get_rng()
+
+        time_axis = (
+            np.arange(
+                beats.shape[1],
+                dtype=np.float32,
+            )
+            / fs
+        )
+
+        phase = rng.uniform(
+            0.0,
+            2.0 * np.pi,
+            size=(
+                beats.shape[0],
+                1,
+            ),
+        )
+
+        drift = (
+            amp
+            * np.sin(
+                2.0
+                * np.pi
+                * freq
+                * time_axis
+                + phase
+            )
+        )
+
+        return (
+            beats + drift
+        ).astype(
+            np.float32,
+            copy=False,
+        )
+
+    def time_warp(
+        self,
+        beats,
+        sigma=0.2,
+        num_knots=4,
+    ):
+        """
+        Apply a smooth monotonic temporal deformation.
+
+        Positive random interval multipliers are used so the warped time
+        coordinates always remain strictly increasing.
+        """
+        beats = self._ensure_2d(
+            beats
+        )
+
+        sigma = self._validate_non_negative(
+            sigma,
+            "sigma",
+        )
+
+        num_knots = (
+            self._validate_positive_integer(
+                num_knots,
+                "num_knots",
+            )
+        )
+
+        if beats.size == 0:
+            return beats.copy()
+
+        signal_length = beats.shape[1]
+
+        if signal_length < 2:
+            return beats.copy()
+
+        rng = self._get_rng()
+
+        augmented = np.empty_like(
+            beats
+        )
+
+        original_time = np.arange(
+            signal_length,
+            dtype=np.float64,
+        )
+
+        control_time = np.linspace(
+            0.0,
+            float(signal_length - 1),
+            num_knots + 2,
+        )
+
+        base_intervals = np.diff(
+            control_time
+        )
+
+        for sample_index in range(
+            len(beats)
+        ):
+            interval_multipliers = np.exp(
+                rng.normal(
+                    loc=0.0,
+                    scale=sigma,
+                    size=len(
+                        base_intervals
+                    ),
+                )
+            )
+
+            warped_intervals = (
+                base_intervals
+                * interval_multipliers
+            )
+
+            warped_control_time = (
+                np.concatenate(
+                    [
+                        np.asarray([0.0]),
+                        np.cumsum(
+                            warped_intervals
+                        ),
+                    ]
+                )
+            )
+
+            warped_control_time *= (
+                float(signal_length - 1)
+                / warped_control_time[-1]
+            )
+
+            warped_time = np.interp(
+                original_time,
+                control_time,
+                warped_control_time,
+            )
+
+            augmented[
+                sample_index
+            ] = np.interp(
+                original_time,
+                warped_time,
+                beats[sample_index],
+            )
+
+        return augmented.astype(
+            np.float32,
+            copy=False,
+        )
+
+    def cutout(
+        self,
+        beats,
+        num_holes=1,
+        length=20,
+    ):
+        """
+        Zero one or more continuous intervals in each segment.
+        """
+        beats = self._ensure_2d(
+            beats
+        )
+
+        num_holes = (
+            self._validate_positive_integer(
+                num_holes,
+                "num_holes",
+                allow_zero=True,
+            )
+        )
+
+        length = (
+            self._validate_positive_integer(
+                length,
+                "length",
+            )
+        )
+
+        if beats.size == 0:
+            return beats.copy()
+
+        signal_length = beats.shape[1]
+
+        if length > signal_length:
+            raise ValueError(
+                "length cannot exceed the ECG signal length."
+            )
+
+        augmented = beats.copy()
+
+        if num_holes == 0:
+            return augmented
+
+        rng = self._get_rng()
+
+        for sample_index in range(
+            len(augmented)
+        ):
+            for _ in range(
+                num_holes
+            ):
+                start = rng.randint(
+                    0,
+                    signal_length
+                    - length
+                    + 1,
+                )
+
+                augmented[
+                    sample_index,
+                    start:
+                    start + length,
+                ] = 0.0
+
+        return augmented.astype(
+            np.float32,
+            copy=False,
+        )
+
+    def emg_noise(
+        self,
+        beats,
+        fs=250,
+        std=0.05,
+    ):
+        """
+        Add high-pass-filtered noise resembling EMG interference.
+        """
+        beats = self._ensure_2d(
+            beats
+        )
+
+        fs = self._validate_non_negative(
+            fs,
+            "fs",
+        )
+
+        std = self._validate_non_negative(
+            std,
+            "std",
+        )
+
+        if fs <= 40.0:
+            raise ValueError(
+                "fs must be greater than 40 Hz for "
+                "the 20 Hz EMG high-pass filter."
+            )
+
+        if beats.size == 0:
+            return beats.copy()
+
+        if std == 0.0:
+            return beats.copy()
+
+        rng = self._get_rng()
+
+        noise = rng.standard_normal(
+            beats.shape
+        ).astype(
+            np.float32
+        )
+
+        numerator, denominator = butter(
+            4,
+            20,
+            btype="high",
+            fs=fs,
+        )
+
+        coloured_noise = lfilter(
+            numerator,
+            denominator,
+            noise,
+            axis=1,
+        )
+
+        signal_std = (
+            beats.std(
+                axis=1,
+                keepdims=True,
+            )
+            + 1e-8
+        )
+
+        noise_std = (
+            coloured_noise.std(
+                axis=1,
+                keepdims=True,
+            )
+            + 1e-8
+        )
+
+        coloured_noise = (
+            coloured_noise
+            * (
+                std
+                * signal_std
+                / noise_std
+            )
+        )
+
+        return (
+            beats + coloured_noise
+        ).astype(
+            np.float32,
+            copy=False,
+        )
+
+    def istft_augment(
+        self,
+        beats,
+        fs,
+        window="hann",
+        nperseg=128,
+        noverlap=64,
+        noise_std=0.05,
+        log_power=True,
+    ):
+        """
+        Perturb STFT magnitude while preserving phase.
+        """
+        beats = self._ensure_2d(
+            beats
+        )
+
+        fs = self._validate_non_negative(
+            fs,
+            "fs",
+        )
+
+        if fs <= 0.0:
+            raise ValueError(
+                "fs must be greater than zero."
+            )
+
+        nperseg = (
+            self._validate_positive_integer(
+                nperseg,
+                "nperseg",
+            )
+        )
+
+        noverlap = (
+            self._validate_positive_integer(
+                noverlap,
+                "noverlap",
+                allow_zero=True,
+            )
+        )
+
+        noise_std = (
+            self._validate_non_negative(
+                noise_std,
+                "noise_std",
+            )
+        )
+
+        if not isinstance(
+            log_power,
+            (
+                bool,
+                np.bool_,
+            ),
+        ):
+            raise ValueError(
+                "log_power must be Boolean."
+            )
+
+        if noverlap >= nperseg:
+            raise ValueError(
+                "noverlap must be smaller than nperseg."
+            )
+
+        if beats.size == 0:
+            return beats.copy()
+
+        rng = self._get_rng()
         augmented = []
-        
-        for seg in x:
-            # 1. STFT
-            f, t, Z = stft(seg, fs=fs, window=window, nperseg=nperseg, noverlap=noverlap)
-            
-            mag = np.abs(Z)
-            phase = np.angle(Z)
-            
-            # 2. Add Noise to Magnitude
+
+        for segment in beats:
+            effective_nperseg = min(
+                nperseg,
+                len(segment),
+            )
+
+            if effective_nperseg < 2:
+                augmented.append(
+                    segment.copy()
+                )
+                continue
+
+            effective_noverlap = min(
+                noverlap,
+                effective_nperseg - 1,
+            )
+
+            _, _, spectrum = stft(
+                segment,
+                fs=fs,
+                window=window,
+                nperseg=effective_nperseg,
+                noverlap=effective_noverlap,
+            )
+
+            magnitude = np.abs(
+                spectrum
+            )
+
+            phase = np.angle(
+                spectrum
+            )
+
             if log_power:
-                mag_log = np.log(mag + 1e-8)
-                noise = np.random.normal(0, noise_std, mag_log.shape)
-                mag_aug = np.exp(mag_log + noise)
+                log_magnitude = np.log(
+                    magnitude + 1e-8
+                )
+
+                noise = rng.normal(
+                    loc=0.0,
+                    scale=noise_std,
+                    size=log_magnitude.shape,
+                )
+
+                augmented_magnitude = np.exp(
+                    log_magnitude + noise
+                )
             else:
-                noise = np.random.normal(0, noise_std * mag.std(), mag.shape)
-                mag_aug = np.clip(mag + noise, 0, None)
-            
-            # 3. Inverse STFT
-            Z_aug = mag_aug * np.exp(1j * phase)
-            _, x_rec = istft(Z_aug, fs=fs, window=window, nperseg=nperseg, noverlap=noverlap)
-            
-            # 4. Fix Length
-            if len(x_rec) > len(seg):
-                x_rec = x_rec[:len(seg)]
+                magnitude_scale = float(
+                    magnitude.std()
+                )
+
+                noise = rng.normal(
+                    loc=0.0,
+                    scale=(
+                        noise_std
+                        * magnitude_scale
+                    ),
+                    size=magnitude.shape,
+                )
+
+                augmented_magnitude = np.clip(
+                    magnitude + noise,
+                    0.0,
+                    None,
+                )
+
+            augmented_spectrum = (
+                augmented_magnitude
+                * np.exp(
+                    1j * phase
+                )
+            )
+
+            _, reconstructed = istft(
+                augmented_spectrum,
+                fs=fs,
+                window=window,
+                nperseg=effective_nperseg,
+                noverlap=effective_noverlap,
+            )
+
+            if len(reconstructed) >= len(
+                segment
+            ):
+                reconstructed = reconstructed[
+                    :len(segment)
+                ]
             else:
-                x_rec = np.pad(x_rec, (0, len(seg) - len(x_rec)))
-                
-            augmented.append(x_rec)
-            
-        return np.stack(augmented)
+                reconstructed = np.pad(
+                    reconstructed,
+                    (
+                        0,
+                        len(segment)
+                        - len(reconstructed),
+                    ),
+                )
+
+            augmented.append(
+                reconstructed
+            )
+
+        return np.stack(
+            augmented
+        ).astype(
+            np.float32,
+            copy=False,
+        )

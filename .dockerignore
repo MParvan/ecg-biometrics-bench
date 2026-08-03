@@ -1,0 +1,50 @@
+# Everything excluded here stays out of the build context, which is uploaded
+# to the Docker daemon before the first instruction runs. Datasets alone are
+# several gigabytes, so omitting them turns a multi-minute upload into an
+# instant one.
+
+# Datasets, downloaded by the loaders at runtime
+datasets/
+
+# Generated artifacts
+precomputed/
+cache/
+results/
+validation_runs/
+ecg-biometrics-artifacts/
+reproduced_tables/
+model_comparison_tables/
+figures/
+ARTIFACTS.md
+
+# Model, cache, and array payloads
+*.pth
+*.pt
+*.ckpt
+*.npz
+*.npy
+*.pkl
+*.pickle
+
+# Version control and CI metadata
+.git/
+.github/
+.gitignore
+.gitattributes
+
+# Python bytecode and packaging leftovers
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local editor and tooling state
+.vscode/
+.idea/
+*.before_manuscript_validation
+
+# Container definitions do not need to be inside the image
+Dockerfile
+.dockerignore
