@@ -1,0 +1,154 @@
+name: tests
+
+# Runs on every push and pull request to the long-lived branches, and can be
+# triggered by hand from the Actions tab.
+on:
+  push:
+    branches:
+      - main
+      - "revision/**"
+      - "feature/**"
+  pull_request:
+    branches:
+      - main
+      - "revision/**"
+  workflow_dispatch:
+
+# A new push to the same branch cancels the previous run rather than queueing
+# behind it.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test suite (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.10 is the version the reported results were produced with; 3.12
+        # guards against the framework drifting out of support on newer
+        # interpreters.
+        python-version: ["3.10", "3.12"]
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      - name: Install dependencies
+        # The CPU wheel index keeps the PyTorch download to a few hundred
+        # megabytes rather than several gigabytes. The pins carry no local
+        # build label, so they resolve against this index unchanged.
+        run: |
+          python -m pip install --upgrade pip
+          pip install \
+            --index-url https://download.pytorch.org/whl/cpu \
+            --extra-index-url https://pypi.org/simple \
+            -r requirements.txt -r requirements-dev.txt
+
+      - name: Report the resolved environment
+        run: |
+          python --version
+          python -c "import torch; print('torch', torch.__version__)"
+
+      - name: Run the test suite
+        # No test reads the ECG datasets: loaders are either mocked or given a
+        # synthetic WFDB fixture, so the suite runs without the multi-gigabyte
+        # download.
+        env:
+          MPLBACKEND: Agg
+        run: python -m pytest tests -q
+
+  configurations:
+    name: Validate shipped configurations
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install \
+            --index-url https://download.pytorch.org/whl/cpu \
+            --extra-index-url https://pypi.org/simple \
+            -r requirements.txt
+
+      - name: Every shipped configuration must parse and validate
+        # Guards against a configuration drifting out of step with the CLI,
+        # which would only otherwise surface when someone tried to reproduce
+        # a result.
+        env:
+          MPLBACKEND: Agg
+        run: |
+          python - <<'PYTHON'
+          import contextlib, glob, io, sys
+          sys.path.insert(0, ".")
+          import main
+
+          failures = []
+          paths = sorted(glob.glob("configs/*/*/*.yaml"))
+
+          for path in paths:
+              buffer = io.StringIO()
+              try:
+                  with contextlib.redirect_stdout(buffer), \
+                       contextlib.redirect_stderr(buffer):
+                      main.parse_experiment_arguments(["--config", path])
+              except SystemExit:
+                  failures.append((path, buffer.getvalue().strip()))
+
+          print(f"validated {len(paths)} configurations")
+
+          for path, message in failures:
+              print(f"FAILED {path}\n  {message}")
+
+          sys.exit(1 if failures else 0)
+          PYTHON
+
+  container:
+    name: Container image builds
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build the image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: ecg-biometrics-bench:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: The image must be able to run the suite
+        run: |
+          docker run --rm ecg-biometrics-bench:ci -m pytest tests -q
