@@ -1,52 +1,51 @@
 # Core dependencies for the benchmark pipeline: dataset loading,
 # preprocessing, training, and biometric evaluation.
 #
-# Versions are pinned to those used to produce the reported results.
-# Verified on Python 3.12.
+# Versions are pinned to the environment used to produce the reported
+# results, running Python 3.10.
 #
 #   pip install -r requirements.txt
 #
-# Optional time-frequency representations (spectrograms, scalograms, Gramian
-# angular fields) need additional packages that are imported only when those
-# functions are called. Install them separately if required:
+# Two companion files cover cases this one deliberately excludes:
 #
-#   pip install -r requirements-representations.txt
-
+#   requirements-representations.txt   optional time-frequency transforms
+#   requirements-dev.txt               test runner
+#
 # Numerical and scientific stack
 numpy==1.26.4
 pandas==2.2.1
-scipy==1.16.1
-scikit-learn==1.5.2
+scipy==1.15.3
+scikit-learn==1.7.2
 
 # Deep learning.
 #
-# These pins are build-agnostic: they match the CPU wheel (2.8.0+cpu) and any
-# CUDA wheel (2.8.0+cuXXX) equally, because pip ignores a local build label
-# when the specifier does not name one. The framework selects the device at
-# runtime and falls back to CPU automatically, so the same installation runs
-# unchanged on a machine with or without a GPU.
+# These pins carry no local build label, so they match the CPU wheel
+# (2.4.1+cpu) and any CUDA wheel (2.4.1+cuXXX) equally: pip ignores a local
+# label when the specifier does not name one. The framework selects the
+# device at runtime and falls back to CPU, so one installation runs unchanged
+# with or without a GPU.
 #
-# For GPU acceleration, install the CUDA build first, then install the rest
-# of this file. On Windows the default PyPI wheel is CPU-only:
+# For GPU acceleration install the CUDA build first, then this file. The
+# default PyPI wheel is CPU-only on Windows. The reported results used the
+# CUDA 12.4 build:
 #
-#   pip install torch==2.8.0 torchvision==0.23.0 --index-url https://download.pytorch.org/whl/cu128
+#   pip install torch==2.4.1 torchvision==0.19.1 --index-url https://download.pytorch.org/whl/cu124
 #
-# See https://pytorch.org/get-started/locally/ for the URL matching your
-# CUDA version.
-torch==2.8.0
-torchvision==0.23.0
+# See https://pytorch.org/get-started/locally/ for other CUDA versions.
+torch==2.4.1
+torchvision==0.19.1
 
 # Signal processing
 neurokit2==0.2.12
 wfdb==4.1.2
-PyWavelets==1.9.0
+PyWavelets==1.8.0
 
 # Configuration, I/O, and progress reporting
-PyYAML==6.0.2
-tqdm==4.67.1
-requests==2.32.4
-patool==4.0.2
+PyYAML==6.0.3
+tqdm==4.69.1
+requests==2.34.2
+patool==4.0.1
 
 # Visualization
-matplotlib==3.10.5
-seaborn==0.12.2
+matplotlib==3.10.9
+seaborn==0.13.2

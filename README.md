@@ -206,7 +206,7 @@ source ecg_env/bin/activate
 **Option B: Using Conda (Anaconda/Miniconda)**
 ```bash
 # 1. Create the conda environment (Python 3.9+ recommended)
-conda create -n ecg_env python=3.12 -y
+conda create -n ecg_env python=3.10 -y
 
 # 2. Activate the environment
 conda activate ecg_env
@@ -218,8 +218,8 @@ cd ecg-biometrics-bench
 pip install -r requirements.txt
 ```
 
-Dependency versions are pinned to those used to produce the reported results,
-and were verified on Python 3.12.
+Dependency versions are pinned to the environment used to produce the reported
+results, running Python 3.10.
 
 **CPU and GPU.** The same installation runs on either. The framework detects
 the available device at runtime and falls back to CPU, and `--device cpu`
@@ -227,7 +227,7 @@ forces it. For GPU acceleration, install the CUDA build of PyTorch *before*
 the requirements file, because the default PyPI wheel is CPU-only on Windows:
 
 ```bash
-pip install torch==2.8.0 torchvision==0.23.0 --index-url https://download.pytorch.org/whl/cu128
+pip install torch==2.4.1 torchvision==0.19.1 --index-url https://download.pytorch.org/whl/cu124
 pip install -r requirements.txt
 ```
 
@@ -248,6 +248,13 @@ extension, and a failed build would otherwise abort the whole installation:
 
 ```bash
 pip install -r requirements-representations.txt
+```
+
+**Running the tests.** The test suite needs one extra package:
+
+```bash
+pip install -r requirements-dev.txt
+python -m pytest tests -q
 ```
 
 The framework includes main.py which can simply be used as CLI. Some examples are as follows:
