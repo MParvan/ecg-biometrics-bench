@@ -261,6 +261,57 @@ pip install -r requirements-dev.txt
 python -m pytest tests -q
 ```
 
+---
+
+## 📥 Acquiring the datasets
+
+Every dataset is downloaded and unpacked on first use, so no manual step is
+normally required. To fetch and check all of them up front, and get one table
+describing what arrived:
+
+```bash
+python -m scripts.verify_datasets
+```
+
+The script reports each dataset as `ok`, `already-present`, `missing-tool`, or
+`failed`, and exits non-zero if any dataset could not be acquired. Add
+`--output-json report.json` to keep the full detail, or `--datasets ecgid ptb`
+to check a subset. Only acquisition is exercised: no signals are parsed, so the
+run takes as long as the transfers and needs no GPU.
+
+**One external dependency.** Six of the seven datasets are published as ZIP
+archives, which Python unpacks on its own. HeartPrint is published as a RAR
+archive, and Python has no built-in RAR decoder, so unpacking it needs a tool
+from the operating system:
+
+```bash
+# Debian, Ubuntu, and Google Colab
+apt-get install -y unar
+
+# macOS
+brew install unar
+
+# Windows: install 7-Zip or WinRAR
+```
+
+To check what is available before downloading anything:
+
+```bash
+python -m scripts.verify_datasets --check-tools
+```
+
+If no such tool can be installed, download `Heartprint.rar` from the
+[published record](https://doi.org/10.6084/m9.figshare.20105354.v3) and unpack
+it by hand into `datasets/heartprint/`; the loader scans for the session
+directories at any depth, so the exact nesting does not matter.
+
+**Disk space.** The archives are kept after unpacking so an interrupted run can
+resume without downloading again. Pass `--delete-archives` to remove each one
+once it is unpacked, which roughly halves the peak requirement — worth doing on
+a Colab instance, where PTB and PTB-XL dominate the total.
+
+---
+
 The framework includes main.py which can simply be used as CLI. Some examples are as follows:
 
 Experiment 1: Baseline Closed-Set Identification (Task 1)
