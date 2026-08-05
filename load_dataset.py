@@ -9,6 +9,7 @@ import datetime
 import shutil
 import zipfile
 import tempfile
+import time
 import requests
 import yaml
 import wfdb
@@ -1166,6 +1167,31 @@ _ARCHIVE_SIGNATURES = (
 
 _ARCHIVE_SUFFIXES = {"zip": ".zip", "rar": ".rar", "7z": ".7z"}
 
+# Repositories disagree about how to treat a client that presents itself as a
+# browser. Some answer one with an interactive page, a consent step, or an
+# empty 202 while serving a plain client the file directly; others refuse a
+# client that does not look like a browser at all. Requesting with the HTTP
+# library's own headers first and only presenting a browser identity after the
+# first attempt fails satisfies both, and keeps the common case to one request.
+_BROWSER_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+)
+
+_DOWNLOAD_IDENTITIES = ({}, {"User-Agent": _BROWSER_USER_AGENT})
+
+# Statuses whose body is the requested file. Other 2xx codes report progress
+# rather than content, and requests treats them as success.
+_FILE_BEARING_STATUSES = (200, 206)
+
+# Several of these archives are hundreds of megabytes and are served slowly, so
+# a gateway giving up part-way through is a normal event rather than a sign
+# that the dataset is unavailable. Retrying the same request recovers it, while
+# switching to a different client identity would not.
+_TRANSIENT_STATUSES = (408, 429, 500, 502, 503, 504)
+_TRANSIENT_ATTEMPTS = 3
+_TRANSIENT_BACKOFF_SECONDS = 5
+
 # Python has no built-in RAR decoder, so patool delegates to an external
 # program. When none of these is installed, extraction cannot proceed at all.
 _RAR_BACKENDS = ("unar", "unrar", "rar", "7z", "7za", "bsdtar")
@@ -1209,6 +1235,38 @@ def available_rar_backend() -> Optional[str]:
         if shutil.which(backend):
             return backend
     return None
+
+
+def _describe_unrecognised_file(path: Path, preview_bytes: int = 200) -> str:
+    """
+    Summarise a file that was expected to be an archive but is not one.
+
+    A server that refuses a request often answers with an HTML page or an XML
+    error document rather than a transport-level failure, and the download then
+    succeeds while producing something unusable. Quoting the beginning of the
+    file turns that into a self-explaining error, because the reason is almost
+    always stated in the first line of the response.
+    """
+    try:
+        size = path.stat().st_size
+        with open(path, "rb") as handle:
+            head = handle.read(preview_bytes)
+    except OSError as exc:
+        return f"The file could not be inspected: {exc}"
+
+    if size == 0:
+        return "The file is empty, which usually means the connection was refused."
+
+    preview = head.decode("utf-8", errors="replace").strip()
+    preview = " ".join(preview.split())
+
+    return (
+        f"It is {size} bytes and begins:\n"
+        f"    {preview}\n"
+        f"An HTML or XML response here means the server declined the request "
+        f"rather than serving the file; a much smaller size than expected means "
+        f"the transfer was cut short. Delete the file to retry the download."
+    )
 
 
 def _reconcile_archive_suffix(archive_path: Path) -> Path:
@@ -1264,9 +1322,8 @@ def _unpack_archive(archive_path: Path, staging: Path, destination: Path):
 
     if archive_format is None:
         raise RuntimeError(
-            f"{archive_path.name} is not a recognised archive. The download was "
-            f"most likely truncated or replaced by an error page; delete the "
-            f"file to force a fresh download."
+            f"{archive_path.name} is not a recognised archive. "
+            f"{_describe_unrecognised_file(archive_path)}"
         )
 
     if archive_format == "rar" and available_rar_backend() is None:
@@ -1328,7 +1385,7 @@ def _extraction_marker(extract_to: Path) -> Path:
     return extract_to.parent / f".{extract_to.name}.incomplete"
 
 
-def _download_file(url: str, destination: Path, dataset_name: str):
+def _download_file(url: str, destination: Path, dataset_name: str, expected_size: Optional[int] = None):
     """
     Download a URL to a path, verifying that the transfer completed.
 
@@ -1340,57 +1397,123 @@ def _download_file(url: str, destination: Path, dataset_name: str):
         url (str): Direct download link.
         destination (Path): Where to save the file.
         dataset_name (str): For print logging.
+        expected_size (int, optional): Size the file is known to have, from a
+            source independent of the transfer itself. A repository that
+            publishes the size in its metadata gives a stronger guarantee than
+            the response headers, which describe only what the server intended
+            to send.
 
     Raises:
         RuntimeError: If the download fails or arrives incomplete.
     """
-    # A browser user agent avoids the 403 responses that some repositories
-    # return to unrecognised clients.
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-        )
-    }
-
     print(f"[INFO] Downloading {dataset_name}...")
-    try:
-        with requests.get(url, stream=True, headers=headers, timeout=60) as response:
-            response.raise_for_status()
 
-            declared = int(response.headers.get("content-length") or 0)
-            # A compressed transfer is decoded on arrival, so the number of
-            # bytes written legitimately differs from the advertised length.
-            recompressed = any(
-                key.lower() == "content-encoding" for key in response.headers
-            )
+    reasons = []
+    for identity, headers in enumerate(_DOWNLOAD_IDENTITIES):
+        if identity:
+            print(f"[INFO] Retrying {dataset_name} with a browser identity.")
 
-            written = 0
-            with open(destination, "wb") as handle, tqdm(
-                desc=f"Downloading {dataset_name}",
-                total=declared,
-                unit="iB",
-                unit_scale=True,
-                unit_divisor=1024,
-            ) as bar:
-                for chunk in response.iter_content(chunk_size=65536):
-                    written += handle.write(chunk)
-                    bar.update(len(chunk))
+        for attempt in range(_TRANSIENT_ATTEMPTS):
+            try:
+                _stream_to_file(url, destination, dataset_name, headers, expected_size)
+                return
+            except Exception as exc:
+                if destination.exists():
+                    os.remove(destination)
 
-        if declared and not recompressed and written != declared:
+                if _is_transient(exc) and attempt + 1 < _TRANSIENT_ATTEMPTS:
+                    print(
+                        f"[WARN] {dataset_name} download interrupted ({exc}); "
+                        f"retrying in {_TRANSIENT_BACKOFF_SECONDS}s."
+                    )
+                    time.sleep(_TRANSIENT_BACKOFF_SECONDS)
+                    continue
+
+                reasons.append(str(exc))
+                break
+
+    raise RuntimeError(
+        f"Downloading {dataset_name} from {url} failed: " + "; then ".join(reasons)
+    )
+
+
+def _is_transient(exc: Exception) -> bool:
+    """
+    Report whether a failed download is worth repeating unchanged.
+
+    A refusal, a missing file, or a response carrying no content will repeat
+    identically and should be reported at once. A timeout, a dropped
+    connection, or a gateway error reflects load rather than the request, and
+    usually succeeds on a second attempt.
+    """
+    if isinstance(exc, (requests.Timeout, requests.ConnectionError)):
+        return True
+
+    status = getattr(getattr(exc, "response", None), "status_code", None)
+    return status in _TRANSIENT_STATUSES
+
+
+def _stream_to_file(url: str, destination: Path, dataset_name: str, headers: dict, expected_size: Optional[int]):
+    """
+    Stream one request to a file and reject anything that is not the file.
+
+    Args:
+        url (str): Direct download link.
+        destination (Path): Where to save the file.
+        dataset_name (str): For the progress bar label.
+        headers (dict): Request headers identifying this client.
+        expected_size (int, optional): Size published by the repository.
+
+    Raises:
+        IOError: If the response carries no file, or the transfer is short.
+    """
+    with requests.get(url, stream=True, headers=headers, timeout=60) as response:
+        response.raise_for_status()
+
+        # A 2xx status is not by itself a file. Repositories answer 202 to say
+        # the request was accepted while the body is still an interactive page
+        # or nothing at all, which would otherwise be stored as the archive.
+        if response.status_code not in _FILE_BEARING_STATUSES:
             raise IOError(
-                f"expected {declared} bytes but received {written}"
+                f"the server answered {response.status_code} "
+                f"{response.reason} without sending the file"
             )
 
-    except Exception as exc:
-        if destination.exists():
-            os.remove(destination)
-        raise RuntimeError(
-            f"Downloading {dataset_name} from {url} failed: {exc}"
-        ) from exc
+        declared = int(response.headers.get("content-length") or 0)
+        # A compressed transfer is decoded on arrival, so the number of bytes
+        # written legitimately differs from the advertised length.
+        recompressed = any(
+            key.lower() == "content-encoding" for key in response.headers
+        )
+
+        written = 0
+        with open(destination, "wb") as handle, tqdm(
+            desc=f"Downloading {dataset_name}",
+            total=declared,
+            unit="iB",
+            unit_scale=True,
+            unit_divisor=1024,
+        ) as bar:
+            for chunk in response.iter_content(chunk_size=65536):
+                written += handle.write(chunk)
+                bar.update(len(chunk))
+
+    if written == 0:
+        raise IOError("the server returned an empty response")
+
+    if expected_size and written != expected_size:
+        raise IOError(
+            f"the repository lists this file as {expected_size} bytes "
+            f"but {written} arrived"
+        )
+
+    if declared and not recompressed and written != declared:
+        raise IOError(
+            f"expected {declared} bytes but received {written}"
+        )
 
 
-def _download_and_extract(url: str, zip_path: Path, extract_to: Path, dataset_name: str, cleanup: bool = False):
+def _download_and_extract(url: str, zip_path: Path, extract_to: Path, dataset_name: str, cleanup: bool = False, expected_size: Optional[int] = None):
     """
     Download an archive and unpack it, reporting failure rather than continuing
     with an incomplete dataset.
@@ -1401,6 +1524,8 @@ def _download_and_extract(url: str, zip_path: Path, extract_to: Path, dataset_na
         extract_to (Path): Folder to extract contents into.
         dataset_name (str): For print logging.
         cleanup (bool): If True, deletes the archive after successful extraction.
+        expected_size (int, optional): Size published by the repository, used to
+            verify the transfer independently of the response headers.
 
     Raises:
         RuntimeError: If the dataset cannot be downloaded or unpacked.
@@ -1425,7 +1550,7 @@ def _download_and_extract(url: str, zip_path: Path, extract_to: Path, dataset_na
         return
 
     if not zip_path.exists():
-        _download_file(url, zip_path, dataset_name)
+        _download_file(url, zip_path, dataset_name, expected_size=expected_size)
 
     zip_path = _reconcile_archive_suffix(zip_path)
 
@@ -1847,6 +1972,7 @@ class load_heartprint_dataset():
         self.dataset_root.mkdir(parents=True, exist_ok=True)
 
         url = self.url
+        expected_size = None
         match = re.search(r'articles/(\d+)/versions/(\d+)', self.url)
         if match:
             article_id, version = match.groups()
@@ -1865,6 +1991,9 @@ class load_heartprint_dataset():
                     raise ValueError("the record contains no recognised archive")
 
                 url = archive["download_url"]
+                # The record publishes the size, which verifies the transfer
+                # independently of what the download response claims.
+                expected_size = archive.get("size")
                 # The configured file name does not necessarily match the
                 # published format. An already downloaded archive keeps its
                 # name and is corrected during extraction instead.
@@ -1880,7 +2009,7 @@ class load_heartprint_dataset():
 
         _download_and_extract(
             url, self.zip_path, self.dataset_root, "HeartPrint",
-            cleanup=self.cleanup_zip,
+            cleanup=self.cleanup_zip, expected_size=expected_size,
         )
 
     def load_raw_data(self):
