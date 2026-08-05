@@ -1147,89 +1147,310 @@ def _beat_merge_start_indices(beat_count, num_beats_to_merge, beat_merge_stride)
 # SHARED UTILITIES
 # =============================================================================
 
+class MissingArchiveToolError(RuntimeError):
+    """Raised when unpacking an archive needs a program that is not installed."""
+
+
+# Archives are identified by their leading bytes rather than by their file
+# name. Data repositories regularly publish an archive under a generic or
+# mismatched name, and dispatching on the extension in that case fails with an
+# error that describes the wrong problem.
+_ARCHIVE_SIGNATURES = (
+    (b"PK\x03\x04", "zip"),
+    (b"PK\x05\x06", "zip"),
+    (b"PK\x07\x08", "zip"),
+    (b"Rar!\x1a\x07\x00", "rar"),
+    (b"Rar!\x1a\x07\x01", "rar"),
+    (b"7z\xbc\xaf\x27\x1c", "7z"),
+)
+
+_ARCHIVE_SUFFIXES = {"zip": ".zip", "rar": ".rar", "7z": ".7z"}
+
+# Python has no built-in RAR decoder, so patool delegates to an external
+# program. When none of these is installed, extraction cannot proceed at all.
+_RAR_BACKENDS = ("unar", "unrar", "rar", "7z", "7za", "bsdtar")
+
+_RAR_BACKEND_HINT = (
+    "Unpacking a RAR archive requires an external tool, and none of "
+    "{backends} was found on this system.\n"
+    "  Debian/Ubuntu (including Google Colab):  apt-get install -y unar\n"
+    "  macOS (Homebrew):                        brew install unar\n"
+    "  Windows:                                 install 7-Zip or WinRAR\n"
+    "Alternatively, unpack {archive} by hand into {destination}."
+)
+
+
+def detect_archive_format(path) -> Optional[str]:
+    """
+    Identify an archive from its leading bytes.
+
+    Args:
+        path: File to inspect.
+
+    Returns:
+        The format name, or None if the file is missing, empty, or not a
+        recognised archive.
+    """
+    try:
+        with open(path, "rb") as handle:
+            head = handle.read(8)
+    except OSError:
+        return None
+
+    for signature, name in _ARCHIVE_SIGNATURES:
+        if head.startswith(signature):
+            return name
+    return None
+
+
+def available_rar_backend() -> Optional[str]:
+    """Return the first installed external program able to unpack RAR files."""
+    for backend in _RAR_BACKENDS:
+        if shutil.which(backend):
+            return backend
+    return None
+
+
+def _reconcile_archive_suffix(archive_path: Path) -> Path:
+    """
+    Rename an archive whose extension disagrees with its actual format.
+
+    Extraction tools dispatch on the file name, so an archive saved under the
+    wrong extension is handed to a decoder that cannot read it. Renaming in
+    place also avoids downloading the file a second time.
+
+    Args:
+        archive_path (Path): Archive to inspect.
+
+    Returns:
+        Path: The archive's path, corrected if it needed correcting.
+    """
+    detected = detect_archive_format(archive_path)
+    expected = _ARCHIVE_SUFFIXES.get(detected or "")
+
+    if not expected or archive_path.suffix.lower() == expected:
+        return archive_path
+
+    corrected = archive_path.with_suffix(expected)
+    print(
+        f"[INFO] {archive_path.name} is a {detected.upper()} archive; "
+        f"renaming to {corrected.name}."
+    )
+    os.replace(archive_path, corrected)
+    return corrected
+
+
+def _unpack_archive(archive_path: Path, staging: Path, destination: Path):
+    """
+    Unpack an archive into a staging directory.
+
+    Args:
+        archive_path (Path): Archive to unpack.
+        staging (Path): Directory to unpack into.
+        destination (Path): Final dataset directory, named in error messages so
+            a manual fallback is actionable.
+
+    Raises:
+        MissingArchiveToolError: If the format needs an external program that
+            is not installed.
+        RuntimeError: If the file is not a recognised archive.
+    """
+    archive_format = detect_archive_format(archive_path)
+
+    if archive_format == "zip":
+        with zipfile.ZipFile(archive_path, "r") as archive:
+            archive.extractall(staging)
+        return
+
+    if archive_format is None:
+        raise RuntimeError(
+            f"{archive_path.name} is not a recognised archive. The download was "
+            f"most likely truncated or replaced by an error page; delete the "
+            f"file to force a fresh download."
+        )
+
+    if archive_format == "rar" and available_rar_backend() is None:
+        raise MissingArchiveToolError(
+            _RAR_BACKEND_HINT.format(
+                backends=", ".join(_RAR_BACKENDS),
+                archive=archive_path,
+                destination=destination,
+            )
+        )
+
+    patoolib.extract_archive(str(archive_path), outdir=str(staging))
+
+
+def _extract_archive_into(archive_path: Path, extract_to: Path, dataset_name: str):
+    """
+    Unpack an archive into a directory, flattening a redundant wrapper folder.
+
+    Extraction runs in a temporary directory first, so a failure part-way
+    through cannot leave a half-populated dataset behind. A marker file records
+    that the move is in progress, which lets an interrupted run be recognised
+    on the next attempt instead of being mistaken for a complete dataset.
+
+    Args:
+        archive_path (Path): Archive to unpack.
+        extract_to (Path): Directory to populate.
+        dataset_name (str): For print logging.
+    """
+    marker = _extraction_marker(extract_to)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.touch()
+
+    with tempfile.TemporaryDirectory() as staging:
+        _unpack_archive(archive_path, Path(staging), extract_to)
+
+        # Many archives wrap their contents in a single top-level folder.
+        # Lifting those contents keeps dataset paths identical regardless of
+        # how the archive was assembled.
+        entries = os.listdir(staging)
+        source = staging
+        if len(entries) == 1 and os.path.isdir(os.path.join(staging, entries[0])):
+            source = os.path.join(staging, entries[0])
+            entries = os.listdir(source)
+
+        extract_to.mkdir(parents=True, exist_ok=True)
+        for entry in entries:
+            shutil.move(os.path.join(source, entry), str(extract_to))
+
+    marker.unlink(missing_ok=True)
+
+
+def _extraction_marker(extract_to: Path) -> Path:
+    """
+    Return the sentinel that marks an extraction as being in progress.
+
+    The marker lives beside the dataset directory rather than inside it, so it
+    is never picked up by the recursive scans the loaders perform.
+    """
+    return extract_to.parent / f".{extract_to.name}.incomplete"
+
+
+def _download_file(url: str, destination: Path, dataset_name: str):
+    """
+    Download a URL to a path, verifying that the transfer completed.
+
+    A partial download is removed rather than left in place: a truncated
+    archive that survives to the next run is indistinguishable from a complete
+    one until extraction fails, at which point the cause is no longer obvious.
+
+    Args:
+        url (str): Direct download link.
+        destination (Path): Where to save the file.
+        dataset_name (str): For print logging.
+
+    Raises:
+        RuntimeError: If the download fails or arrives incomplete.
+    """
+    # A browser user agent avoids the 403 responses that some repositories
+    # return to unrecognised clients.
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+        )
+    }
+
+    print(f"[INFO] Downloading {dataset_name}...")
+    try:
+        with requests.get(url, stream=True, headers=headers, timeout=60) as response:
+            response.raise_for_status()
+
+            declared = int(response.headers.get("content-length") or 0)
+            # A compressed transfer is decoded on arrival, so the number of
+            # bytes written legitimately differs from the advertised length.
+            recompressed = any(
+                key.lower() == "content-encoding" for key in response.headers
+            )
+
+            written = 0
+            with open(destination, "wb") as handle, tqdm(
+                desc=f"Downloading {dataset_name}",
+                total=declared,
+                unit="iB",
+                unit_scale=True,
+                unit_divisor=1024,
+            ) as bar:
+                for chunk in response.iter_content(chunk_size=65536):
+                    written += handle.write(chunk)
+                    bar.update(len(chunk))
+
+        if declared and not recompressed and written != declared:
+            raise IOError(
+                f"expected {declared} bytes but received {written}"
+            )
+
+    except Exception as exc:
+        if destination.exists():
+            os.remove(destination)
+        raise RuntimeError(
+            f"Downloading {dataset_name} from {url} failed: {exc}"
+        ) from exc
+
+
 def _download_and_extract(url: str, zip_path: Path, extract_to: Path, dataset_name: str, cleanup: bool = False):
     """
-    Helper to download a file with a real-time progress bar and extract it.
-    Includes auto-cleanup for corrupt files and handles nested ZIP/RAR archives.
-    
+    Download an archive and unpack it, reporting failure rather than continuing
+    with an incomplete dataset.
+
     Args:
         url (str): Direct download link.
         zip_path (Path): Where to save the compressed file.
         extract_to (Path): Folder to extract contents into.
         dataset_name (str): For print logging.
-        cleanup (bool): If True, deletes the zip/rar file after successful extraction.
+        cleanup (bool): If True, deletes the archive after successful extraction.
+
+    Raises:
+        RuntimeError: If the dataset cannot be downloaded or unpacked.
     """
     extract_to.mkdir(parents=True, exist_ok=True)
-    
-    # 1. DOWNLOAD PHASE
-    if not zip_path.exists():
-        print(f"[INFO] Downloading {dataset_name}...")
-        try:
-            # Use browser headers to prevent 403 Forbidden errors from sites like Figshare
-            headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
-            
-            response = requests.get(url, stream=True, headers=headers)
-            response.raise_for_status()
-            total_size = int(response.headers.get('content-length', 0))
-            
-            # Write file in chunks with progress bar
-            with open(zip_path, "wb") as f, tqdm(
-                desc=f"Downloading {dataset_name}", 
-                total=total_size, 
-                unit='iB', 
-                unit_scale=True, 
-                unit_divisor=1024
-            ) as bar:
-                for data in response.iter_content(chunk_size=1024):
-                    size = f.write(data)
-                    bar.update(size)
-                    
-        except Exception as e:
-            print(f"[ERR] Download failed: {e}")
-            # Clean up partial file so we don't try to unzip a corrupt file later
-            if zip_path.exists(): os.remove(zip_path)
-            return
+    marker = _extraction_marker(extract_to)
 
-    # 2. EXTRACTION PHASE
-    # Only extract if the target directory is empty
-    if not any(extract_to.iterdir()):
-        print(f"[INFO] Extracting {dataset_name}...")
-        try:
-            with tempfile.TemporaryDirectory() as temp_dir:
-                # Handle ZIP files
-                if zip_path.suffix == ".zip":
-                    with zipfile.ZipFile(zip_path, "r") as zf:
-                        zf.extractall(temp_dir)
-                        
-                # Handle RAR files (requires 'patool' and system 7-Zip/Unrar)
-                elif zip_path.suffix == ".rar":
-                    patoolib.extract_archive(str(zip_path), outdir=temp_dir)
-                
-                # --- Intelligent Move Logic ---
-                # Many archives wrap everything in a single top-level folder.
-                # We detect this and move the *contents* up one level to keep paths clean.
-                content = [d for d in os.listdir(temp_dir)]
-                if len(content) == 1 and os.path.isdir(os.path.join(temp_dir, content[0])):
-                    src = os.path.join(temp_dir, content[0])
-                    for item in os.listdir(src):
-                        shutil.move(os.path.join(src, item), extract_to)
-                else:
-                    # Move everything directly
-                    for item in content:
-                        shutil.move(os.path.join(temp_dir, item), extract_to)
-                        
-            print(f"[INFO] {dataset_name} ready.")
-            
-            # Optional cleanup
-            if cleanup: 
-                print(f"[INFO] Cleaning up zip file: {zip_path.name}")
-                os.remove(zip_path)
-                
-        except Exception as e:
-            print(f"[ERR] Extraction failed: {e}")
-            print(f"[ACTION] Deleting corrupt file {zip_path.name} to force re-download on next run.")
-            if zip_path.exists(): os.remove(zip_path)
-            if extract_to.exists(): shutil.rmtree(extract_to)
+    # An interrupted extraction leaves files behind that would otherwise look
+    # like a finished dataset. Clearing them forces a clean retry.
+    if marker.exists():
+        print(
+            f"[WARN] A previous {dataset_name} extraction did not finish; "
+            f"discarding it and starting again."
+        )
+        shutil.rmtree(extract_to, ignore_errors=True)
+        extract_to.mkdir(parents=True, exist_ok=True)
+        marker.unlink(missing_ok=True)
+
+    # Checking the extracted dataset before the archive means a run that
+    # cleaned up its archive does not download it again.
+    if any(extract_to.iterdir()):
+        return
+
+    if not zip_path.exists():
+        _download_file(url, zip_path, dataset_name)
+
+    zip_path = _reconcile_archive_suffix(zip_path)
+
+    print(f"[INFO] Extracting {dataset_name}...")
+    try:
+        _extract_archive_into(zip_path, extract_to, dataset_name)
+    except MissingArchiveToolError:
+        # The archive is intact and the tool can be installed, so it is kept.
+        shutil.rmtree(extract_to, ignore_errors=True)
+        marker.unlink(missing_ok=True)
+        raise
+    except Exception as exc:
+        # The archive is the likely culprit, so it is removed to force a fresh
+        # download, and the destination is cleared so the next run starts clean.
+        if zip_path.exists():
+            os.remove(zip_path)
+        shutil.rmtree(extract_to, ignore_errors=True)
+        marker.unlink(missing_ok=True)
+        raise RuntimeError(f"Extracting {dataset_name} failed: {exc}") from exc
+
+    print(f"[INFO] {dataset_name} ready.")
+
+    if cleanup:
+        print(f"[INFO] Removing archive: {zip_path.name}")
+        os.remove(zip_path)
 
 # =============================================================================
 # 1. ECG-ID
@@ -1611,46 +1832,56 @@ class load_heartprint_dataset():
             session_list[i] = s
 
     def download(self):
-        """Attempts robust download via Figshare API."""
+        """
+        Resolve the HeartPrint archive on Figshare and unpack it.
+
+        The published record bundles several files, only one of which holds the
+        recordings, so the archive is located through the Figshare API rather
+        than downloading the whole record.
+        """
         if self.dataset_root.exists():
             for root, dirs, files in os.walk(self.dataset_root):
                 for d in dirs:
-                    if "session" in d.lower(): return 
+                    if "session" in d.lower(): return
 
         self.dataset_root.mkdir(parents=True, exist_ok=True)
-        print(f"[INFO] Attempting to download HeartPrint...")
-        
-        try:
-            if not self.zip_path.exists():
-                match = re.search(r'articles/(\d+)/versions/(\d+)', self.url)
-                if match:
-                    aid, ver = match.groups()
-                    api = f"https://api.figshare.com/v2/articles/{aid}/versions/{ver}"
-                    r = requests.get(api); r.raise_for_status()
-                    target = next((f for f in r.json()['files'] if 'zip' in f['name'] or 'rar' in f['name']), None)
-                    if not target: raise ValueError("Archive not found")
-                    dl_url = target['download_url']
-                    size = target['size']
-                else:
-                    dl_url = self.url; size = 0
 
-                with requests.get(dl_url, stream=True) as r:
-                    r.raise_for_status()
-                    if size == 0: size = int(r.headers.get('content-length', 0))
-                    with open(self.zip_path, "wb") as f, tqdm(desc="Downloading", total=size, unit='iB', unit_scale=True) as bar:
-                        for chunk in r.iter_content(8192): f.write(chunk); bar.update(len(chunk))
+        url = self.url
+        match = re.search(r'articles/(\d+)/versions/(\d+)', self.url)
+        if match:
+            article_id, version = match.groups()
+            api = f"https://api.figshare.com/v2/articles/{article_id}/versions/{version}"
+            try:
+                response = requests.get(api, timeout=60)
+                response.raise_for_status()
+                archive = next(
+                    (
+                        entry for entry in response.json()["files"]
+                        if Path(entry["name"]).suffix.lower() in _ARCHIVE_SUFFIXES.values()
+                    ),
+                    None,
+                )
+                if archive is None:
+                    raise ValueError("the record contains no recognised archive")
 
-            print(f"[INFO] Attempting extraction...")
-            with tempfile.TemporaryDirectory() as temp_dir:
-                try: patoolib.extract_archive(str(self.zip_path), outdir=temp_dir)
-                except Exception:
-                    with zipfile.ZipFile(self.zip_path, "r") as zf: zf.extractall(temp_dir)
-                for item in os.listdir(temp_dir): shutil.move(os.path.join(temp_dir, item), self.dataset_root)
-            if self.cleanup_zip: os.remove(self.zip_path)
+                url = archive["download_url"]
+                # The configured file name does not necessarily match the
+                # published format. An already downloaded archive keeps its
+                # name and is corrected during extraction instead.
+                if not self.zip_path.exists():
+                    self.zip_path = self.zip_path.with_suffix(
+                        Path(archive["name"]).suffix
+                    )
+            except Exception as exc:
+                print(
+                    f"[WARN] Could not query the Figshare API ({exc}); "
+                    f"falling back to the record URL."
+                )
 
-        except Exception as e:
-            print(f"[WARN] Automated download failed: {e}")
-            print("Please download manually and extract to:", self.dataset_root)
+        _download_and_extract(
+            url, self.zip_path, self.dataset_root, "HeartPrint",
+            cleanup=self.cleanup_zip,
+        )
 
     def load_raw_data(self):
         """
