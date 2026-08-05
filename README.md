@@ -282,7 +282,14 @@ run takes as long as the transfers and needs no GPU.
 **One external dependency.** Six of the seven datasets are published as ZIP
 archives, which Python unpacks on its own. HeartPrint is published as a RAR
 archive, and Python has no built-in RAR decoder, so unpacking it needs a tool
-from the operating system:
+from the operating system. Many environments already provide one — hosted
+notebooks commonly ship `unrar` or `7z` — so check before installing anything:
+
+```bash
+python -m scripts.verify_datasets --check-tools
+```
+
+If none is present:
 
 ```bash
 # Debian, Ubuntu, and Google Colab
@@ -292,12 +299,6 @@ apt-get install -y unar
 brew install unar
 
 # Windows: install 7-Zip or WinRAR
-```
-
-To check what is available before downloading anything:
-
-```bash
-python -m scripts.verify_datasets --check-tools
 ```
 
 If no such tool can be installed, download `Heartprint.rar` from the
