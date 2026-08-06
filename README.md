@@ -419,6 +419,42 @@ python -m scripts.reproduce_tables --table 5 --collect
 
 ---
 
+## 🎯 Beat Alignment
+
+Beat-mode segmentation cuts a fixed window around each detected R-peak, so the
+window is only correct if the detector reports the fiducial point itself.
+Several widely used QRS detectors do not: they report the maximum of a smoothed
+detection curve, which lags the true peak by roughly half the smoothing window.
+For the Pan-Tompkins and Hamilton implementations reachable through NeuroKit2
+that is 40–70 ms. The offset is harmless for interval measurements, where it
+cancels, but it displaces every beat cut around the peak.
+
+`cut_beats` therefore re-centres each beat on the largest nearby deflection.
+The half-width of that search is `align_window_s`:
+
+```yaml
+preprocessing:
+  align_peak: true
+  align_window_s: null   # derive from the median R-R interval
+```
+
+`null` sizes the search as a fraction of the median R-R interval, bounded to
+100–200 ms and never wider than `pre_s` or `post_s`. That range covers the
+largest reported detector lag while staying clear of the T-wave, and it tracks
+both heart rate and sampling rate across the 128–1000 Hz range the supported
+datasets span. A fixed half-width in seconds can be given instead.
+
+Measured against the beat annotations shipped with ECG-ID, MIT-BIH and NSRDB,
+the adaptive search brings every available detector to within 1–3 ms of the
+annotated peak, or to the sampling period at 128 Hz. A search narrower than the
+detector's lag is not merely less effective: it can settle on a neighbouring
+wave and finish further from the peak than no alignment at all.
+
+Detector choice still matters for how many beats are found and how many
+spurious detections appear; it stops mattering for where the beats are cut.
+
+---
+
 ## 🔒 Leakage Controls
 
 The framework refuses configurations that would place the same physical

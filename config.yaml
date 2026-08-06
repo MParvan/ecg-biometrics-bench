@@ -19,6 +19,12 @@ datasets:
       stride_s: 1.0
       rpeak_method: "pantompkins"
       align_peak: true
+      # Half-width of the search that re-centres each beat on its R-peak.
+      # null derives it from the median R-R interval, which is recommended:
+      # several detectors report the peak of a smoothed detection curve rather
+      # than the fiducial point, lagging it by up to ~70 ms, and a search
+      # narrower than that lag can settle on a neighbouring wave.
+      align_window_s: null
       filter_method: "butter"
       filter_parameters:
         low: 0.5
@@ -41,6 +47,12 @@ datasets:
       stride_s: 1.0
       rpeak_method: "pantompkins"
       align_peak: true
+      # Half-width of the search that re-centres each beat on its R-peak.
+      # null derives it from the median R-R interval, which is recommended:
+      # several detectors report the peak of a smoothed detection curve rather
+      # than the fiducial point, lagging it by up to ~70 ms, and a search
+      # narrower than that lag can settle on a neighbouring wave.
+      align_window_s: null
       filter_method: "butter"
       filter_parameters:
         low: 0.5
@@ -63,6 +75,12 @@ datasets:
       stride_s: 1.0
       rpeak_method: "pantompkins"
       align_peak: true
+      # Half-width of the search that re-centres each beat on its R-peak.
+      # null derives it from the median R-R interval, which is recommended:
+      # several detectors report the peak of a smoothed detection curve rather
+      # than the fiducial point, lagging it by up to ~70 ms, and a search
+      # narrower than that lag can settle on a neighbouring wave.
+      align_window_s: null
       filter_method: "butter"
       filter_parameters:
         low: 0.5
@@ -85,6 +103,12 @@ datasets:
       stride_s: 1.0
       rpeak_method: "pantompkins"
       align_peak: true
+      # Half-width of the search that re-centres each beat on its R-peak.
+      # null derives it from the median R-R interval, which is recommended:
+      # several detectors report the peak of a smoothed detection curve rather
+      # than the fiducial point, lagging it by up to ~70 ms, and a search
+      # narrower than that lag can settle on a neighbouring wave.
+      align_window_s: null
       filter_method: "butter"
       filter_parameters:
         low: 0.5
@@ -107,6 +131,12 @@ datasets:
       stride_s: 1.0
       rpeak_method: "pantompkins"
       align_peak: true
+      # Half-width of the search that re-centres each beat on its R-peak.
+      # null derives it from the median R-R interval, which is recommended:
+      # several detectors report the peak of a smoothed detection curve rather
+      # than the fiducial point, lagging it by up to ~70 ms, and a search
+      # narrower than that lag can settle on a neighbouring wave.
+      align_window_s: null
       filter_method: "butter"
       filter_parameters:
         low: 0.5
@@ -130,6 +160,12 @@ datasets:
       stride_s: 1.0
       rpeak_method: "pantompkins"
       align_peak: true
+      # Half-width of the search that re-centres each beat on its R-peak.
+      # null derives it from the median R-R interval, which is recommended:
+      # several detectors report the peak of a smoothed detection curve rather
+      # than the fiducial point, lagging it by up to ~70 ms, and a search
+      # narrower than that lag can settle on a neighbouring wave.
+      align_window_s: null
       filter_method: "butter"
       filter_parameters:
         low: 0.5
@@ -153,6 +189,12 @@ datasets:
       stride_s: 1.0
       rpeak_method: "pantompkins"
       align_peak: true
+      # Half-width of the search that re-centres each beat on its R-peak.
+      # null derives it from the median R-R interval, which is recommended:
+      # several detectors report the peak of a smoothed detection curve rather
+      # than the fiducial point, lagging it by up to ~70 ms, and a search
+      # narrower than that lag can settle on a neighbouring wave.
+      align_window_s: null
       filter_method: "butter"
       filter_parameters:
         low: 0.5

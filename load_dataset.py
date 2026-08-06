@@ -57,6 +57,7 @@ DEFAULT_PREPROCESSING_CONFIG = {
     "stride_s": 1.0,
     "rpeak_method": "pantompkins",
     "align_peak": True,
+    "align_window_s": None,
     "filter_method": "butter",
     "filter_parameters": {
         "low": 0.5,
@@ -91,6 +92,7 @@ def _normalize_preprocessing_config(*configurations):
         "stride_s",
         "rpeak_method",
         "align_peak",
+        "align_window_s",
         "filter_method",
         "filter_parameters",
         "normalization_method",
@@ -274,6 +276,23 @@ def _normalize_preprocessing_config(*configurations):
 
     normalized["align_peak"] = bool(normalized["align_peak"])
 
+    align_window_s = normalized["align_window_s"]
+
+    if align_window_s is not None:
+        if isinstance(align_window_s, bool) or not np.isscalar(align_window_s):
+            raise ValueError(
+                "align_window_s must be a positive number of seconds or null."
+            )
+
+        align_window_s = float(align_window_s)
+
+        if not np.isfinite(align_window_s) or align_window_s <= 0.0:
+            raise ValueError(
+                "align_window_s must be a positive number of seconds or null."
+            )
+
+        normalized["align_window_s"] = align_window_s
+
     filter_method = normalized["filter_method"]
 
     if isinstance(filter_method, str):
@@ -374,6 +393,7 @@ def _preprocess_signal(preprocessor, signal, fs, preprocessing_config):
         stride_s=config["stride_s"],
         rpeak_method=config["rpeak_method"],
         align_peak=config["align_peak"],
+        align_window_s=config["align_window_s"],
         filter_method=config["filter_method"],
         filter_kwargs=dict(config["filter_parameters"]),
         norm_method=config["normalization_method"],
