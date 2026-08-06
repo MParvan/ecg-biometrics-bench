@@ -2514,29 +2514,79 @@ class load_mitbih_dataset():
                     if req in avail or avail in req: indices.append(i); break
         return indices
 
-    def load_raw_data(self):
+    def load_raw_data(self, min_ranges=None):
         """
-        Loads all raw files into memory. 
-        Files are kept continuous. Slicing occurs via index manipulation based on fs.
+        Loads raw files into memory.
+
+        Args:
+            min_ranges (list of tuples or None): Minute ranges to read. When
+                given, only those spans are read from disk and returned
+                concatenated in the order requested, which is what slicing the
+                whole record in memory would have produced. Each recording is
+                half an hour long while a protocol typically uses a few minutes
+                of it, so reading the remainder costs time and memory for data
+                that is discarded.
+                None reads the whole recording, which 'all-available' needs.
+
+        Returns:
+            dict: Subject id mapped to its signal, sampling rate, and filename.
         """
         if not self.dataset_root.exists() or not any(self.dataset_root.iterdir()):
             self.download()
-            
+
         recordings = {}
         files = list(self.dataset_root.rglob("*.hea"))
-        
+
         for hea in tqdm(files, desc="Loading MIT-BIH raw files"):
             sid = hea.stem
             try:
                 rec_header = wfdb.rdheader(str(hea.with_suffix("")))
                 lead_indices = self._get_lead_indices(rec_header.sig_name)
                 if not lead_indices: continue
-                
-                data, _ = wfdb.rdsamp(str(hea.with_suffix("")), channels=lead_indices)
+
+                if min_ranges is None:
+                    data, _ = wfdb.rdsamp(str(hea.with_suffix("")), channels=lead_indices)
+                else:
+                    data = self._read_ranges(
+                        str(hea.with_suffix("")), lead_indices,
+                        rec_header.fs, rec_header.sig_len, min_ranges,
+                    )
+                    if data is None:
+                        continue
+
                 recordings[sid] = {"signal": data, "fs": rec_header.fs, "filename": hea.name}
             except Exception: pass
-            
+
         return recordings
+
+    def _read_ranges(self, record_path, lead_indices, fs, total_samples, min_ranges):
+        """
+        Read only the requested minute ranges and return them concatenated.
+
+        The boundaries are clamped exactly as an in-memory slice would clamp
+        them, so a range that runs past the end of a recording yields the same
+        samples either way.
+
+        Returns:
+            np.ndarray or None: The concatenated spans, or None if none of the
+                requested ranges intersects the recording.
+        """
+        chunks = []
+
+        for (start_min, end_min) in min_ranges:
+            start_idx = max(0, int(start_min * 60 * fs))
+            end_idx = min(int(total_samples), int(end_min * 60 * fs))
+
+            if start_idx >= end_idx:
+                continue
+
+            chunk, _ = wfdb.rdsamp(
+                record_path, channels=lead_indices,
+                sampfrom=start_idx, sampto=end_idx,
+            )
+            chunks.append(chunk)
+
+        return np.vstack(chunks) if chunks else None
 
     def _process_signal(self, sig, fs):
         """Applies filters, segmentation, and multi-beat merging."""
@@ -2579,6 +2629,12 @@ class load_mitbih_dataset():
         """
         Takes a continuous raw signal and extracts the requested minute boundaries.
         Returns a concatenated raw array to pass to the preprocessor.
+
+        The loader reads those boundaries directly from disk rather than
+        reading a whole recording and cutting it, so this is no longer on the
+        loading path. It is kept as the reference the reading path is checked
+        against: expressing the same selection a second way is what makes the
+        equivalence test meaningful.
         """
         if not min_ranges: return np.empty((0, raw_signal.shape[1]))
         
@@ -2608,21 +2664,21 @@ class load_mitbih_dataset():
         if self.data_split_mode not in ["all-available", "single-segment"]:
             print(f"[WARN] Calling load_all_data() but mode is '{self.data_split_mode}'.")
             
-        data = self.load_raw_data()
+        # The ranges are applied while reading, so the signal returned here is
+        # already the span the protocol asks for and must not be sliced again.
+        target_ranges = None
+        if self.data_split_mode == "single-segment":
+            target_ranges = [self.single_segment_range]
+
+        data = self.load_raw_data(min_ranges=target_ranges)
         x_list, y_list = [], []
-        
+
         for sid, rec in tqdm(data.items(), desc="Processing signals"):
-            raw_sig = rec['signal']
+            target_signal = rec['signal']
             fs = rec['fs']
-            
-            # Extract requested ranges before preprocessing
-            if self.data_split_mode == "single-segment":
-                target_signal = self._slice_signal(raw_sig, fs, [self.single_segment_range])
-            else: # all-available
-                target_signal = raw_sig
-                
+
             if target_signal.shape[0] == 0: continue
-            
+
             segments = self._process_signal(target_signal, fs)
             if len(segments) > 0:
                 x_list.append(segments)
@@ -2652,19 +2708,19 @@ class load_mitbih_dataset():
         else:
             raise ValueError("session_name must be 'train', 'enrol', or 'test'.")
 
-        data = self.load_raw_data()
+        # Reading the assigned minutes directly avoids pulling in the rest of a
+        # half-hour recording only to discard it.
+        data = self.load_raw_data(min_ranges=target_ranges)
         x_list, y_list = [], []
-        
+
         kept_subjects = 0
 
         for sid, rec in tqdm(data.items(), desc=f"Processing {session_name}"):
-            raw_sig = rec['signal']
+            target_signal = rec['signal']
             fs = rec['fs']
-            
-            # Slice the raw signal based on the assigned minutes
-            target_signal = self._slice_signal(raw_sig, fs, target_ranges)
+
             if target_signal.shape[0] == 0: continue
-            
+
             segments = self._process_signal(target_signal, fs)
             
             if len(segments) > 0:

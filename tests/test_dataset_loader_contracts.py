@@ -505,14 +505,31 @@ class DatasetLoaderContractTests(
             dtype=np.float32,
         ).reshape(-1, 1)
 
-        loader.load_raw_data = Mock(
-            return_value={
+        # The loader reads only the requested minute ranges, so the stand-in
+        # has to honour that argument. Returning the whole recording instead
+        # would let the assertions below pass on data no session asked for.
+        def read(
+            min_ranges=None,
+        ):
+            signal = (
+                raw_signal
+                if min_ranges is None
+                else loader._slice_signal(
+                    raw_signal,
+                    1,
+                    min_ranges,
+                )
+            )
+            return {
                 "record_a": {
-                    "signal": raw_signal,
+                    "signal": signal,
                     "fs": 1,
                     "filename": "record_a",
                 }
             }
+
+        loader.load_raw_data = Mock(
+            side_effect=read,
         )
 
         loader._process_signal = Mock(
