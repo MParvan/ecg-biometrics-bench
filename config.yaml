@@ -7,9 +7,15 @@ datasets:
     root_dir: "ecgid"
     zip_name: "ECGID_Dataset.zip"
     url: "https://physionet.org/content/ecgiddb/get-zip/1.0.0/"
-    sample_length: 20000
+    # Declared so that a recording contradicting it stops the run. The rate
+    # stored in each WFDB header is what preprocessing uses.
     fs: 500
-    signal_type: "filtered"        # Options: "raw", "filtered"
+    # Which of the two stored channels to read. Options: "raw", "filtered".
+    # ECG-ID ships a hardware-filtered copy alongside the raw recording, but the
+    # filter that produced it is not documented. Reading the raw channel keeps
+    # ECG-ID on the same preprocessing path as the other datasets, which supply
+    # raw signals only. Overridden by --signal_type.
+    signal_type: "raw"
     preprocessing:
       mode: "beat"
       pre_s: 0.2

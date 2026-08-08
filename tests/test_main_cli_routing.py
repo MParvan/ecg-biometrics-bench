@@ -471,12 +471,14 @@ class MainCLIRoutingTests(unittest.TestCase):
                     "runner_mocks"
                 ]
 
+                # An unset --signal_type is forwarded as None so that the loader
+                # resolves the channel from the dataset configuration.
                 loader_constructor.assert_called_once_with(
                     data_split_mode="all-available",
                     num_beats_to_merge=1,
                     beat_merge_stride=1,
                     preprocessing_config={},
-                    signal_type="filtered",
+                    signal_type=None,
                 )
 
                 self.assertEqual(

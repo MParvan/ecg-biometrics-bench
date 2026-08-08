@@ -413,6 +413,17 @@ def _normalize_minute_range_list(
 
     return normalized_ranges
 
+# Enumerated options that may stay unset on both the command line and in YAML,
+# because the dataset entry in config.yaml carries the default. Every other
+# option with a fixed set of choices must hold one of them by the time the
+# configuration is complete.
+OPTIONAL_CHOICE_ARGUMENTS = frozenset(
+    {
+        "signal_type",
+    }
+)
+
+
 def validate_experiment_arguments(args, parser):
     """
     Validate the complete experiment configuration after YAML overrides.
@@ -454,6 +465,14 @@ def validate_experiment_arguments(args, parser):
             continue
 
         value = getattr(args, action.dest, None)
+
+        # Leaving one of these unset is legitimate: the dataset entry in
+        # config.yaml then supplies the value, so None is not a choice
+        # violation. Action defaults cannot be consulted here because
+        # collecting the explicit command-line values replaces every one of
+        # them with argparse.SUPPRESS.
+        if value is None and action.dest in OPTIONAL_CHOICE_ARGUMENTS:
+            continue
 
         if value not in action.choices:
             parser.error(
@@ -982,10 +1001,13 @@ def build_data_cache_config(args, loader, task_type):
         "task_type": task_type,
         "split_mode": args.data_split_mode,
         "num_beats_to_merge": args.num_beats_to_merge,
-        "signal_type": (
-            args.signal_type
-            if args.dataset == "ecgid"
-            else None
+        # Read back from the loader rather than from the arguments, because the
+        # channel may have been left unset on the command line and resolved
+        # from config.yaml. The cache key must name the channel actually read.
+        "signal_type": getattr(
+            loader,
+            "signal_type",
+            None,
         ),
         "train_sessions": args.train_sessions,
         "enroll_sessions": args.enroll_sessions,
@@ -1127,8 +1149,9 @@ def get_parser():
             "experiment logs."
         ),
     )
-    data_group.add_argument('--signal_type', type=str, default='filtered', choices=['raw', 'filtered'],
-                            help="For ECG-ID: filtered hardware channel by default, or raw unfiltered channel.")
+    data_group.add_argument('--signal_type', type=str, default=None, choices=['raw', 'filtered'],
+                            help="For ECG-ID: which stored channel to read. Omit to use the "
+                                 "dataset default in config.yaml, which is the raw channel.")
     data_group.add_argument(
         "--single_segment_range",
         type=float,

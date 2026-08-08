@@ -14,7 +14,12 @@ from utils import _generate_config_hash
 
 
 class DummyLoader:
-    def __init__(self):
+    def __init__(self, signal_type="filtered"):
+        # The channel is resolved by the loader, which may take it from the
+        # dataset configuration rather than from the command line, so the cache
+        # identity reads it back from here.
+        self.signal_type = signal_type
+
         self.cfg = {
             "root_dir": "synthetic_dataset",
             "preprocessing": {
@@ -126,24 +131,40 @@ class DataCacheConfigurationTests(unittest.TestCase):
         )
 
     def test_signal_type_changes_the_cache_hash(self):
-        args_1 = make_args()
-        args_2 = deepcopy(args_1)
-        args_2.signal_type = "raw"
-
         config_1 = build_data_cache_config(
-            args_1,
-            DummyLoader(),
+            make_args(),
+            DummyLoader(signal_type="filtered"),
             task_type="cross_session",
         )
         config_2 = build_data_cache_config(
-            args_2,
-            DummyLoader(),
+            make_args(),
+            DummyLoader(signal_type="raw"),
             task_type="cross_session",
         )
 
         self.assertNotEqual(
             _generate_config_hash(config_1),
             _generate_config_hash(config_2),
+        )
+
+    def test_cache_records_the_channel_the_loader_resolved(self):
+        """
+        A run that leaves the channel unset on the command line still reads a
+        specific channel, so the cache identity must name that channel rather
+        than the absent argument.
+        """
+        args = make_args()
+        args.signal_type = None
+
+        config = build_data_cache_config(
+            args,
+            DummyLoader(signal_type="raw"),
+            task_type="cross_session",
+        )
+
+        self.assertEqual(
+            config["signal_type"],
+            "raw",
         )
 
     def test_effective_loader_settings_are_recorded(self):

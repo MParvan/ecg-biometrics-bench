@@ -106,7 +106,7 @@ def _load_configuration(config_path):
 def audit_record_order_dataset(
     dataset,
     data_split_mode,
-    signal_type="filtered",
+    signal_type=None,
     only_healthy=False,
     limit_records=None,
 ):
@@ -267,9 +267,10 @@ def build_parser():
     parser.add_argument(
         "--signal_type",
         type=str,
-        default="filtered",
+        default=None,
         choices=["raw", "filtered"],
-        help="ECG-ID channel selection (default: filtered).",
+        help="ECG-ID channel selection. Omit to use the dataset default "
+             "in config.yaml.",
     )
     parser.add_argument(
         "--only_healthy",
@@ -364,8 +365,10 @@ def main(argv=None):
             configuration.get("test_parts")
         )
 
-        if configuration.get("signal_type"):
-            signal_type = configuration["signal_type"]
+        # Match the precedence of every other field here: an explicit command
+        # line wins, the file fills in what was left unset, and a value absent
+        # from both is resolved by the loader from config.yaml.
+        signal_type = signal_type or configuration.get("signal_type")
 
         if configuration.get("temporal_guard_minutes") is not None:
             temporal_guard_minutes = float(

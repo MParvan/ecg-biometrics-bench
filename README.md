@@ -114,7 +114,7 @@ Accordingly:
 
 The framework provides plug-and-play automated download and parsing for the following datasets:
 
-1. **ECG-ID**: 90 subjects, varied short-term/long-term sessions. The framework uses the hardware-filtered ECG channel by default; pass `--signal_type raw` to select the unfiltered channel explicitly.
+1. **ECG-ID**: 90 subjects, 310 records, Lead I at 500 Hz. Each record stores the raw signal alongside a hardware-filtered copy; the framework reads the raw channel by default so that ECG-ID passes through the same preprocessing as the other datasets, whose recordings are unfiltered. Pass `--signal_type filtered` to read the stored filtered channel instead, keeping in mind that its filter is not documented and is applied in series with the pipeline's own band-pass. Only 20 of the 90 subjects were recorded on more than one day, so the long-term regimes evaluate 20 subjects rather than 90, with a median gap of 8 to 11 days between the last enrolment recording and the first probe and a maximum of 21 days. The six-month figure in the database documentation describes the collection period, not the interval any protocol measures.
 2. **PTB**: 290 subjects (includes healthy controls and clinical pathologies).
 3. **MIT-BIH Arrhythmia**: 47 subjects, continuous 30-minute Holter recordings.
 4. **NSRDB**: 18 subjects, extremely long-term 24-hour continuous recordings.

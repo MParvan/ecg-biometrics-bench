@@ -8,7 +8,8 @@
 dataset: 'ecgid'
 task: 1
 data_split_mode: 'all-available'
-signal_type: 'filtered'
+# ECG-ID only. Leave null to take the dataset default from config.yaml.
+signal_type: 'raw'
 num_beats_to_merge: 1
 
 # Session-based datasets (HeartPrint and CYBHi).

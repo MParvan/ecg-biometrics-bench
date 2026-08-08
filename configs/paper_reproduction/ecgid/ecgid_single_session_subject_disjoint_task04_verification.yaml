@@ -10,7 +10,7 @@
 dataset: ecgid
 task: 4
 data_split_mode: single-session
-signal_type: filtered
+signal_type: raw
 num_beats_to_merge: 1
 train_sessions: null
 enroll_sessions: null

@@ -15,6 +15,7 @@ import wfdb
 import re
 import patoolib
 import collections
+import statistics
 from tqdm import tqdm  # For real-time progress bars
 from preprocessing import Preprocessing
 
@@ -703,6 +704,40 @@ RECORD_ORDER_SPLIT_MODES = (
 )
 
 
+def verify_sampling_rate(declared_fs, dataset_name, record_name, measured_fs):
+    """
+    Check a recording's sampling rate against the rate the configuration declares.
+
+    The rate stored in the file is what preprocessing uses, so this does not
+    override it. Its purpose is to catch a silent mismatch: a repository that
+    re-releases a database at a different rate, or a configuration edited to a
+    value the files do not carry. Either would leave every filter cutoff and
+    beat window subtly wrong while the pipeline reported success.
+
+    Takes the declared rate rather than the configuration mapping, so that the
+    key a loader depends on is visible at the call site.
+
+    Args:
+        declared_fs: Rate declared for the dataset, or None to skip the check.
+        dataset_name: Name used in the message.
+        record_name: Recording the rate was read from.
+        measured_fs: Sampling rate carried by the file.
+
+    Raises:
+        ValueError: When the file disagrees with the declared rate.
+    """
+    if declared_fs is None or measured_fs is None:
+        return
+
+    if int(declared_fs) != int(measured_fs):
+        raise ValueError(
+            f"{dataset_name}: {record_name} is sampled at {int(measured_fs)} Hz "
+            f"but config.yaml declares {int(declared_fs)} Hz. Preprocessing "
+            "uses the rate stored in the file, so correct the configuration or "
+            "re-download the database before relying on the result."
+        )
+
+
 def select_record_order_partition(records, data_split_mode, is_enrollment):
     """
     Select the recordings assigned to one partition of a record-order regime.
@@ -971,7 +1006,10 @@ def audit_record_order_causality(records_by_subject, data_split_mode):
     """
     subject_reports = []
     violations = []
+    separations = []
     eligible_subjects = 0
+    total_enrollment_records = 0
+    total_probe_records = 0
 
     for subject_id in sorted(records_by_subject):
         records = list(records_by_subject[subject_id])
@@ -997,6 +1035,8 @@ def audit_record_order_causality(records_by_subject, data_split_mode):
             continue
 
         eligible_subjects += 1
+        total_enrollment_records += len(enrollment_records)
+        total_probe_records += len(probe_records)
 
         enrollment_keys = [
             _record_sort_key(record, records)
@@ -1039,6 +1079,14 @@ def audit_record_order_causality(records_by_subject, data_split_mode):
                 }
             )
 
+        separation_days = _partition_separation_days(
+            enrollment_keys,
+            probe_keys,
+        )
+
+        if separation_days is not None:
+            separations.append(separation_days)
+
         subject_reports.append(
             {
                 "subject": subject_id,
@@ -1060,6 +1108,7 @@ def audit_record_order_causality(records_by_subject, data_split_mode):
                     if probe_keys
                     else None
                 ),
+                "separation_days": separation_days,
             }
         )
 
@@ -1070,7 +1119,74 @@ def audit_record_order_causality(records_by_subject, data_split_mode):
         "subjects_audited": len(subject_reports),
         "violations": violations,
         "enrollment_precedes_probe": not violations,
+        "temporal_separation": summarize_temporal_separation(
+            separations,
+            enrollment_records=total_enrollment_records,
+            probe_records=total_probe_records,
+        ),
         "subject_reports": subject_reports,
+    }
+
+
+def _partition_separation_days(enrollment_keys, probe_keys):
+    """
+    Return the whole days between the last enrollment and the first probe.
+
+    ``None`` when either partition is empty or the recordings carry no usable
+    date, so that a dataset without acquisition dates is reported as unknown
+    rather than as zero separation.
+    """
+    if not (enrollment_keys and probe_keys):
+        return None
+
+    latest_enrollment = max(enrollment_keys)[0]
+    earliest_probe = min(probe_keys)[0]
+
+    if not (
+        isinstance(latest_enrollment, datetime.date)
+        and isinstance(earliest_probe, datetime.date)
+    ):
+        return None
+
+    if datetime.date.min in (latest_enrollment, earliest_probe):
+        return None
+
+    return (earliest_probe - latest_enrollment).days
+
+
+def summarize_temporal_separation(
+    separations,
+    enrollment_records=0,
+    probe_records=0,
+):
+    """
+    Describe how far apart in time a regime placed enrollment and probes.
+
+    Some regimes separate recordings without separating days. Reporting the
+    measured gap alongside the number of recordings on each side describes what
+    a regime compared, which the name alone does not settle.
+
+    Returns ``None`` when no subject supplied a usable pair of dates.
+    """
+    usable = [
+        value for value in separations if value is not None
+    ]
+
+    if not usable:
+        return None
+
+    same_day = sum(1 for value in usable if value == 0)
+
+    return {
+        "subjects_measured": len(usable),
+        "subjects_same_day": same_day,
+        "subjects_different_day": len(usable) - same_day,
+        "enrollment_records": enrollment_records,
+        "probe_records": probe_records,
+        "separates_days": same_day == 0,
+        "min_days": min(usable),
+        "median_days": float(statistics.median(usable)),
+        "max_days": max(usable),
     }
 
 
@@ -1239,8 +1355,12 @@ class load_ecgid_dataset():
     Robust Loader for the ECG-ID Database.
     Handles automatic downloading, parsing via WFDB, and filtering.
 
-    This dataset consists of 310 recordings from 90 subjects. Recordings vary 
-    in number per subject (from 2 to 20) and are taken over different days.
+    This dataset consists of 310 recordings from 90 subjects. Recordings vary
+    in number per subject and are taken over different days. The database
+    documentation gives the per-subject range as 2 to 20 records; the released
+    files actually span 1 to 22, and 70 of the 90 subjects were recorded on a
+    single day. The long-term regimes below therefore evaluate 20 subjects
+    rather than 90.
 
     Args:
         num_beats_to_merge (int): Number of consecutive beats to fuse into a single sample. 
@@ -1258,21 +1378,32 @@ class load_ecgid_dataset():
                 - 'all-available': Loads every record (used for random beat-level splitting).
                 - 'single-session': Loads ONLY the 1st record of each subject.
                 - 'single-cross-session': 1st record = Train/Enroll, 2nd record = Test/Probe.
+                  On ECG-ID the first two records of every eligible subject were
+                  acquired on the same day, so this regime separates recordings
+                  but not sessions. Use the long-term regimes for a genuine
+                  across-day comparison.
                 - 'single-shot-short-term': Day 1's 1st record = Enroll, rest of Day 1 = Probe.
                 - 'leave-last-out-short-term': Day 1's last record = Probe, rest of Day 1 = Enroll.
                 - 'single-shot-long-term': All Day 1 records = Enroll, all future days = Probe.
                 - 'leave-last-out-long-term': Last recording day = Probe, all past days = Enroll.
         signal_type (str): Which WFDB channel to extract.
             Options:
-                - 'raw': Extracts the noisy/unfiltered channel (idx 0).
+                - 'raw': Extracts the unfiltered channel (idx 0).
                 - 'filtered': Extracts the hardware-filtered channel (idx 1).
+            Defaults to the value in ``config.yaml``, which is 'raw'. The
+            filtered channel was produced by the database authors with an
+            undocumented filter, so selecting it places an unspecified filter
+            in series with the pipeline's own band-pass and gives ECG-ID an
+            effective passband that no other dataset in the benchmark shares.
+            Reading the raw channel keeps every dataset on the same
+            preprocessing path.
         cleanup_zip (bool): If True, deletes the downloaded zip file after extraction.
         **preprocessing_params: kwargs passed directly to the Preprocessing class.
             Common options: mode='beat'|'blind', bandpass=True, normalize=True, window_len=5.0
     """
     def __init__(self, num_beats_to_merge=1, beat_merge_method="average",
                  beat_merge_stride=1,
-                 data_split_mode="all-available", signal_type="filtered",
+                 data_split_mode="all-available", signal_type=None,
                  cleanup_zip=False, preprocessing_config=None,
                  **preprocessing_params):
         
@@ -1284,6 +1415,13 @@ class load_ecgid_dataset():
         self.zip_path = self.data_root / self.cfg["zip_name"]
         self.url = self.cfg["url"]
         
+        # An explicit argument wins; otherwise the dataset entry in config.yaml
+        # supplies the default, so editing that file changes which channel is
+        # read. The resolved value is what reaches the cache identity, so a
+        # change of default regenerates cached data rather than reusing it.
+        if signal_type is None:
+            signal_type = self.cfg.get("signal_type", "raw")
+
         if signal_type not in {"raw", "filtered"}:
             raise ValueError(
                 "signal_type must be either 'raw' or 'filtered'."
@@ -1368,6 +1506,13 @@ class load_ecgid_dataset():
                                 except: pass
                     if rec_date is None: rec_date = datetime.date.min
 
+                    verify_sampling_rate(
+                        self.cfg.get("fs"),
+                        "ECG-ID",
+                        hea_path.name,
+                        record.fs,
+                    )
+
                     if metadata_only:
                         recs.append({
                             'date': rec_date,
@@ -1388,7 +1533,20 @@ class load_ecgid_dataset():
                         'fs': record.fs,
                         'filename': hea_path.name
                     })
-                except Exception as e: pass
+                except ValueError:
+                    # Raised deliberately when a recording contradicts the
+                    # dataset configuration. That is a defect in the data or the
+                    # configuration, not an unreadable file, so it must stop the
+                    # run rather than reduce the cohort.
+                    raise
+                except Exception as read_error:
+                    # A record that cannot be read shrinks the evaluated cohort,
+                    # so report it rather than letting the run continue on a
+                    # silently reduced set of recordings.
+                    print(
+                        f"[WARN] ECG-ID: skipping {hea_path.name} for subject "
+                        f"{sid}: {read_error}"
+                    )
 
             recs.sort(key=lambda x: (x['date'], self._extract_rec_number(x['filename'])))
             recordings[sid] = recs

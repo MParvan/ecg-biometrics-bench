@@ -10,7 +10,7 @@
 dataset: ecgid
 task: 5
 data_split_mode: leave-last-out-short-term
-signal_type: filtered
+signal_type: raw
 num_beats_to_merge: 1
 train_sessions: null
 enroll_sessions: null
