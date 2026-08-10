@@ -35,6 +35,20 @@ def write_record(directory, name, minutes, fs=360):
         p_signal=signal,
         write_dir=str(directory),
     )
+
+    # The loader enumerates from the shipped RECORDS manifest rather than by
+    # scanning, so a synthetic database needs one too.
+    manifest = directory / "RECORDS"
+    existing = (
+        manifest.read_text().splitlines()
+        if manifest.exists()
+        else []
+    )
+    manifest.write_text(
+        "\n".join([line for line in existing if line.strip()] + [name])
+        + "\n"
+    )
+
     return signal
 
 

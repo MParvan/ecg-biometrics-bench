@@ -2627,6 +2627,13 @@ class load_mitbih_dataset():
         cleanup_zip (bool): If True, deletes the downloaded zip file after extraction.
         **preprocessing_params: kwargs passed directly to the Preprocessing class.
     """
+    # The database documentation states that records 201 and 202 came from the
+    # same male subject, so the 48 records represent 47 people. Mapping the
+    # second record onto the first keeps one identity per person.
+    SHARED_SUBJECT_RECORDS = {
+        "202": "201",
+    }
+
     def __init__(self, leads=['MLII'], data_split_mode="all-available",
                  single_segment_range=(0, 5), train_parts=None, enrol_parts=None,
                  test_parts=None, num_beats_to_merge=1, beat_merge_method="average",
@@ -2724,12 +2731,20 @@ class load_mitbih_dataset():
             self.download()
 
         recordings = {}
-        files = list(self.dataset_root.rglob("*.hea"))
 
-        for hea in tqdm(files, desc="Loading MIT-BIH raw files"):
-            sid = hea.stem
+        for name in tqdm(self._record_names(), desc="Loading MIT-BIH raw files"):
+            hea = self.dataset_root / f"{name}.hea"
+            sid = self.SHARED_SUBJECT_RECORDS.get(name, name)
             try:
                 rec_header = wfdb.rdheader(str(hea.with_suffix("")))
+
+                verify_sampling_rate(
+                    self.cfg.get("fs"),
+                    "MIT-BIH",
+                    hea.name,
+                    rec_header.fs,
+                )
+
                 lead_indices = self._get_lead_indices(rec_header.sig_name)
                 if not lead_indices: continue
 
@@ -2743,10 +2758,55 @@ class load_mitbih_dataset():
                     if data is None:
                         continue
 
+                if sid in recordings:
+                    # A second recording of a subject already seen. Both are
+                    # continuous acquisitions of the same person, so the spans
+                    # requested from each are appended in record order.
+                    existing = recordings[sid]
+                    existing["signal"] = np.vstack(
+                        [existing["signal"], data]
+                    )
+                    existing["filename"] = (
+                        f"{existing['filename']}+{hea.name}"
+                    )
+                    continue
+
                 recordings[sid] = {"signal": data, "fs": rec_header.fs, "filename": hea.name}
-            except Exception: pass
+            except ValueError:
+                # Raised deliberately when a recording contradicts the dataset
+                # configuration, which must stop the run rather than quietly
+                # reduce the cohort.
+                raise
+            except Exception as read_error:
+                print(
+                    f"[WARN] MIT-BIH: skipping {hea.name}: {read_error}"
+                )
 
         return recordings
+
+    def _record_names(self):
+        """
+        Return the canonical record names, in the order the database lists them.
+
+        The shipped RECORDS file is the authoritative index and is already
+        sorted, which makes enumeration reproducible across filesystems. It
+        also excludes the x_mitdb directory, whose records are copies of the
+        first ten minutes of records listed here and which therefore carry no
+        additional identities.
+        """
+        manifest = self.dataset_root / "RECORDS"
+
+        if not manifest.exists():
+            raise FileNotFoundError(
+                f"MIT-BIH record list not found at {manifest}. The database "
+                "ships this file; re-download if it is missing."
+            )
+
+        return [
+            line.strip()
+            for line in manifest.read_text().splitlines()
+            if line.strip()
+        ]
 
     def _read_ranges(self, record_path, lead_indices, fs, total_samples, min_ranges):
         """

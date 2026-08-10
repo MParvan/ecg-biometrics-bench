@@ -60,7 +60,9 @@ datasets:
     root_dir: "mitbih"
     zip_name: "mitbih_Dataset.zip"
     url: "https://physionet.org/content/mitdb/get-zip/1.0.0/"
-    sample_length: 650000
+    # Declared so that a recording contradicting it stops the run. The rate
+    # stored in each WFDB header is what preprocessing uses. Protocols select
+    # minute ranges rather than a fixed sample count, so no length is declared.
     fs: 360
     preprocessing:
       mode: "beat"
