@@ -3180,12 +3180,20 @@ class load_ptbxl_dataset():
         leads (list of str): Target leads to extract.
             Options: Any valid 12-lead string (e.g., ['i', 'v5', 'avf']) or 'all' for all 12 channels.
             Default: ['i']
-        resolution (str): The sampling rate database to load.
+        resolution (str): Which of the two stored copies to read.
             Options:
-                - 'high': 500 Hz (Recommended for biometric fidelity).
-                - 'low': 100 Hz.
-        only_healthy (bool): If True, strictly evaluates the 'scp_codes' of the subject's 
-                             baseline recording and drops any subject without a 'NORM' tag.
+                - 'high': the 500 Hz copy, and the default.
+                - 'low': the 100 Hz copy.
+            Both copies hold the same 10-second recordings. The 100 Hz copy is
+            a resampling rather than a subsample, so the two are not related by
+            simple decimation and results obtained at one rate do not carry
+            over to the other. Each header is checked against the rate its
+            resolution implies.
+        only_healthy (bool): If True, keeps only subjects whose baseline
+            recording carries the 'NORM' diagnostic code, which is 8,896 of the
+            18,869 patients. Note that a record may carry 'NORM' alongside
+            another positive finding: requiring 'NORM' to be the only
+            positive code would leave 8,411 patients instead.
         data_split_mode (str): Evaluation regime mapping to strictly partition the 10-second records.
             Options:
                 - 'all-available': Loads every record (used for random beat-level splitting).
@@ -3205,13 +3213,21 @@ class load_ptbxl_dataset():
         cleanup_zip (bool): If True, deletes the downloaded zip file after extraction.
         **preprocessing_params: kwargs passed directly to the Preprocessing class.
     """
-    def __init__(self, leads=['i'], resolution='high', only_healthy=False, 
+    # PTB-XL distributes every recording twice. The rate follows from which
+    # copy is read rather than being a free choice, so it lives here instead of
+    # in config.yaml, and each header is checked against it.
+    SAMPLING_RATES = {
+        "high": 500,
+        "low": 100,
+    }
+
+    def __init__(self, leads=['i'], resolution='high', only_healthy=False,
                  data_split_mode="all-available", num_beats_to_merge=1,
                  beat_merge_method="average", beat_merge_stride=1,
                  limit_records=None,
                  cleanup_zip=False, preprocessing_config=None,
                  **preprocessing_params):
-       
+
         self.preprocessor = Preprocessing()
         self.cfg = CONFIG["datasets"]["ptbxl"]
         project_dir = Path(__file__).resolve().parent
@@ -3226,6 +3242,13 @@ class load_ptbxl_dataset():
             preprocessing_params,
         )
         self.target_leads = [l.lower() for l in leads] if isinstance(leads, list) else leads
+
+        if resolution not in self.SAMPLING_RATES:
+            raise ValueError(
+                f"resolution must be one of {sorted(self.SAMPLING_RATES)}, "
+                f"not {resolution!r}."
+            )
+
         self.resolution = resolution
         self.only_healthy = only_healthy
         self.num_beats = num_beats_to_merge
@@ -3318,6 +3341,14 @@ class load_ptbxl_dataset():
 
                 try:
                     rec_header = wfdb.rdheader(str(full_path))
+
+                    verify_sampling_rate(
+                        self.SAMPLING_RATES[self.resolution],
+                        "PTB-XL",
+                        fname_rel,
+                        rec_header.fs,
+                    )
+
                     lead_indices = self._get_lead_indices(rec_header.sig_name)
                     if not lead_indices: continue
 
@@ -3340,8 +3371,19 @@ class load_ptbxl_dataset():
                         "date": rec_dt,
                         "filename": str(fname_rel),
                     })
-                except Exception: pass
-            
+                except ValueError:
+                    # Raised deliberately when a recording contradicts the
+                    # dataset configuration, which must stop the run rather
+                    # than quietly reduce the cohort.
+                    raise
+                except Exception as read_error:
+                    # With 21,799 records a silent skip is invisible, so report
+                    # which recording was dropped and why.
+                    print(
+                        f"[WARN] PTB-XL: skipping {fname_rel} for patient "
+                        f"{pid}: {read_error}"
+                    )
+
             if recs_list: recordings[str(pid)] = recs_list
             
         return recordings

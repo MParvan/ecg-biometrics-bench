@@ -102,8 +102,10 @@ datasets:
     root_dir: "ptbxl"
     zip_name: "ptbxl_Dataset.zip"
     url: "https://physionet.org/content/ptb-xl/get-zip/1.0.3/"
-    sample_length: 5000
-    fs: 500
+    # No fs entry: PTB-XL ships every recording at both 100 Hz and 500 Hz, so
+    # the rate follows from the --resolution setting rather than being a
+    # separate choice. The loader checks each header against the rate its
+    # resolution implies.
     preprocessing:
       mode: "beat"
       pre_s: 0.2
