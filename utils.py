@@ -1674,6 +1674,7 @@ _CACHE_RELEVANT_LOADER_ATTRIBUTES = (
     "probe_sessions",
     "session_for_single_session_evaluation",
     "required_cross_sessions",
+    "electrode_unit",
     "target_leads",
     "leads",
     "single_segment_range",

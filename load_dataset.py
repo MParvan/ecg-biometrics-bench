@@ -2407,15 +2407,29 @@ class load_cybhi_dataset():
     """
     Dynamic Loader for the CYBHi Dataset.
     
-    CYBHi is designed to test biometric stability across intense physical/mental 
-    interventions (Short-Term) and across a 3-month aging gap (Long-Term).
+    CYBHi holds two collections published together, with different people,
+    hardware and session structure. The short-term collection records one
+    sitting per participant; the long-term collection records two visits about
+    three months apart.
 
     Session Tags Available for Mapping:
-      - 'short-term_CI' (Baseline Rest)
-      - 'short-term_A1' (Intervention 1 - e.g., Physical Exercise)
-      - 'short-term_A2' (Intervention 2 - e.g., Mental Stress)
-      - 'long-term_S1'  (Month 0 Baseline)
-      - 'long-term_S2'  (Month 3 Follow-up)
+      - 'short-term_CI' (Informed-consent briefing; no stimulus presented)
+      - 'short-term_A1' (Watching a low-arousal video)
+      - 'short-term_A2' (Watching a high-arousal video)
+      - 'long-term_S1'  (First visit)
+      - 'long-term_S2'  (Second visit, about three months later)
+
+    The three short-term moments belong to a single sitting a few minutes
+    apart, so pairing them measures tolerance to an induced change in
+    emotional arousal rather than to a separation between sessions. Only the
+    long-term pair is a comparison across visits.
+
+    The recordings carry heavy 50 Hz mains interference, most of all on the
+    electrolycra unit where it dominates the spectrum. The pipeline band-pass
+    is therefore doing essential work here and should not be weakened: without
+    it these signals are largely hum. The sensor is documented as applying a
+    1-30 Hz band-pass in hardware, but mains energy survives in the released
+    files, so the data cannot be treated as already band-limited.
 
     Args:
         data_split_mode (str): The routing logic for data extraction.
@@ -2431,6 +2445,17 @@ class load_cybhi_dataset():
             Example: 'long-term_S1'
         probe_sessions (str or list): Session(s) to load for Test queries.
             Example: 'long-term_S2'
+        electrode_unit (str): Which short-term acquiring unit to read.
+            Options:
+                - '8B': hand palms, Ag/AgCl electrodes. The default.
+                - '85': index and middle fingers, electrolycra.
+                - 'both': pool the two, for an electrode-material comparison.
+            Every short-term acquisition was recorded by both units at once, so
+            the choice holds subject and moment fixed and varies only the
+            electrode. The electrolycra recordings carry markedly more noise
+            and yield far fewer detectable beats, which is what the dataset was
+            built to demonstrate. Defaults to the value in ``config.yaml``.
+            The long-term collection has one unit and is unaffected.
         num_beats_to_merge (int): Number of consecutive beats to fuse into a single sample.
         beat_merge_method (str): Strategy for fusing beats. Options: ['average', 'concat']
         beat_merge_stride (int): Step between consecutive merge windows.
@@ -2440,16 +2465,29 @@ class load_cybhi_dataset():
         cleanup_zip (bool): If True, deletes the downloaded zip file after extraction.
         **preprocessing_params: kwargs passed directly to the Preprocessing class.
     """
-    def __init__(self, data_split_mode="cross-session", 
+    # Subject codes present in the data that do not correspond to a study
+    # participant. VIDEOPRINT is a test acquisition: it has no baseline moment,
+    # spans two collection days, and is absent from the shipped participant
+    # list.
+    EXCLUDED_CODES = frozenset({"VIDEOPRINT"})
+
+    # Every short-term acquisition was recorded simultaneously by two units
+    # with different electrodes, distinguished by the filename suffix:
+    # 8B from the hand palms with Ag/AgCl electrodes, and 85 from the fingers
+    # with electrolycra. The long-term unit, 35, is unaffected by this choice.
+    SHORT_TERM_UNITS = ("8B", "85", "both")
+
+    def __init__(self, data_split_mode="cross-session",
                  session_for_single_session_evaluation=["long-term_S1"],
-                 train_sessions=["long-term_S1"], 
+                 train_sessions=["long-term_S1"],
                  enroll_sessions=["long-term_S1"],
                  probe_sessions=["long-term_S2"],
+                 electrode_unit=None,
                  num_beats_to_merge=1, beat_merge_method="average",
                  beat_merge_stride=1,
                  cleanup_zip=False, preprocessing_config=None,
                  **preprocessing_params):
-        
+
         self.preprocessor = Preprocessing()
         self.cfg = CONFIG["datasets"]["cybhi"]
         project_dir = Path(__file__).resolve().parent
@@ -2457,7 +2495,23 @@ class load_cybhi_dataset():
         self.dataset_root = self.data_root / self.cfg["root_dir"]
         self.zip_path = self.data_root / self.cfg["zip_name"]
         self.url = self.cfg["url"]
-        
+
+        # An explicit argument wins; otherwise the dataset entry in config.yaml
+        # supplies the default. The electrolycra recordings mostly defeat beat
+        # detection, so the Ag/AgCl unit is the default and 'both' restores the
+        # pooled behaviour for an electrode comparison.
+        if electrode_unit is None:
+            electrode_unit = self.cfg.get("electrode_unit", "8B")
+
+        if electrode_unit not in self.SHORT_TERM_UNITS:
+            raise ValueError(
+                f"electrode_unit must be one of {list(self.SHORT_TERM_UNITS)}, "
+                f"not {electrode_unit!r}."
+            )
+
+        self.electrode_unit = electrode_unit
+        self.fs = int(self.cfg.get("fs", 1000))
+
         self.prep_params = _normalize_preprocessing_config(
             self.cfg.get("preprocessing", {}),
             preprocessing_config,
@@ -2496,31 +2550,36 @@ class load_cybhi_dataset():
 
     def _parse_file_info(self, filename):
         """
-        Parses strictly based on CYBHi format seen in screenshots: 
-        [Date] - [SID] - [Session/Intervention] - [Sensor/Extra]
+        Parse one CYBHi filename:
+        [Date] - [SID] - [Session/Intervention] - [Acquiring unit]
         """
         clean = filename.replace('.txt', '').replace('._', '')
         parts = clean.split('-')
-        
+
         rec_date = datetime.date.min
         sid = "UNKNOWN"
         session_code = "UNKNOWN"
-        
+        unit = "UNKNOWN"
+
         if len(parts) >= 3:
             # 1. Date (e.g., 20110715)
             if len(parts[0]) == 8 and parts[0].isdigit():
-                try: 
+                try:
                     rec_date = datetime.datetime.strptime(parts[0], "%Y%m%d").date()
-                except ValueError: 
+                except ValueError:
                     pass
-            
+
             # 2. Subject ID (e.g., MLS)
             sid = parts[1].upper()
-            
+
             # 3. Session Code (e.g., A1, CI, A0)
             session_code = parts[2].upper()
-            
-        return rec_date, sid, session_code
+
+        if len(parts) >= 4:
+            # 4. Acquiring unit (e.g., 8B, 85, 35)
+            unit = parts[3].upper()
+
+        return rec_date, sid, session_code, unit
 
     def _read_signal(self, fpath):
         """Bulletproof Pandas reader using the fast C engine and native comment skipping."""
@@ -2546,25 +2605,40 @@ class load_cybhi_dataset():
         st_pool = {} # Short-Term
         lt_pool = {} # Long-Term
 
-        # 1. Distribute files to proper pools based on exact folder names
-        for root, _, files in os.walk(self.dataset_root):
-            path_str = str(root).lower()
-            is_st = "short-term" in path_str or "ci" in path_str
-            is_lt = "long-term" in path_str or "a0" in path_str
+        # 1. Distribute files to the two collections. The collection is decided
+        # by the exact directory names on the path, never by substring matching
+        # against the whole path: the absolute path also contains the location
+        # the repository was cloned into, which must not influence which pool a
+        # recording lands in. Directories and files are visited in sorted order
+        # so enumeration does not depend on the filesystem.
+        for root, dirs, files in os.walk(self.dataset_root):
+            dirs.sort()
+            components = {part.lower() for part in Path(root).parts}
+
+            # The archive ships a __MACOSX tree of resource forks; skip it.
+            if "__macosx" in components:
+                continue
+
+            is_st = "short-term" in components
+            is_lt = "long-term" in components
 
             if not is_st and not is_lt: continue
 
-            for f in files:
+            for f in sorted(files):
                 # IMPORTANT: Skip macOS hidden metadata files that crash the reader
-                if not f.endswith(".txt") or f.startswith("._"): 
+                if not f.endswith(".txt") or f.startswith("._"):
                     continue
-                    
+
                 fpath = Path(root) / f
-                rec_date, sid, session_code = self._parse_file_info(f)
-                
+                rec_date, sid, session_code, unit = self._parse_file_info(f)
+
                 if sid == "UNKNOWN": continue
-                
+                if sid in self.EXCLUDED_CODES: continue
+
                 if is_st:
+                    # Keep only the recordings of the selected acquiring unit.
+                    if self.electrode_unit != "both" and unit != self.electrode_unit:
+                        continue
                     if sid not in st_pool: st_pool[sid] = []
                     st_pool[sid].append({"path": fpath, "date": rec_date, "code": session_code})
                 elif is_lt:
@@ -2582,7 +2656,7 @@ class load_cybhi_dataset():
                 
                 sig = self._read_signal(rec['path'])
                 if sig is not None:
-                    recordings[sid][tag].append({'signal': sig, 'fs': 1000})
+                    recordings[sid][tag].append({'signal': sig, 'fs': self.fs})
 
         # 3. Load Long-Term signals by date sequence (Month 0 vs Month 3)
         for sid, recs in tqdm(lt_pool.items(), desc="Loading long-term raw files"):
@@ -2598,7 +2672,7 @@ class load_cybhi_dataset():
                 
                 sig = self._read_signal(rec['path'])
                 if sig is not None:
-                    recordings[sid][tag].append({'signal': sig, 'fs': 1000})
+                    recordings[sid][tag].append({'signal': sig, 'fs': self.fs})
 
         return recordings
 

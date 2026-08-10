@@ -154,8 +154,15 @@ datasets:
     root_dir: "cybhi"
     zip_name: "cybhi_Dataset.zip"
     url: "https://zenodo.org/records/2381823/files/CYBHi.zip"
-    sample_length: null
     fs: 1000
+    # Short-term acquisitions were recorded simultaneously by two units:
+    # "8B" from the hand palms with Ag/AgCl electrodes, "85" from the fingers
+    # with electrolycra. The electrolycra recordings mostly defeat beat
+    # detection, so the Ag/AgCl unit is the default; "both" pools the two for
+    # an electrode comparison. Overridden by the electrode_unit argument.
+    electrode_unit: "8B"
+    # Column holding the ECG in the seven-column short-term files; long-term
+    # files have a single column and fall back to it.
     ecg_column: 3
     preprocessing:
       mode: "beat"
