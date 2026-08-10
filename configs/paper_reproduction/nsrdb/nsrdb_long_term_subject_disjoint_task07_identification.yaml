@@ -23,8 +23,8 @@ enrol_parts:
 - - 0
   - 5
 test_parts:
-- - 1430
-  - 1435
+- - 1380
+  - 1385
 model: deepecg
 epochs: 250
 batch_size: 256

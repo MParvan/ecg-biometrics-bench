@@ -90,7 +90,7 @@ python -m scripts.audit_temporal_causality --config configs/paper_reproduction/m
 The framework uses the training partition as the enrollment/gallery partition, so multi-shot configurations pool all historical enrollment windows into `train_parts` or `train_sessions`:
 
 - MIT-BIH multi-shot: 0-5 and 12.5-17.5 minutes; probe 25-30 minutes.
-- NSRDB multi-shot: 0-5, 120-125, 360-365, and 720-725 minutes; probe 1430-1435 minutes.
+- NSRDB multi-shot: 0-5, 120-125, 360-365, and 720-725 minutes; probe 1380-1385 minutes. The probe window ends before the shortest recording, which runs to 1388 minutes, so all 18 subjects are probed rather than only those whose recording extends further.
 - Heartprint S1-S2-S3R and S1-S2-S3L: sessions 1 and 2 are pooled for training/enrollment; session 3R or 3L is the probe.
 
 A protocol that instead keeps separate historical training and enrollment partitions will not produce identical numbers, because the gallery is then built from different data.

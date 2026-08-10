@@ -3287,16 +3287,23 @@ class load_nsrdb_dataset():
             self.download()
             
         recordings = {}
-        files = list(self.dataset_root.rglob("*.hea"))
-        
-        for hea in tqdm(files, desc="Loading NSRDB specific slices"):
-            sid = hea.stem
+
+        for name in tqdm(self._record_names(), desc="Loading NSRDB specific slices"):
+            hea = self.dataset_root / f"{name}.hea"
+            sid = name
             try:
                 # 1. Read lightweight header to get total length and sampling rate
                 rec_header = wfdb.rdheader(str(hea.with_suffix("")))
                 total_samples = rec_header.sig_len
                 fs = rec_header.fs
-                
+
+                verify_sampling_rate(
+                    self.cfg.get("fs"),
+                    "NSRDB",
+                    hea.name,
+                    fs,
+                )
+
                 lead_indices = self._get_lead_indices(rec_header.sig_name)
                 if not lead_indices: continue
 
@@ -3321,9 +3328,38 @@ class load_nsrdb_dataset():
                         if sid not in recordings: recordings[sid] = []
                         recordings[sid].append({"signal": data, "fs": fs, "filename": hea.name})
                         
-            except Exception: pass
-            
+            except ValueError:
+                # Raised deliberately when a recording contradicts the dataset
+                # configuration, which must stop the run rather than quietly
+                # reduce the cohort.
+                raise
+            except Exception as read_error:
+                print(
+                    f"[WARN] NSRDB: skipping {hea.name}: {read_error}"
+                )
+
         return recordings
+
+    def _record_names(self):
+        """
+        Return the record names, in the order the database lists them.
+
+        The shipped RECORDS file is the authoritative index and is already
+        sorted, which makes enumeration reproducible across filesystems.
+        """
+        manifest = self.dataset_root / "RECORDS"
+
+        if not manifest.exists():
+            raise FileNotFoundError(
+                f"NSRDB record list not found at {manifest}. The database "
+                "ships this file; re-download if it is missing."
+            )
+
+        return [
+            line.strip()
+            for line in manifest.read_text().splitlines()
+            if line.strip()
+        ]
 
     def _process_signal(self, sig, fs):
         """Applies filters, segmentation, and multi-beat merging."""

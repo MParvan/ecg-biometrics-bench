@@ -84,7 +84,9 @@ datasets:
     root_dir: "nsrdb"
     zip_name: "nsrdb_Dataset.zip"
     url: "https://physionet.org/content/nsrdb/get-zip/1.0.0/"
-    sample_length: null            # Varies (24h)
+    # Declared so that a recording contradicting it stops the run. The rate
+    # stored in each WFDB header is what preprocessing uses. Protocols select
+    # minute ranges rather than a fixed sample count, so no length is declared.
     fs: 128
     preprocessing:
       mode: "beat"
