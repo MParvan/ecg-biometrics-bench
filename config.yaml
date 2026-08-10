@@ -36,7 +36,9 @@ datasets:
     root_dir: "ptb"
     zip_name: "ptb_Dataset.zip"
     url: "https://physionet.org/content/ptbdb/get-zip/1.0.0/"
-    sample_length: null            # Varies
+    # Declared so that a recording contradicting it stops the run. The rate
+    # stored in each WFDB header is what preprocessing uses. Record duration
+    # varies from 32 to 120 seconds, so there is no single sample length.
     fs: 1000
     preprocessing:
       mode: "beat"

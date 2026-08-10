@@ -2089,7 +2089,19 @@ class load_ptb_dataset():
             if pid not in patient_groups: patient_groups[pid] = []
             patient_groups[pid].append(f)
 
-        # Base date for synthetic injection
+        # 541 of the 549 records state an acquisition date in the header. The
+        # remaining eight receive synthetic dates from a counter starting well
+        # in the future, so they sort after every dated record and the ordering
+        # stays deterministic.
+        #
+        # Seven of the eight belong to patients whose only recording is that
+        # record, so they are dropped by every regime that requires two
+        # recordings and their date is never used. The exception is
+        # patient180/s0561_re, whose patient has six dated records: the
+        # synthetic date makes it the probe under leave-last-out-long-term.
+        # Placing it last is consistent with the numbering, which follows
+        # acquisition order for 112 of the 113 patients that have more than one
+        # dated record, and s0561 is the highest number this patient carries.
         dummy_date = datetime.date(2099, 1, 1)
 
         for sid, p_files in tqdm(sorted(patient_groups.items()), desc="Loading PTB raw files"):
@@ -2105,6 +2117,14 @@ class load_ptb_dataset():
             for hea in p_files:
                 try:
                     rec_header = wfdb.rdheader(str(hea.with_suffix("")))
+
+                    verify_sampling_rate(
+                        self.cfg.get("fs"),
+                        "PTB",
+                        hea.name,
+                        rec_header.fs,
+                    )
+
                     lead_indices = self._get_lead_indices(rec_header.sig_name)
                     if not lead_indices: continue
 
@@ -2115,7 +2135,7 @@ class load_ptb_dataset():
                     dt = rec_header.base_date
                     if dt is None: dt = self._parse_date_from_comments(rec_header.comments)
 
-                    # Assign a synthetic sequential date if none is found
+                    # No date in the header; take the next synthetic one.
                     if dt is None:
                         dt = dummy_date
                         dummy_date += datetime.timedelta(days=1)
@@ -2132,8 +2152,19 @@ class load_ptb_dataset():
                         record_entry["signal"] = data
 
                     recs.append(record_entry)
-                except Exception: pass
-            
+                except ValueError:
+                    # Raised deliberately when a recording contradicts the
+                    # dataset configuration, which must stop the run rather
+                    # than quietly reduce the cohort.
+                    raise
+                except Exception as read_error:
+                    # A record that cannot be read shrinks the evaluated
+                    # cohort, so report it rather than dropping it in silence.
+                    print(
+                        f"[WARN] PTB: skipping {hea.name} for {sid}: "
+                        f"{read_error}"
+                    )
+
             if recs:
                 recs.sort(key=lambda x: (x["date"], x["filename"]))
                 recordings[sid] = recs
