@@ -130,9 +130,10 @@ datasets:
     root_dir: "heartprint"
     zip_name: "Heartprint_Dataset.zip"
     url: "https://figshare.com/ndownloader/articles/20105354/versions/3"
-    sample_length: 3747            # Exact length per file
+    # Each file holds 7,500 lines of which the first 3,747 are signal; the
+    # remainder is written by the recording device and is excluded.
+    sample_length: 3747
     fs: 250
-    sessions: ["Session-1", "Session-2", "Session-3L", "Session-3R"]
     preprocessing:
       mode: "beat"
       pre_s: 0.2

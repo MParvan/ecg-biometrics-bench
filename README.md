@@ -119,7 +119,7 @@ The framework provides plug-and-play automated download and parsing for the foll
 3. **MIT-BIH Arrhythmia**: 47 subjects, continuous 30-minute Holter recordings.
 4. **NSRDB**: 18 subjects, extremely long-term 24-hour continuous recordings.
 5. **PTB-XL**: Massive 21k+ clinical record database (10-second segments).
-6. **HeartPrint**: Highly structured multi-session dataset (Baseline, Post-Exercise, Cognitive tasks, Temporal separation).
+6. **HeartPrint**: 199 subjects, 1,539 records, single lead from the thumbs of both hands at 250 Hz, collected over ten years. Four session folders: `session1` and `session2` are separate visits, while `session3r` and `session3l` are the reading condition and the long interval of the *same* third visit. Because those two share 135 recordings, the loader refuses a protocol that enrols or trains on one and probes the other. Two subjects who attended only once have that single sitting filed under both `session1` and `session2`; the loader keeps the `session1` copy and drops the repeat, so `session1` to `session2` evaluates 197 subjects rather than 199.
 7. **CYBHi**: Designed for short-term and long-term (3-month gap) biometric stability.
 
 ---

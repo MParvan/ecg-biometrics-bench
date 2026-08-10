@@ -15,6 +15,7 @@ import wfdb
 import re
 import patoolib
 import collections
+import hashlib
 import statistics
 from tqdm import tqdm  # For real-time progress bars
 from preprocessing import Preprocessing
@@ -1704,9 +1705,37 @@ class load_heartprint_dataset():
         cleanup_zip (bool): If True, deletes the downloaded zip file after extraction.
         **preprocessing_params: kwargs passed directly to the Preprocessing class.
     """
-    def __init__(self, data_split_mode="cross-session", 
+    # Sessions are read in this order so that enumeration, and the choice of
+    # which copy of a repeated recording to keep, do not depend on the
+    # filesystem.
+    SESSION_ORDER = (
+        "session1",
+        "session2",
+        "session3r",
+        "session3l",
+    )
+
+    # The visit each session belongs to. S3R holds the recordings made in the
+    # reading condition and S3L those separated from the first session by a
+    # long interval, but both come from the third visit, so one recording can
+    # legitimately appear under both tags.
+    SESSION_VISIT = {
+        "session1": "visit1",
+        "session2": "visit2",
+        "session3r": "visit3",
+        "session3l": "visit3",
+    }
+
+    # Pairs that describe one visit and therefore share recordings. Using one
+    # to enrol and the other to probe would compare recordings against
+    # themselves for 45 of the 78 subjects present in both.
+    SAME_VISIT_SESSION_PAIRS = (
+        ("session3r", "session3l"),
+    )
+
+    def __init__(self, data_split_mode="cross-session",
                  session_for_single_session_evaluation=["session1"],
-                 train_sessions=["session1"], 
+                 train_sessions=["session1"],
                  enroll_sessions=["session1"],
                  probe_sessions=["session2"],
                  num_beats_to_merge=1, beat_merge_method="average",
@@ -1723,6 +1752,7 @@ class load_heartprint_dataset():
         self.url = self.cfg["url"]
         
         self.sample_len = self.cfg.get("sample_length", 3747)
+        self.fs = int(self.cfg.get("fs", 250))
         self.prep_params = _normalize_preprocessing_config(
             self.cfg.get("preprocessing", {}),
             preprocessing_config,
@@ -1735,7 +1765,7 @@ class load_heartprint_dataset():
             num_beats_to_merge,
         )
         self.cleanup_zip = cleanup_zip
-        
+
         valid_modes = ["single-session", "cross-session"]
         if data_split_mode not in valid_modes:
             raise ValueError(f"Invalid mode: {data_split_mode}. Use {valid_modes}")
@@ -1756,6 +1786,8 @@ class load_heartprint_dataset():
         self._normalize_sessions(self.probe_sessions)
         
         self.required_cross_sessions = list(set(self.train_sessions + self.enroll_sessions + self.probe_sessions))
+
+        self._reject_same_visit_pairing()
         
         if self.data_split_mode == "single-session" and not self.session_for_single_session_evaluation:
             raise ValueError("You must provide `session_for_single_session_evaluation`.")
@@ -1810,6 +1842,33 @@ class load_heartprint_dataset():
             print(f"[WARN] Automated download failed: {e}")
             print("Please download manually and extract to:", self.dataset_root)
 
+    def _reject_same_visit_pairing(self):
+        """
+        Refuse a protocol that enrols and probes on two tags of one visit.
+
+        S3R and S3L label the reading condition and the long interval of the
+        same third visit, so 135 recordings appear under both. Using one to
+        enrol and the other to probe compares recordings against themselves for
+        45 of the 78 subjects present in both, which reports a similarity that
+        no separation produced.
+        """
+        enrolment = set(self.train_sessions) | set(self.enroll_sessions)
+        probes = set(self.probe_sessions)
+
+        for first, second in self.SAME_VISIT_SESSION_PAIRS:
+            crosses = (
+                (first in enrolment and second in probes)
+                or (second in enrolment and first in probes)
+            )
+
+            if crosses:
+                raise ValueError(
+                    f"HeartPrint: '{first}' and '{second}' are two labels on "
+                    "the same visit and share recordings, so one cannot enrol "
+                    "while the other probes. Probe against 'session1' or "
+                    "'session2' for a comparison across visits."
+                )
+
     def load_raw_data(self):
         """
         Scans the HeartPrint directory and maps valid text files to their explicit Session and Subject ID.
@@ -1819,9 +1878,12 @@ class load_heartprint_dataset():
 
         print("\n[INFO] Scanning directories and pooling HeartPrint files...")
         session_dirs = {}
-        
-        # 1. Identify the core session folders safely
+
+        # 1. Identify the core session folders safely. Directories are walked in
+        # sorted order so that the same tree always yields the same folder for
+        # a given session tag.
         for root, dirs, files in os.walk(self.dataset_root):
+            dirs.sort()
             for d in dirs:
                 d_norm = d.lower().replace("-", "").replace("_", "").replace(" ", "")
                 if "session1" in d_norm: session_dirs["session1"] = Path(root) / d
@@ -1830,30 +1892,73 @@ class load_heartprint_dataset():
                 elif "session3l" in d_norm or ("session3" in d_norm and "l" in d_norm): session_dirs["session3l"] = Path(root) / d
 
         recordings = {}
-        
+
+        # Recordings already seen for a subject, keyed by content, together
+        # with the visit they were first seen in. Session-2 holds a
+        # byte-identical copy of the Session-1 recordings of two subjects who
+        # attended only once, which would otherwise make an enrolment and its
+        # probe the same signal. A recording shared between session3r and
+        # session3l is not the same case: those are two labels on one visit, so
+        # the same recording belongs under both and is kept.
+        seen_by_subject = {}
+        duplicate_count = 0
+
         # 2. Extract records, ensuring we skip hidden macOS files
-        for session_tag, sess_path in session_dirs.items():
-            for sid in tqdm(os.listdir(sess_path), desc=f"Loading {session_tag.upper()} raw files"):
+        for session_tag in self.SESSION_ORDER:
+            sess_path = session_dirs.get(session_tag)
+            if sess_path is None:
+                continue
+
+            subject_ids = sorted(
+                entry.name
+                for entry in sess_path.iterdir()
+                if entry.is_dir()
+            )
+
+            for sid in tqdm(subject_ids, desc=f"Loading {session_tag.upper()} raw files"):
                 subj_path = sess_path / sid
-                if not subj_path.is_dir(): continue
-                
+
                 if sid not in recordings: recordings[sid] = {}
                 if session_tag not in recordings[sid]: recordings[sid][session_tag] = []
-                
-                for f in os.listdir(subj_path):
-                    if not f.endswith(".txt") or f.startswith("._"): continue
-                    
-                    fpath = subj_path / f
+
+                for fpath in sorted(subj_path.glob("*.txt")):
+                    if fpath.name.startswith("._"): continue
+
                     try:
+                        digest = hashlib.sha256(
+                            fpath.read_bytes()
+                        ).hexdigest()
+
+                        visit = self.SESSION_VISIT[session_tag]
+                        first_visit = seen_by_subject.setdefault(
+                            sid, {}
+                        ).get(digest)
+
+                        if first_visit is not None and first_visit != visit:
+                            duplicate_count += 1
+                            continue
+
+                        seen_by_subject[sid].setdefault(digest, visit)
+
                         # High-Speed parsing: Bypasses headers and stops at the sample length
                         df = pd.read_csv(fpath, comment='#', delim_whitespace=True, header=None, nrows=self.sample_len, on_bad_lines='skip')
                         if not df.empty:
                             sig = df.iloc[:, 0].dropna().values.astype(float)
                             sig = sig - np.mean(sig) # Zero-mean baseline
-                            recordings[sid][session_tag].append({'signal': sig, 'fs': 250})
+                            recordings[sid][session_tag].append({
+                                'signal': sig,
+                                'fs': self.fs,
+                                'filename': fpath.name,
+                            })
                     except Exception as e:
-                        print(f"\n[WARN] Failed to read {f}: {e}")
-                        
+                        print(f"\n[WARN] Failed to read {fpath.name}: {e}")
+
+        if duplicate_count:
+            print(
+                f"[INFO] HeartPrint: skipped {duplicate_count} recording(s) "
+                "that repeat an earlier session of the same subject."
+            )
+
         return recordings
 
     def _process_signal(self, sig, fs=250):
