@@ -36,6 +36,7 @@ preprocessing_parameters:
   stride_s: 1.0
   rpeak_method: pantompkins
   align_peak: true
+  align_window_s: 0.10
   filter_method: butter
   filter_parameters:
     low: 0.5
