@@ -210,10 +210,14 @@ class CommandLineValidationTests(unittest.TestCase):
         self.assertIsNone(args.target_fars)
 
     def test_valid_targets_are_accepted(self):
+        # Task 4 enrolls and probes on the same unseen subjects, so it asks for
+        # the gallery budget to be stated.
         args, _ = self._parse(
             [
                 "--task",
                 "4",
+                "--template_size",
+                "1",
                 "--target_fars",
                 "0.01",
                 "0.001",

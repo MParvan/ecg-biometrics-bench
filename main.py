@@ -956,6 +956,18 @@ def validate_experiment_arguments(args, parser):
         )
 
     if (
+        args.task in [3, 4]
+        and args.use_template
+        and args.template_size is None
+    ):
+        parser.error(
+            f"Task {args.task} draws enrollment and probe samples from the "
+            "same unseen subjects, so the gallery budget decides how many "
+            "beats are left to probe with. Give 'template_size' an explicit "
+            "positive integer; the paper configurations use 1."
+        )
+
+    if (
         args.use_deployment_evaluation
         and args.val_split <= 0.0
     ):

@@ -5183,7 +5183,14 @@ def run_subject_disjoint_identification(x, y, model_class, epochs=150, batch_siz
     # --------------------------------------
     
     if template_size is None:
-        template_size = 1 # Fallback to single-shot enrollment
+        raise ValueError(
+            "Subject-disjoint identification needs an explicit template_size. "
+            "Enrollment and probe samples come from the same unseen subjects "
+            "here, so the gallery budget decides how many beats are left to "
+            "probe with and cannot be inferred from the partition. Set "
+            "template_size to the number of enrollment beats per subject; the "
+            "paper configurations use 1."
+        )
 
     # ====================================================
     # 0. Capture Hyperparameters for Logger & MULTI-RUN AGGREGATOR
@@ -5816,7 +5823,14 @@ def run_subject_disjoint_verification(x, y, model_class, epochs=150, batch_size=
     # ----------------------------
 
     if use_template and template_size is None:
-        template_size = 1
+        raise ValueError(
+            "Subject-disjoint verification needs an explicit template_size. "
+            "Enrollment and probe samples come from the same unseen subjects "
+            "here, so the gallery budget decides how many beats are left to "
+            "probe with and cannot be inferred from the partition. Set "
+            "template_size to the number of enrollment beats per subject; the "
+            "paper configurations use 1."
+        )
 
     augmentation_config = (
         _normalize_augmentation_config(
