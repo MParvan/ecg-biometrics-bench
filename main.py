@@ -14,7 +14,8 @@ import utils
 # Import Dataset Loaders
 from load_dataset import (
     load_ecgid_dataset, load_heartprint_dataset, load_ptb_dataset, 
-    load_cybhi_dataset, load_mitbih_dataset, load_nsrdb_dataset, load_ptbxl_dataset
+    load_cybhi_dataset, load_mitbih_dataset, load_nsrdb_dataset, load_ptbxl_dataset,
+    BeatProvenance
 )
 
 # Import Task Runners
@@ -1599,35 +1600,40 @@ def main():
                 data_config,
             )
             
-            if cached_data:
-                print(f"\n[INFO] Loaded precomputed data from cache (Hash: {uid})")
-                x, y = cached_data['x'], cached_data['y']
+            cached_provenance = None
+            if cached_data and "x" in cached_data and "y" in cached_data:
+                cached_provenance = BeatProvenance.from_cache_dict(
+                    cached_data,
+                    expected_length=len(cached_data["y"]),
+                )
+
+            if cached_provenance is not None:
+                print(f"[INFO] Loaded precomputed data from cache (Hash: {uid})")
+                x, y = cached_data["x"], cached_data["y"]
+                provenance = cached_provenance
             else:
-                if args.dataset in [
-                    "cybhi",
-                    "heartprint",
+                if args.dataset in ["cybhi", "heartprint"]:
+                    x, y, provenance = loader.load_session(
+                        "train", return_provenance=True
+                    )
+                elif args.data_split_mode in [
+                    "all-available",
+                    "single-session",
+                    "single-segment",
                 ]:
-                    x, y = loader.load_session(
-                        "train"
+                    x, y, provenance = loader.load_all_data(
+                        return_provenance=True
                     )
                 else:
-                    if args.data_split_mode in [
-                        "all-available",
-                        "single-session",
-                        "single-segment",
-                    ]:
-                        x, y = loader.load_all_data()
-                    else:
-                        x, y = loader.load_session(
-                            "train"
-                        )
+                    x, y, provenance = loader.load_session(
+                        "train", return_provenance=True
+                    )
+                cache_arrays = {"x": x, "y": y}
+                cache_arrays.update(provenance.to_cache_dict())
                 run._timed_runtime_call(
                     "Data Cache Write",
                     cache.save_data_cache,
-                    {
-                        "x": x,
-                        "y": y,
-                    },
+                    cache_arrays,
                     data_config,
                     uid,
                 )
@@ -1650,22 +1656,52 @@ def main():
                 data_config,
             )
             
-            if cached_data:
-                print(f"\n[INFO] Loaded precomputed cross-session data from cache (Hash: {uid})")
-                x_s1, y_s1 = cached_data['x_s1'], cached_data['y_s1']
-                x_s2, y_s2 = cached_data['x_s2'], cached_data['y_s2']
+            cached_provenance_s1 = None
+            cached_provenance_s2 = None
+            if cached_data and "y_s1" in cached_data and "y_s2" in cached_data:
+                cached_provenance_s1 = BeatProvenance.from_cache_dict(
+                    cached_data,
+                    prefix="provenance_s1__",
+                    expected_length=len(cached_data["y_s1"]),
+                )
+                cached_provenance_s2 = BeatProvenance.from_cache_dict(
+                    cached_data,
+                    prefix="provenance_s2__",
+                    expected_length=len(cached_data["y_s2"]),
+                )
+
+            if (
+                cached_provenance_s1 is not None
+                and cached_provenance_s2 is not None
+            ):
+                print(f"[INFO] Loaded precomputed cross-session data from cache (Hash: {uid})")
+                x_s1, y_s1 = cached_data["x_s1"], cached_data["y_s1"]
+                x_s2, y_s2 = cached_data["x_s2"], cached_data["y_s2"]
+                provenance_s1 = cached_provenance_s1
+                provenance_s2 = cached_provenance_s2
             else:
-                x_s1, y_s1 = loader.load_session("train")
-                x_s2, y_s2 = loader.load_session("test")
+                x_s1, y_s1, provenance_s1 = loader.load_session(
+                    "train", return_provenance=True
+                )
+                x_s2, y_s2, provenance_s2 = loader.load_session(
+                    "test", return_provenance=True
+                )
+                cache_arrays = {
+                    "x_s1": x_s1,
+                    "y_s1": y_s1,
+                    "x_s2": x_s2,
+                    "y_s2": y_s2,
+                }
+                cache_arrays.update(
+                    provenance_s1.to_cache_dict(prefix="provenance_s1__")
+                )
+                cache_arrays.update(
+                    provenance_s2.to_cache_dict(prefix="provenance_s2__")
+                )
                 run._timed_runtime_call(
                     "Data Cache Write",
                     cache.save_data_cache,
-                    {
-                        "x_s1": x_s1,
-                        "y_s1": y_s1,
-                        "x_s2": x_s2,
-                        "y_s2": y_s2,
-                    },
+                    cache_arrays,
                     data_config,
                     uid,
                 )

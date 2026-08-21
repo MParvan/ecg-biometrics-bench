@@ -21,6 +21,265 @@ from tqdm import tqdm  # For real-time progress bars
 from preprocessing import Preprocessing
 
 # =============================================================================
+# PER-BEAT SOURCE PROVENANCE
+# =============================================================================
+# Every returned beat can be traced back to the recording, acquisition and
+# source segment it was extracted from. The representation is columnar: one
+# array per field, all sharing the first axis with the returned ``X``/``y``.
+# Subject identity stays in ``y`` and is not duplicated here.
+#
+# ``acquisition_time`` is the genuine acquisition date or datetime when the
+# source states one and ``None`` otherwise; it is never fabricated. When a role
+# must be ordered and some acquisitions state no time, ``acquisition_order``
+# supplies a stable dataset-defined order instead, which is a deterministic
+# source order rather than a chronology. ``source_segment_order`` carries a
+# numeric source position (a start minute or sample) so segments order without
+# relying on lexical ``source_segment_id`` comparison.
+
+PROVENANCE_COLUMNS = (
+    "record_id",
+    "session_id",
+    "acquisition_time",
+    "acquisition_order",
+    "source_segment_id",
+    "source_segment_order",
+    "beat_ordinal",
+    "rpeak_index",
+)
+
+_PROVENANCE_OBJECT_COLUMNS = frozenset(
+    {
+        "record_id",
+        "session_id",
+        "acquisition_time",
+        "source_segment_id",
+    }
+)
+
+_PROVENANCE_INT_COLUMNS = frozenset(
+    {
+        "acquisition_order",
+        "beat_ordinal",
+        "rpeak_index",
+    }
+)
+
+
+def _provenance_column_dtype(name):
+    if name in _PROVENANCE_OBJECT_COLUMNS:
+        return object
+    if name in _PROVENANCE_INT_COLUMNS:
+        return np.int64
+    return np.float64
+
+
+class BeatProvenance:
+    """Columnar per-beat source provenance aligned to ``X`` and ``y``."""
+
+    __slots__ = ("columns",)
+
+    def __init__(self, columns):
+        self.columns = dict(columns)
+        lengths = {len(value) for value in self.columns.values()}
+        if len(lengths) > 1:
+            raise ValueError(
+                "All provenance columns must share one length."
+            )
+
+    def __len__(self):
+        if not self.columns:
+            return 0
+        return len(next(iter(self.columns.values())))
+
+    @classmethod
+    def empty(cls):
+        return cls(
+            {
+                name: np.empty(
+                    (0,),
+                    dtype=_provenance_column_dtype(name),
+                )
+                for name in PROVENANCE_COLUMNS
+            }
+        )
+
+    def validate(self, expected_length=None):
+        missing = [
+            name for name in PROVENANCE_COLUMNS if name not in self.columns
+        ]
+        if missing:
+            raise ValueError(
+                f"Provenance is missing columns: {missing}."
+            )
+
+        lengths = {
+            len(self.columns[name]) for name in PROVENANCE_COLUMNS
+        }
+        if len(lengths) != 1:
+            raise ValueError(
+                "Provenance columns have unequal lengths."
+            )
+
+        length = lengths.pop()
+        if expected_length is not None and length != expected_length:
+            raise ValueError(
+                f"Provenance length {length} does not match the expected "
+                f"{expected_length}."
+            )
+        return length
+
+    def subset(self, indices):
+        indices = np.asarray(indices)
+        return BeatProvenance(
+            {
+                name: np.asarray(column)[indices]
+                for name, column in self.columns.items()
+            }
+        )
+
+    @classmethod
+    def concatenate(cls, parts):
+        parts = [part for part in parts if part is not None and len(part) > 0]
+        if not parts:
+            return cls.empty()
+        return cls(
+            {
+                name: np.concatenate(
+                    [part.columns[name] for part in parts]
+                )
+                for name in PROVENANCE_COLUMNS
+            }
+        )
+
+    def to_cache_dict(self, prefix="provenance__"):
+        return {
+            f"{prefix}{name}": np.asarray(
+                self.columns[name],
+                dtype=_provenance_column_dtype(name),
+            )
+            for name in PROVENANCE_COLUMNS
+        }
+
+    @classmethod
+    def from_cache_dict(
+        cls,
+        arrays,
+        prefix="provenance__",
+        expected_length=None,
+    ):
+        keys = [f"{prefix}{name}" for name in PROVENANCE_COLUMNS]
+        if any(key not in arrays for key in keys):
+            return None
+
+        columns = {
+            name: np.asarray(arrays[f"{prefix}{name}"])
+            for name in PROVENANCE_COLUMNS
+        }
+        try:
+            provenance = cls(columns)
+            provenance.validate(expected_length)
+        except ValueError:
+            return None
+        return provenance
+
+
+class _ProvenanceBuilder:
+    """Accumulate provenance blocks as beats are extracted."""
+
+    def __init__(self):
+        self._blocks = {name: [] for name in PROVENANCE_COLUMNS}
+
+    def add_block(
+        self,
+        beat_count,
+        record_id,
+        session_id,
+        acquisition_time,
+        acquisition_order,
+        source_segment_id,
+        source_segment_order,
+        rpeak_indices=None,
+    ):
+        if beat_count <= 0:
+            return
+
+        if rpeak_indices is None:
+            rpeaks = np.full(beat_count, -1, dtype=np.int64)
+        else:
+            rpeaks = np.asarray(rpeak_indices, dtype=np.int64)
+            if len(rpeaks) != beat_count:
+                raise ValueError(
+                    "rpeak_indices length must match beat_count."
+                )
+
+        self._blocks["record_id"].append(
+            np.full(beat_count, record_id, dtype=object)
+        )
+        self._blocks["session_id"].append(
+            np.full(beat_count, session_id, dtype=object)
+        )
+        self._blocks["acquisition_time"].append(
+            np.array([acquisition_time] * beat_count, dtype=object)
+        )
+        self._blocks["acquisition_order"].append(
+            np.full(beat_count, int(acquisition_order), dtype=np.int64)
+        )
+        self._blocks["source_segment_id"].append(
+            np.full(beat_count, source_segment_id, dtype=object)
+        )
+        self._blocks["source_segment_order"].append(
+            np.full(
+                beat_count,
+                float(source_segment_order),
+                dtype=np.float64,
+            )
+        )
+        self._blocks["beat_ordinal"].append(
+            np.arange(beat_count, dtype=np.int64)
+        )
+        self._blocks["rpeak_index"].append(rpeaks)
+
+    def build(self):
+        columns = {}
+        for name in PROVENANCE_COLUMNS:
+            blocks = self._blocks[name]
+            if blocks:
+                columns[name] = np.concatenate(blocks)
+            else:
+                columns[name] = np.empty(
+                    (0,),
+                    dtype=_provenance_column_dtype(name),
+                )
+        return BeatProvenance(columns)
+
+
+
+def _finalize_loader_output(
+    x_list,
+    y_list,
+    provenance_builder,
+    return_provenance,
+):
+    """Assemble the loader return value, optionally with aligned provenance."""
+    if x_list:
+        samples = np.vstack(x_list)
+        labels = np.array(y_list)
+    else:
+        samples = np.empty((0, 0))
+        labels = np.empty((0,))
+
+    if not return_provenance:
+        return samples, labels
+
+    provenance = (
+        provenance_builder.build()
+        if provenance_builder is not None
+        else BeatProvenance.empty()
+    )
+    provenance.validate(len(labels))
+    return samples, labels, provenance
+
+# =============================================================================
 # CONFIGURATION LOADING
 # =============================================================================
 def load_config(config_name: str = "config.yaml") -> dict:
@@ -1657,7 +1916,7 @@ class load_ecgid_dataset():
                 processed_samples.append(group.flatten())
         return np.array(processed_samples)
 
-    def load_all_data(self):
+    def load_all_data(self, return_provenance=False):
         """
         Loads dataset for tasks that handle train/test splitting downstream.
         Applies to 'all-available' and 'single-session'.
@@ -1667,22 +1926,32 @@ class load_ecgid_dataset():
             
         data = self.load_raw_data()
         x_list, y_list = [], []
+        provenance_builder = _ProvenanceBuilder() if return_provenance else None
         
         for sid, recs in tqdm(data.items(), desc="Processing signals"):
             if not recs: continue
             
             target_recs = recs if self.data_split_mode == "all-available" else [recs[0]]
             
-            for rec in target_recs:
+            for acquisition_order, rec in enumerate(target_recs):
                 segments = self._process_signal(rec['signal'], rec['fs'])
                 if len(segments) > 0:
                     x_list.append(segments)
                     y_list.extend([sid] * len(segments))
+                    if provenance_builder is not None:
+                        provenance_builder.add_block(
+                            len(segments),
+                            record_id=rec['filename'],
+                            session_id=rec['filename'],
+                            acquisition_time=rec['date'],
+                            acquisition_order=acquisition_order,
+                            source_segment_id=rec['filename'],
+                            source_segment_order=float(acquisition_order),
+                        )
                     
-        if x_list: return np.vstack(x_list), np.array(y_list)
-        return np.empty((0, 0)), np.empty((0,))
+        return _finalize_loader_output(x_list, y_list, provenance_builder, return_provenance)
 
-    def load_session(self, session_name):
+    def load_session(self, session_name, return_provenance=False):
         """
         Loads the partitioned data strictly based on temporal/record boundaries.
         Applies to cross-session and short/long-term tasks.
@@ -1699,6 +1968,7 @@ class load_ecgid_dataset():
             
         data = self.load_raw_data()
         x_list, y_list = [], []
+        provenance_builder = _ProvenanceBuilder() if return_provenance else None
         
         kept_subjects, dropped_subjects = 0, 0
 
@@ -1728,20 +1998,29 @@ class load_ecgid_dataset():
             )
 
             # --- EXTRACTION & SPLITTING ---
-            for rec in target_recs:
+            for acquisition_order, rec in enumerate(target_recs):
                 segments = self._process_signal(rec['signal'], rec['fs'])
                 
                 if len(segments) > 0:
                     x_list.append(segments)
                     y_list.extend([sid] * len(segments))
+                    if provenance_builder is not None:
+                        provenance_builder.add_block(
+                            len(segments),
+                            record_id=rec['filename'],
+                            session_id=rec['filename'],
+                            acquisition_time=rec['date'],
+                            acquisition_order=acquisition_order,
+                            source_segment_id=rec['filename'],
+                            source_segment_order=float(acquisition_order),
+                        )
 
         # Dynamic summary print for all structured tasks during enrollment
         if self.data_split_mode not in ["all-available", "single-session"] and is_enrollment:
             mode_title = self.data_split_mode.replace('-', ' ').title()
             print(f"\n[INFO] {mode_title} Summary: Kept {kept_subjects} subjects. Dropped {dropped_subjects} subjects.")
 
-        if x_list: return np.vstack(x_list), np.array(y_list)
-        return np.empty((0, 0)), np.empty((0,))
+        return _finalize_loader_output(x_list, y_list, provenance_builder, return_provenance)
 
 # =============================================================================
 # 2. HeartPrint
@@ -2065,13 +2344,13 @@ class load_heartprint_dataset():
             elif self.merge_strategy == "concat": processed_samples.append(group.flatten())
         return np.array(processed_samples)
 
-    def load_all_data(self):
+    def load_all_data(self, return_provenance=False):
         """Safely routes generic all-data requests to the single-session logic."""
         if self.data_split_mode != "single-session":
             print(f"[WARN] Calling load_all_data() but mode is '{self.data_split_mode}'.")
-        return self.load_session("train")
+        return self.load_session("train", return_provenance=return_provenance)
 
-    def load_session(self, session_name):
+    def load_session(self, session_name, return_provenance=False):
         """
         Extracts requested sessions.
         In 'cross-session' mode, enforces strict mathematical intersection, ensuring a 
@@ -2102,10 +2381,11 @@ class load_heartprint_dataset():
             log_name = f"Cross-Session ({session_name.title()}): {target_sessions}"
 
         if not target_sessions:
-            return np.empty((0, 0)), np.empty((0,))
+            return _finalize_loader_output([], [], None, return_provenance)
             
         data = self.load_raw_data()
         x_list, y_list = [], []
+        provenance_builder = _ProvenanceBuilder() if return_provenance else None
         
         kept_subjects, dropped_subjects = 0, 0
 
@@ -2120,6 +2400,7 @@ class load_heartprint_dataset():
 
             if is_valid:
                 kept_subjects += 1
+                record_order = 0
                 for s in target_sessions:
                     # HeartPrint frequently has 2 to 6 files per session. This naturally pools them!
                     for signal_dict in tagged_sessions[s]:
@@ -2127,6 +2408,17 @@ class load_heartprint_dataset():
                         if len(segments) > 0:
                             x_list.append(segments)
                             y_list.extend([sid] * len(segments))
+                            if provenance_builder is not None:
+                                provenance_builder.add_block(
+                                    len(segments),
+                                    record_id=signal_dict['filename'],
+                                    session_id=s,
+                                    acquisition_time=None,
+                                    acquisition_order=record_order,
+                                    source_segment_id=signal_dict['filename'],
+                                    source_segment_order=float(record_order),
+                                )
+                        record_order += 1
             else:
                 dropped_subjects += 1
 
@@ -2134,8 +2426,7 @@ class load_heartprint_dataset():
             print(f"\n[INFO] HeartPrint Evaluation Summary ({self.data_split_mode.title()}):")
             print(f"       Kept {kept_subjects} mathematically matched subjects. Dropped {dropped_subjects} subjects due to missing session data.")
 
-        if x_list: return np.vstack(x_list), np.array(y_list)
-        return np.empty((0, 0)), np.empty((0,))
+        return _finalize_loader_output(x_list, y_list, provenance_builder, return_provenance)
 
 # =============================================================================
 # 3. PTB (Physikalisch-Technische Bundesanstalt)
@@ -2415,7 +2706,7 @@ class load_ptb_dataset():
                 merged_samples.append(merged)
         return np.array(merged_samples)
 
-    def load_all_data(self):
+    def load_all_data(self, return_provenance=False):
         """
         Loads dataset for tasks that handle train/test splitting downstream.
         Applies to 'all-available' and 'single-session'.
@@ -2425,22 +2716,32 @@ class load_ptb_dataset():
             
         data = self.load_raw_data()
         x_list, y_list = [], []
+        provenance_builder = _ProvenanceBuilder() if return_provenance else None
         
         for sid, recs in tqdm(data.items(), desc="Processing signals"):
             if not recs: continue
             
             target_recs = recs if self.data_split_mode == "all-available" else [recs[0]]
             
-            for rec in target_recs:
+            for acquisition_order, rec in enumerate(target_recs):
                 segments = self._process_signal(rec['signal'], rec['fs'])
                 if len(segments) > 0:
                     x_list.append(segments)
                     y_list.extend([sid] * len(segments))
+                    if provenance_builder is not None:
+                        provenance_builder.add_block(
+                            len(segments),
+                            record_id=rec['filename'],
+                            session_id=rec['filename'],
+                            acquisition_time=rec['date'],
+                            acquisition_order=acquisition_order,
+                            source_segment_id=rec['filename'],
+                            source_segment_order=float(acquisition_order),
+                        )
                     
-        if x_list: return np.vstack(x_list), np.array(y_list)
-        return np.empty((0, 0)), np.empty((0,))
+        return _finalize_loader_output(x_list, y_list, provenance_builder, return_provenance)
 
-    def load_session(self, session_name):
+    def load_session(self, session_name, return_provenance=False):
         """
         Loads the partitioned data strictly based on temporal/record boundaries.
         Applies to cross-session and short/long-term tasks.
@@ -2457,6 +2758,7 @@ class load_ptb_dataset():
             
         data = self.load_raw_data()
         x_list, y_list = [], []
+        provenance_builder = _ProvenanceBuilder() if return_provenance else None
         
         kept_subjects, dropped_subjects = 0, 0
 
@@ -2486,20 +2788,29 @@ class load_ptb_dataset():
             )
 
             # --- EXTRACTION & SIGNAL PROCESSING ---
-            for rec in target_recs:
+            for acquisition_order, rec in enumerate(target_recs):
                 segments = self._process_signal(rec['signal'], rec['fs'])
                 
                 if len(segments) > 0:
                     x_list.append(segments)
                     y_list.extend([sid] * len(segments))
+                    if provenance_builder is not None:
+                        provenance_builder.add_block(
+                            len(segments),
+                            record_id=rec['filename'],
+                            session_id=rec['filename'],
+                            acquisition_time=rec['date'],
+                            acquisition_order=acquisition_order,
+                            source_segment_id=rec['filename'],
+                            source_segment_order=float(acquisition_order),
+                        )
 
         # Dynamic summary print for all structured tasks during enrollment
         if self.data_split_mode not in ["all-available", "single-session"] and is_enrollment:
             mode_title = self.data_split_mode.replace('-', ' ').title()
             print(f"\n[INFO] {mode_title} Summary: Kept {kept_subjects} subjects. Dropped {dropped_subjects} subjects.")
 
-        if x_list: return np.vstack(x_list), np.array(y_list)
-        return np.empty((0, 0)), np.empty((0,))
+        return _finalize_loader_output(x_list, y_list, provenance_builder, return_provenance)
 
 # # =============================================================================
 # # 4. CYBHi
@@ -2802,7 +3113,7 @@ class load_cybhi_dataset():
                 
                 sig = self._read_signal(rec['path'])
                 if sig is not None:
-                    recordings[sid][tag].append({'signal': sig, 'fs': self.fs})
+                    recordings[sid][tag].append({'signal': sig, 'fs': self.fs, 'record_id': rec['path'].name, 'date': rec['date']})
 
         # 3. Load Long-Term signals by date sequence (Month 0 vs Month 3)
         for sid, recs in tqdm(lt_pool.items(), desc="Loading long-term raw files"):
@@ -2818,7 +3129,7 @@ class load_cybhi_dataset():
                 
                 sig = self._read_signal(rec['path'])
                 if sig is not None:
-                    recordings[sid][tag].append({'signal': sig, 'fs': self.fs})
+                    recordings[sid][tag].append({'signal': sig, 'fs': self.fs, 'record_id': rec['path'].name, 'date': rec['date']})
 
         return recordings
 
@@ -2847,12 +3158,12 @@ class load_cybhi_dataset():
             elif self.merge_strategy == "concat": processed_samples.append(group.flatten())
         return np.array(processed_samples)
 
-    def load_all_data(self):
+    def load_all_data(self, return_provenance=False):
         if self.data_split_mode != "single-session":
             print(f"[WARN] Calling load_all_data() but mode is '{self.data_split_mode}'.")
-        return self.load_session("train")
+        return self.load_session("train", return_provenance=return_provenance)
 
-    def load_session(self, session_name):
+    def load_session(self, session_name, return_provenance=False):
         session_name = session_name.lower()
         target_sessions = []
         is_primary_pass = False
@@ -2878,10 +3189,11 @@ class load_cybhi_dataset():
             log_name = f"Cross-Session ({session_name.title()}): {target_sessions}"
 
         if not target_sessions:
-            return np.empty((0, 0)), np.empty((0,))
+            return _finalize_loader_output([], [], None, return_provenance)
             
         data = self.load_raw_data()
         x_list, y_list = [], []
+        provenance_builder = _ProvenanceBuilder() if return_provenance else None
         
         kept_subjects, dropped_subjects = 0, 0
 
@@ -2895,6 +3207,7 @@ class load_cybhi_dataset():
 
             if is_valid:
                 kept_subjects += 1
+                record_order = 0
                 for s in target_sessions:
                     # The acquiring-unit selection already happened during
                     # enumeration, so each session holds recordings from one
@@ -2904,6 +3217,17 @@ class load_cybhi_dataset():
                         if len(segments) > 0:
                             x_list.append(segments)
                             y_list.extend([sid] * len(segments))
+                            if provenance_builder is not None:
+                                provenance_builder.add_block(
+                                    len(segments),
+                                    record_id=signal_dict['record_id'],
+                                    session_id=s,
+                                    acquisition_time=signal_dict['date'],
+                                    acquisition_order=record_order,
+                                    source_segment_id=signal_dict['record_id'],
+                                    source_segment_order=float(record_order),
+                                )
+                        record_order += 1
             else:
                 dropped_subjects += 1
 
@@ -2911,8 +3235,7 @@ class load_cybhi_dataset():
             print(f"\n[INFO] CYBHi Evaluation Summary ({self.data_split_mode.title()}):")
             print(f"       Kept {kept_subjects} matched subjects. Dropped {dropped_subjects} subjects.")
 
-        if x_list: return np.vstack(x_list), np.array(y_list)
-        return np.empty((0, 0)), np.empty((0,))
+        return _finalize_loader_output(x_list, y_list, provenance_builder, return_provenance)
 
 # =============================================================================
 # 5. MIT-BIH Arrhythmia Database
@@ -3037,31 +3360,55 @@ class load_mitbih_dataset():
                     if req in avail or avail in req: indices.append(i); break
         return indices
 
+    def _normalized_source_ranges(self, min_ranges):
+        """
+        Order the configured ranges by source time and reject a same-role
+        overlap, which would otherwise read the same samples into two
+        separate segments of one role.
+        """
+        ordered = _normalize_minute_ranges(min_ranges, "range")
+        for earlier, later in zip(ordered, ordered[1:]):
+            if later[0] < earlier[1]:
+                raise ValueError(
+                    "A single role must not request overlapping minute "
+                    f"ranges; {earlier} and {later} overlap."
+                )
+        return ordered
+
     def load_raw_data(self, min_ranges=None):
         """
-        Loads raw files into memory.
+        Load each physical record's configured source ranges independently.
 
-        Args:
-            min_ranges (list of tuples or None): Minute ranges to read. When
-                given, only those spans are read from disk and returned
-                concatenated in the order requested, which is what slicing the
-                whole record in memory would have produced. Each recording is
-                half an hour long while a protocol typically uses a few minutes
-                of it, so reading the remainder costs time and memory for data
-                that is discarded.
-                None reads the whole recording, which 'all-available' needs.
+        Every configured minute range of a physical recording is read and
+        returned as its own segment; ranges are never stitched into one raw
+        signal, so no filtering, R-peak detection or beat window crosses a
+        boundary between two non-contiguous source ranges. ``None`` reads the
+        whole recording as a single segment, which 'all-available' needs.
+
+        Records mapped to the same biometric subject contribute their segments
+        under that subject while keeping their own ``record_id``; their raw
+        waveforms are never concatenated before processing.
 
         Returns:
-            dict: Subject id mapped to its signal, sampling rate, and filename.
+            dict: Subject id mapped to a list of source segments, each
+                carrying its signal, sampling rate, physical record identity
+                and the numeric source start (in minutes) of the range.
         """
         if not self.dataset_root.exists() or not any(self.dataset_root.iterdir()):
             self.download()
 
+        source_ranges = (
+            None if min_ranges is None
+            else self._normalized_source_ranges(min_ranges)
+        )
+
         recordings = {}
+        record_orders = {}
 
         for name in tqdm(self._record_names(), desc="Loading MIT-BIH raw files"):
             hea = self.dataset_root / f"{name}.hea"
             sid = self.SHARED_SUBJECT_RECORDS.get(name, name)
+            record_id = hea.name
             try:
                 rec_header = wfdb.rdheader(str(hea.with_suffix("")))
 
@@ -3073,36 +3420,48 @@ class load_mitbih_dataset():
                 )
 
                 lead_indices = self._get_lead_indices(rec_header.sig_name)
-                if not lead_indices: continue
-
-                if min_ranges is None:
-                    data, _ = wfdb.rdsamp(str(hea.with_suffix("")), channels=lead_indices)
-                else:
-                    data = self._read_ranges(
-                        str(hea.with_suffix("")), lead_indices,
-                        rec_header.fs, rec_header.sig_len, min_ranges,
-                    )
-                    if data is None:
-                        continue
-
-                if sid in recordings:
-                    # A second recording of a subject already seen. Both are
-                    # continuous acquisitions of the same person, so the spans
-                    # requested from each are appended in record order.
-                    existing = recordings[sid]
-                    existing["signal"] = np.vstack(
-                        [existing["signal"], data]
-                    )
-                    existing["filename"] = (
-                        f"{existing['filename']}+{hea.name}"
-                    )
+                if not lead_indices:
                     continue
 
-                recordings[sid] = {"signal": data, "fs": rec_header.fs, "filename": hea.name}
+                fs = rec_header.fs
+                total_samples = rec_header.sig_len
+                record_path = str(hea.with_suffix(""))
+
+                spans = [(0.0, None)] if source_ranges is None else source_ranges
+
+                orders = record_orders.setdefault(sid, {})
+                if record_id not in orders:
+                    orders[record_id] = len(orders)
+                acquisition_order = orders[record_id]
+
+                for (start_min, end_min) in spans:
+                    if end_min is None:
+                        signal, _ = wfdb.rdsamp(
+                            record_path, channels=lead_indices
+                        )
+                        segment_start = 0.0
+                    else:
+                        start_idx = max(0, int(start_min * 60 * fs))
+                        end_idx = min(int(total_samples), int(end_min * 60 * fs))
+                        if start_idx >= end_idx:
+                            continue
+                        signal, _ = wfdb.rdsamp(
+                            record_path, channels=lead_indices,
+                            sampfrom=start_idx, sampto=end_idx,
+                        )
+                        segment_start = float(start_min)
+
+                    recordings.setdefault(sid, []).append(
+                        {
+                            "signal": signal,
+                            "fs": fs,
+                            "filename": record_id,
+                            "record_id": record_id,
+                            "start_min": segment_start,
+                            "acquisition_order": acquisition_order,
+                        }
+                    )
             except ValueError:
-                # Raised deliberately when a recording contradicts the dataset
-                # configuration, which must stop the run rather than quietly
-                # reduce the cohort.
                 raise
             except Exception as read_error:
                 print(
@@ -3134,35 +3493,6 @@ class load_mitbih_dataset():
             for line in manifest.read_text().splitlines()
             if line.strip()
         ]
-
-    def _read_ranges(self, record_path, lead_indices, fs, total_samples, min_ranges):
-        """
-        Read only the requested minute ranges and return them concatenated.
-
-        The boundaries are clamped exactly as an in-memory slice would clamp
-        them, so a range that runs past the end of a recording yields the same
-        samples either way.
-
-        Returns:
-            np.ndarray or None: The concatenated spans, or None if none of the
-                requested ranges intersects the recording.
-        """
-        chunks = []
-
-        for (start_min, end_min) in min_ranges:
-            start_idx = max(0, int(start_min * 60 * fs))
-            end_idx = min(int(total_samples), int(end_min * 60 * fs))
-
-            if start_idx >= end_idx:
-                continue
-
-            chunk, _ = wfdb.rdsamp(
-                record_path, channels=lead_indices,
-                sampfrom=start_idx, sampto=end_idx,
-            )
-            chunks.append(chunk)
-
-        return np.vstack(chunks) if chunks else None
 
     def _process_signal(self, sig, fs):
         """Applies filters, segmentation, and multi-beat merging."""
@@ -3232,7 +3562,7 @@ class load_mitbih_dataset():
             return np.vstack(sliced_chunks)
         return np.empty((0, raw_signal.shape[1]))
 
-    def load_all_data(self):
+    def load_all_data(self, return_provenance=False):
         """
         Handles dataset loading for downstream random-split tasks.
         Applies to 'all-available' and 'single-segment'.
@@ -3248,22 +3578,33 @@ class load_mitbih_dataset():
 
         data = self.load_raw_data(min_ranges=target_ranges)
         x_list, y_list = [], []
+        provenance_builder = _ProvenanceBuilder() if return_provenance else None
 
-        for sid, rec in tqdm(data.items(), desc="Processing signals"):
-            target_signal = rec['signal']
-            fs = rec['fs']
+        for sid, recs in tqdm(data.items(), desc="Processing signals"):
+            for rec in recs:
+                target_signal = rec['signal']
+                fs = rec['fs']
 
-            if target_signal.shape[0] == 0: continue
+                if target_signal.shape[0] == 0: continue
 
-            segments = self._process_signal(target_signal, fs)
-            if len(segments) > 0:
-                x_list.append(segments)
-                y_list.extend([sid] * len(segments))
-                
-        if x_list: return np.vstack(x_list), np.array(y_list)
-        return np.empty((0, 0)), np.empty((0,))
+                segments = self._process_signal(target_signal, fs)
+                if len(segments) > 0:
+                    x_list.append(segments)
+                    y_list.extend([sid] * len(segments))
+                    if provenance_builder is not None:
+                        provenance_builder.add_block(
+                            len(segments),
+                            record_id=rec['record_id'],
+                            session_id=rec['record_id'],
+                            acquisition_time=None,
+                            acquisition_order=rec['acquisition_order'],
+                            source_segment_id=f"{rec['record_id']}#{rec['start_min']}",
+                            source_segment_order=float(rec['start_min']),
+                        )
 
-    def load_session(self, session_name):
+        return _finalize_loader_output(x_list, y_list, provenance_builder, return_provenance)
+
+    def load_session(self, session_name, return_provenance=False):
         """
         Processes the customized minute-based ranges mapping to Train/Enrol/Test tasks.
         """
@@ -3277,7 +3618,7 @@ class load_mitbih_dataset():
         if session_name in ["train"]:
             target_ranges = self.train_parts
         elif session_name in ["enrol", "enrollment"]:
-            if not self.enrol_parts: return np.empty((0, 0)), np.empty((0,))
+            if not self.enrol_parts: return _finalize_loader_output([], [], None, return_provenance)
             target_ranges = self.enrol_parts
         elif session_name in ["test", "probe"]:
             target_ranges = self.test_parts
@@ -3288,27 +3629,40 @@ class load_mitbih_dataset():
         # half-hour recording only to discard it.
         data = self.load_raw_data(min_ranges=target_ranges)
         x_list, y_list = [], []
+        provenance_builder = _ProvenanceBuilder() if return_provenance else None
 
-        kept_subjects = 0
+        subjects_with_data = set()
 
-        for sid, rec in tqdm(data.items(), desc=f"Processing {session_name}"):
-            target_signal = rec['signal']
-            fs = rec['fs']
+        for sid, recs in tqdm(data.items(), desc=f"Processing {session_name}"):
+            for rec in recs:
+                target_signal = rec['signal']
+                fs = rec['fs']
 
-            if target_signal.shape[0] == 0: continue
+                if target_signal.shape[0] == 0: continue
 
-            segments = self._process_signal(target_signal, fs)
-            
-            if len(segments) > 0:
-                kept_subjects += 1
-                x_list.append(segments)
-                y_list.extend([sid] * len(segments))
+                segments = self._process_signal(target_signal, fs)
+
+                if len(segments) > 0:
+                    subjects_with_data.add(sid)
+                    x_list.append(segments)
+                    y_list.extend([sid] * len(segments))
+                    if provenance_builder is not None:
+                        provenance_builder.add_block(
+                            len(segments),
+                            record_id=rec['record_id'],
+                            session_id=rec['record_id'],
+                            acquisition_time=None,
+                            acquisition_order=rec['acquisition_order'],
+                            source_segment_id=f"{rec['record_id']}#{rec['start_min']}",
+                            source_segment_order=float(rec['start_min']),
+                        )
+
+        kept_subjects = len(subjects_with_data)
 
         if session_name == "train":
             print(f"\n[INFO] Custom Split Summary: Extracted data for {kept_subjects} subjects.")
 
-        if x_list: return np.vstack(x_list), np.array(y_list)
-        return np.empty((0, 0)), np.empty((0,))
+        return _finalize_loader_output(x_list, y_list, provenance_builder, return_provenance)
 
 # =============================================================================
 # 6. MIT-BIH NSRDB (Normal Sinus Rhythm)
@@ -3459,7 +3813,7 @@ class load_nsrdb_dataset():
                 if min_ranges is None:
                     data, _ = wfdb.rdsamp(str(hea.with_suffix("")), channels=lead_indices)
                     if sid not in recordings: recordings[sid] = []
-                    recordings[sid].append({"signal": data, "fs": fs, "filename": hea.name})
+                    recordings[sid].append({"signal": data, "fs": fs, "filename": hea.name, "start_min": 0})
                     continue
 
                 # 2. Iterate through requested chunks and pull them efficiently from disk
@@ -3474,7 +3828,7 @@ class load_nsrdb_dataset():
                     if sampfrom < sampto:
                         data, _ = wfdb.rdsamp(str(hea.with_suffix("")), channels=lead_indices, sampfrom=sampfrom, sampto=sampto)
                         if sid not in recordings: recordings[sid] = []
-                        recordings[sid].append({"signal": data, "fs": fs, "filename": hea.name})
+                        recordings[sid].append({"signal": data, "fs": fs, "filename": hea.name, "start_min": start_min})
                         
             except ValueError:
                 # Raised deliberately when a recording contradicts the dataset
@@ -3546,7 +3900,7 @@ class load_nsrdb_dataset():
                 merged_samples.append(merged)
         return np.array(merged_samples)
 
-    def load_all_data(self):
+    def load_all_data(self, return_provenance=False):
         """
         Handles dataset loading for 'all-available' and 'single-segment'.
         """
@@ -3562,17 +3916,27 @@ class load_nsrdb_dataset():
         data = self.load_raw_data_slices(min_ranges=target_ranges)
         
         x_list, y_list = [], []
+        provenance_builder = _ProvenanceBuilder() if return_provenance else None
         for sid, recs in tqdm(data.items(), desc="Processing signals"):
             for rec in recs:
                 segments = self._process_signal(rec['signal'], rec['fs'])
                 if len(segments) > 0:
                     x_list.append(segments)
                     y_list.extend([sid] * len(segments))
+                    if provenance_builder is not None:
+                        provenance_builder.add_block(
+                            len(segments),
+                            record_id=rec['filename'],
+                            session_id=rec['filename'],
+                            acquisition_time=None,
+                            acquisition_order=0,
+                            source_segment_id=f"{rec['filename']}#{rec['start_min']}",
+                            source_segment_order=float(rec['start_min']),
+                        )
                     
-        if x_list: return np.vstack(x_list), np.array(y_list)
-        return np.empty((0, 0)), np.empty((0,))
+        return _finalize_loader_output(x_list, y_list, provenance_builder, return_provenance)
 
-    def load_session(self, session_name):
+    def load_session(self, session_name, return_provenance=False):
         """
         Processes the customized minute-based ranges mapping to Train/Enrol/Test tasks.
         """
@@ -3586,7 +3950,7 @@ class load_nsrdb_dataset():
         if session_name in ["train"]:
             target_ranges = self.train_parts
         elif session_name in ["enrol", "enrollment"]:
-            if not self.enrol_parts: return np.empty((0, 0)), np.empty((0,))
+            if not self.enrol_parts: return _finalize_loader_output([], [], None, return_provenance)
             target_ranges = self.enrol_parts
         elif session_name in ["test", "probe"]:
             target_ranges = self.test_parts
@@ -3597,6 +3961,7 @@ class load_nsrdb_dataset():
         data = self.load_raw_data_slices(min_ranges=target_ranges)
         
         x_list, y_list = [], []
+        provenance_builder = _ProvenanceBuilder() if return_provenance else None
         kept_subjects = 0
 
         for sid, recs in tqdm(data.items(), desc=f"Processing {session_name}"):
@@ -3609,6 +3974,16 @@ class load_nsrdb_dataset():
                     subject_has_data = True
                     x_list.append(segments)
                     y_list.extend([sid] * len(segments))
+                    if provenance_builder is not None:
+                        provenance_builder.add_block(
+                            len(segments),
+                            record_id=rec['filename'],
+                            session_id=rec['filename'],
+                            acquisition_time=None,
+                            acquisition_order=0,
+                            source_segment_id=f"{rec['filename']}#{rec['start_min']}",
+                            source_segment_order=float(rec['start_min']),
+                        )
                     
             if subject_has_data:
                 kept_subjects += 1
@@ -3616,8 +3991,7 @@ class load_nsrdb_dataset():
         if session_name == "train":
             print(f"\n[INFO] Custom Split Summary: Extracted data for {kept_subjects} subjects.")
 
-        if x_list: return np.vstack(x_list), np.array(y_list)
-        return np.empty((0, 0)), np.empty((0,))
+        return _finalize_loader_output(x_list, y_list, provenance_builder, return_provenance)
 
 # =============================================================================
 # 7. PTB-XL (Physikalisch-Technische Bundesanstalt XL)
@@ -3883,7 +4257,7 @@ class load_ptbxl_dataset():
                 merged_samples.append(merged)
         return np.array(merged_samples)
 
-    def load_all_data(self):
+    def load_all_data(self, return_provenance=False):
         """
         Loads dataset for tasks that handle train/test splitting downstream.
         Applies to 'all-available' and 'single-session'.
@@ -3893,22 +4267,32 @@ class load_ptbxl_dataset():
             
         data = self.load_raw_data()
         x_list, y_list = [], []
+        provenance_builder = _ProvenanceBuilder() if return_provenance else None
         
         for sid, recs in tqdm(data.items(), desc="Processing signals"):
             if not recs: continue
             
             target_recs = recs if self.data_split_mode == "all-available" else [recs[0]]
             
-            for rec in target_recs:
+            for acquisition_order, rec in enumerate(target_recs):
                 segments = self._process_signal(rec['signal'], rec['fs'])
                 if len(segments) > 0:
                     x_list.append(segments)
                     y_list.extend([sid] * len(segments))
+                    if provenance_builder is not None:
+                        provenance_builder.add_block(
+                            len(segments),
+                            record_id=rec['filename'],
+                            session_id=rec['filename'],
+                            acquisition_time=None,
+                            acquisition_order=acquisition_order,
+                            source_segment_id=rec['filename'],
+                            source_segment_order=float(acquisition_order),
+                        )
                     
-        if x_list: return np.vstack(x_list), np.array(y_list)
-        return np.empty((0, 0)), np.empty((0,))
+        return _finalize_loader_output(x_list, y_list, provenance_builder, return_provenance)
 
-    def load_session(self, session_name):
+    def load_session(self, session_name, return_provenance=False):
         """
         Loads the partitioned data strictly based on temporal/record boundaries.
         No intra-record splitting is permitted to preserve complete 10s windows.
@@ -3925,6 +4309,7 @@ class load_ptbxl_dataset():
             
         data = self.load_raw_data()
         x_list, y_list = [], []
+        provenance_builder = _ProvenanceBuilder() if return_provenance else None
         
         kept_subjects, dropped_subjects = 0, 0
 
@@ -3954,18 +4339,27 @@ class load_ptbxl_dataset():
             )
 
             # --- EXTRACTION & SIGNAL PROCESSING ---
-            for rec in target_recs:
+            for acquisition_order, rec in enumerate(target_recs):
                 segments = self._process_signal(rec['signal'], rec['fs'])
                 
                 if len(segments) > 0:
                     x_list.append(segments)
                     y_list.extend([sid] * len(segments))
+                    if provenance_builder is not None:
+                        provenance_builder.add_block(
+                            len(segments),
+                            record_id=rec['filename'],
+                            session_id=rec['filename'],
+                            acquisition_time=None,
+                            acquisition_order=acquisition_order,
+                            source_segment_id=rec['filename'],
+                            source_segment_order=float(acquisition_order),
+                        )
 
         # Dynamic summary print during the enrollment pass
         if self.data_split_mode not in ["all-available", "single-session"] and is_enrollment:
             mode_title = self.data_split_mode.replace('-', ' ').title()
             print(f"\n[INFO] {mode_title} Summary: Kept {kept_subjects} subjects. Dropped {dropped_subjects} subjects.")
 
-        if x_list: return np.vstack(x_list), np.array(y_list)
-        return np.empty((0, 0)), np.empty((0,))
+        return _finalize_loader_output(x_list, y_list, provenance_builder, return_provenance)
 # =============================================================================

@@ -520,12 +520,20 @@ class DatasetLoaderContractTests(
                     min_ranges,
                 )
             )
+            start_min = (
+                0.0 if min_ranges is None else float(min_ranges[0][0])
+            )
             return {
-                "record_a": {
-                    "signal": signal,
-                    "fs": 1,
-                    "filename": "record_a",
-                }
+                "record_a": [
+                    {
+                        "signal": signal,
+                        "fs": 1,
+                        "filename": "record_a",
+                        "record_id": "record_a",
+                        "start_min": start_min,
+                        "acquisition_order": 0,
+                    }
+                ]
             }
 
         loader.load_raw_data = Mock(

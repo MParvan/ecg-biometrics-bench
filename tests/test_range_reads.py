@@ -75,28 +75,46 @@ class RangeReadEquivalenceTests(unittest.TestCase):
         leads = self.loader._get_lead_indices(header.sig_name)
         self.whole, _ = wfdb.rdsamp(str(self.directory / "100"), channels=leads)
 
-    def _both_paths(self, min_ranges):
+    def _single_segment(self, min_ranges):
+        # Every range is read independently; a single requested range therefore
+        # yields exactly one segment whose signal is that range's samples.
         produced = self.loader.load_raw_data(min_ranges=min_ranges)
         reference = self.loader._slice_signal(self.whole, self.fs, min_ranges)
-        return produced, reference
+        return produced["100"], reference
 
     def test_a_single_range_matches(self):
-        produced, reference = self._both_paths([(0, 1)])
-        np.testing.assert_array_equal(produced["100"]["signal"], reference)
+        segments, reference = self._single_segment([(0, 1)])
+        self.assertEqual(len(segments), 1)
+        np.testing.assert_array_equal(segments[0]["signal"], reference)
 
     def test_an_interior_range_matches(self):
-        produced, reference = self._both_paths([(1, 2)])
-        np.testing.assert_array_equal(produced["100"]["signal"], reference)
+        segments, reference = self._single_segment([(1, 2)])
+        self.assertEqual(len(segments), 1)
+        np.testing.assert_array_equal(segments[0]["signal"], reference)
 
-    def test_disjoint_ranges_are_concatenated_in_order(self):
-        produced, reference = self._both_paths([(0, 1), (2, 3)])
-        np.testing.assert_array_equal(produced["100"]["signal"], reference)
+    def test_disjoint_ranges_are_separate_segments(self):
+        # Two non-contiguous ranges are never stitched into one raw signal;
+        # each is its own segment, read exactly as slicing it would produce.
+        produced = self.loader.load_raw_data(min_ranges=[(0, 1), (2, 3)])
+        segments = produced["100"]
+        self.assertEqual(len(segments), 2)
+        np.testing.assert_array_equal(
+            segments[0]["signal"],
+            self.loader._slice_signal(self.whole, self.fs, [(0, 1)]),
+        )
+        np.testing.assert_array_equal(
+            segments[1]["signal"],
+            self.loader._slice_signal(self.whole, self.fs, [(2, 3)]),
+        )
+        self.assertEqual(segments[0]["start_min"], 0.0)
+        self.assertEqual(segments[1]["start_min"], 2.0)
 
     def test_a_range_past_the_end_is_clamped(self):
-        # A protocol may ask for minutes the recording does not reach; both
-        # paths have to stop at the same sample.
-        produced, reference = self._both_paths([(2, 10)])
-        np.testing.assert_array_equal(produced["100"]["signal"], reference)
+        # A protocol may ask for minutes the recording does not reach; the read
+        # stops at the same sample slicing would.
+        segments, reference = self._single_segment([(2, 10)])
+        self.assertEqual(len(segments), 1)
+        np.testing.assert_array_equal(segments[0]["signal"], reference)
 
     def test_a_range_entirely_past_the_end_yields_no_record(self):
         produced = self.loader.load_raw_data(min_ranges=[(30, 40)])
@@ -104,7 +122,20 @@ class RangeReadEquivalenceTests(unittest.TestCase):
 
     def test_reading_without_ranges_returns_the_whole_recording(self):
         produced = self.loader.load_raw_data()
-        np.testing.assert_array_equal(produced["100"]["signal"], self.whole)
+        segments = produced["100"]
+        self.assertEqual(len(segments), 1)
+        np.testing.assert_array_equal(segments[0]["signal"], self.whole)
+
+    def test_ranges_are_ordered_by_source_not_by_config_list(self):
+        # The configured list order must not decide the segment order; the
+        # actual source position does.
+        produced = self.loader.load_raw_data(min_ranges=[(2, 3), (0, 1)])
+        segments = produced["100"]
+        self.assertEqual([segment["start_min"] for segment in segments], [0.0, 2.0])
+
+    def test_same_role_overlapping_ranges_are_rejected(self):
+        with self.assertRaises(ValueError):
+            self.loader.load_raw_data(min_ranges=[(0, 2), (1, 3)])
 
     def test_only_the_requested_span_is_read_from_disk(self):
         # The point of the change: a protocol using two minutes of a half-hour

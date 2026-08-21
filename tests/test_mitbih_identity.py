@@ -121,37 +121,52 @@ class MITBIHSharedSubjectTests(unittest.TestCase):
     def test_the_merged_subject_keeps_both_recordings(self):
         recordings = self.loader.load_raw_data()
 
-        single = recordings["100"]["signal"]
-        merged = recordings["201"]["signal"]
+        single = recordings["100"]
+        merged = recordings["201"]
 
+        # The two physical records of one identity are kept as separate
+        # segments; their raw waveforms are never concatenated.
+        self.assertEqual(len(single), 1)
+        self.assertEqual(len(merged), 2)
         self.assertEqual(
-            merged.shape[0],
-            single.shape[0] * 2,
+            {segment["record_id"] for segment in merged},
+            {"201.hea", "202.hea"},
         )
-        self.assertIn("201", recordings["201"]["filename"])
-        self.assertIn("202", recordings["201"]["filename"])
+        for segment in merged:
+            self.assertEqual(
+                segment["signal"].shape[0],
+                single[0]["signal"].shape[0],
+            )
 
-    def test_the_merge_appends_rather_than_replaces(self):
+    def test_both_records_are_processed_as_distinct_segments(self):
         """
-        The second recording must extend the first, not overwrite it, so both
-        offsets have to survive.
+        The second recording is a separate segment of the same identity, not a
+        raw signal appended onto the first, so both offsets survive distinctly.
         """
         recordings = self.loader.load_raw_data()
-        merged = recordings["201"]["signal"][:, 0]
+        by_record = {
+            segment["record_id"]: segment["signal"][:, 0]
+            for segment in recordings["201"]
+        }
 
-        half = len(merged) // 2
-        self.assertLess(
-            float(np.mean(merged[:half])),
-            float(np.mean(merged[half:])),
+        self.assertEqual(set(by_record), {"201.hea", "202.hea"})
+        self.assertNotEqual(
+            float(np.mean(by_record["201.hea"])),
+            float(np.mean(by_record["202.hea"])),
         )
 
-    def test_a_requested_range_is_taken_from_both_recordings(self):
+    def test_a_requested_range_is_taken_from_each_record(self):
         recordings = self.loader.load_raw_data(min_ranges=[(0, 0.5)])
 
-        single = recordings["100"]["signal"]
-        merged = recordings["201"]["signal"]
+        single = recordings["100"]
+        merged = recordings["201"]
 
-        self.assertEqual(merged.shape[0], single.shape[0] * 2)
+        self.assertEqual(len(merged), 2)
+        for segment in merged:
+            self.assertEqual(
+                segment["signal"].shape[0],
+                single[0]["signal"].shape[0],
+            )
 
 
 class MITBIHLeadSelectionTests(unittest.TestCase):

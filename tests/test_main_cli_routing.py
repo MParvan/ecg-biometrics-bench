@@ -882,10 +882,27 @@ class MainCLIRoutingTests(unittest.TestCase):
                 cache_manager_class.return_value
             )
 
+            # A cache entry is only a hit when it also carries the aligned
+            # per-beat provenance bundle; without it the payload is rebuilt.
+            from load_dataset import _ProvenanceBuilder
+
+            provenance_builder = _ProvenanceBuilder()
+            provenance_builder.add_block(
+                len(cached_y),
+                record_id="cached.hea",
+                session_id="cached.hea",
+                acquisition_time=None,
+                acquisition_order=0,
+                source_segment_id="cached.hea#0",
+                source_segment_order=0.0,
+            )
+            cached_provenance = provenance_builder.build().to_cache_dict()
+
             cache_manager.get_data_cache.return_value = (
                 {
                     "x": cached_x,
                     "y": cached_y,
+                    **cached_provenance,
                 },
                 "synthetic-cache-id",
             )
