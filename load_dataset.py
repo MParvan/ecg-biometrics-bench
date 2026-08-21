@@ -735,6 +735,13 @@ RECORD_ORDER_SPLIT_MODES = (
     "leave-last-out-long-term",
 )
 
+# How the record-order regimes treat a recording whose header states no
+# acquisition date: it is left unknown and takes no part in an ordering that
+# would read elapsed time into it. Every loader that orders recordings by date
+# carries this value so that it reaches the cache identity, because a cache
+# built under a different policy describes a different partition.
+TEMPORAL_DATE_POLICY = "known_dates_only"
+
 
 def verify_sampling_rate(declared_fs, dataset_name, record_name, measured_fs):
     """
@@ -791,6 +798,18 @@ def select_record_order_partition(records, data_split_mode, is_enrollment):
             f"Unsupported record-order split mode: {data_split_mode!r}. "
             f"Use one of {list(RECORD_ORDER_SPLIT_MODES)}."
         )
+
+    # Every regime below reads meaning into the order of the dates: which
+    # recording came first, which day is the last one, how far apart the two
+    # partitions sit. A recording whose header states no acquisition date
+    # carries none of that evidence, so it takes no part here. Such recordings
+    # stay available to "all-available", which draws on every recording without
+    # ordering them.
+    records = [
+        record
+        for record in records
+        if record.get("date") is not None
+    ]
 
     if not records:
         return [], False
@@ -1481,6 +1500,10 @@ class load_ecgid_dataset():
         if data_split_mode not in valid_modes:
             raise ValueError(f"Invalid mode: {data_split_mode}. Use {valid_modes}")
         self.data_split_mode = data_split_mode
+        # Recorded so that the temporal-date policy reaches the cache
+        # identity: a cache built under a different policy describes a
+        # different partition and must not be reused.
+        self.temporal_date_policy = TEMPORAL_DATE_POLICY
 
     def download(self):
         _download_and_extract(self.url, self.zip_path, self.dataset_root, "ECG-ID", cleanup=self.cleanup_zip)
@@ -1514,6 +1537,7 @@ class load_ecgid_dataset():
             self.download()
         
         recordings = {}
+        undated_records = []
         for subject_dir in tqdm(sorted(self.dataset_root.glob("Person*")), desc="Loading ECG-ID raw files"):
             sid = subject_dir.name.replace("Person_", "")
             recs = []
@@ -1536,7 +1560,13 @@ class load_ecgid_dataset():
                                     date_str = comment.split(":")[-1].strip()
                                     rec_date = datetime.datetime.strptime(date_str, "%d.%m.%Y").date()
                                 except: pass
-                    if rec_date is None: rec_date = datetime.date.min
+                    # Every released ECG-ID header carries a date, so this stays
+                    # unset in practice. Should one ever arrive without a date,
+                    # it is kept as unknown rather than assigned a placeholder,
+                    # which would otherwise anchor the first day of the
+                    # record-order regimes.
+                    if rec_date is None:
+                        undated_records.append(hea_path.name)
 
                     verify_sampling_rate(
                         self.cfg.get("fs"),
@@ -1580,9 +1610,26 @@ class load_ecgid_dataset():
                         f"{sid}: {read_error}"
                     )
 
-            recs.sort(key=lambda x: (x['date'], self._extract_rec_number(x['filename'])))
+            # Dated recordings lead, in acquisition order. Any undated one
+            # follows in record-number order, so enumeration stays reproducible
+            # without implying where it belongs in time.
+            recs.sort(
+                key=lambda x: (
+                    x['date'] is None,
+                    x['date'] if x['date'] is not None else datetime.date.min,
+                    self._extract_rec_number(x['filename']),
+                )
+            )
             recordings[sid] = recs
-            
+
+        if undated_records:
+            print(
+                f"[INFO] ECG-ID: {len(undated_records)} recording(s) state no "
+                "acquisition date. They stay available to 'all-available' and "
+                "take no part in the record-order regimes: "
+                + ", ".join(sorted(undated_records))
+            )
+
         return recordings
 
     def _process_signal(self, sig, fs):
@@ -2162,6 +2209,10 @@ class load_ptb_dataset():
         if data_split_mode not in valid_modes:
             raise ValueError(f"Invalid mode: {data_split_mode}. Use {valid_modes}")
         self.data_split_mode = data_split_mode
+        # Recorded so that the temporal-date policy reaches the cache
+        # identity: a cache built under a different policy describes a
+        # different partition and must not be reused.
+        self.temporal_date_policy = TEMPORAL_DATE_POLICY
 
     def download(self):
         """Downloads and extracts the dataset if not already present."""
@@ -2203,14 +2254,15 @@ class load_ptb_dataset():
     def load_raw_data(self, metadata_only=False):
         """
         Loads all WFDB records, parses metadata, and sorts chronologically.
-        Injects synthetic dates for records missing timestamps to preserve them for evaluation.
+        A record whose header states no acquisition date keeps ``date`` as
+        ``None`` and is ordered after the dated ones by record name.
 
         Args:
             metadata_only (bool): If True, skips signal reading and returns
                 only the record identity and date of each recording. Date
-                parsing, synthetic-date injection, and sorting are unchanged,
-                so a metadata-only pass reports the same partition assignment
-                the full pipeline produces.
+                parsing and sorting are unchanged, so a metadata-only pass
+                reports the same partition assignment the full pipeline
+                produces.
         """
         if not self.dataset_root.exists() or not any(self.dataset_root.iterdir()):
             self.download()
@@ -2225,20 +2277,20 @@ class load_ptb_dataset():
             if pid not in patient_groups: patient_groups[pid] = []
             patient_groups[pid].append(f)
 
-        # 541 of the 549 records state an acquisition date in the header. The
-        # remaining eight receive synthetic dates from a counter starting well
-        # in the future, so they sort after every dated record and the ordering
-        # stays deterministic.
+        # 541 of the 549 records state an acquisition date in the header; the
+        # remaining eight state none. An unknown acquisition time is kept as
+        # unknown rather than filled in, so that it can never stand in as
+        # evidence of elapsed time. Undated recordings remain available to
+        # "all-available", which does not order recordings, and take no part in
+        # the record-order regimes, which do.
         #
         # Seven of the eight belong to patients whose only recording is that
-        # record, so they are dropped by every regime that requires two
-        # recordings and their date is never used. The exception is
-        # patient180/s0561_re, whose patient has six dated records: the
-        # synthetic date makes it the probe under leave-last-out-long-term.
-        # Placing it last is consistent with the numbering, which follows
-        # acquisition order for 112 of the 113 patients that have more than one
-        # dated record, and s0561 is the highest number this patient carries.
-        dummy_date = datetime.date(2099, 1, 1)
+        # record, so every regime requiring two recordings already drops them.
+        # The eighth is patient180/s0561_re, and that patient keeps six dated
+        # recordings across four distinct days, so the subject stays eligible
+        # throughout; only the undated recording sits out the ordering.
+        dated_count = 0
+        undated_records = []
 
         for sid, p_files in tqdm(sorted(patient_groups.items()), desc="Loading PTB raw files"):
             recs = []
@@ -2271,12 +2323,12 @@ class load_ptb_dataset():
                     dt = rec_header.base_date
                     if dt is None: dt = self._parse_date_from_comments(rec_header.comments)
 
-                    # No date in the header; take the next synthetic one.
                     if dt is None:
-                        dt = dummy_date
-                        dummy_date += datetime.timedelta(days=1)
-
-                    full_dt = datetime.datetime.combine(dt, datetime.time.min)
+                        full_dt = None
+                        undated_records.append(f"{sid}/{hea.stem}")
+                    else:
+                        full_dt = datetime.datetime.combine(dt, datetime.time.min)
+                        dated_count += 1
 
                     record_entry = {
                         "fs": rec_header.fs,
@@ -2302,9 +2354,27 @@ class load_ptb_dataset():
                     )
 
             if recs:
-                recs.sort(key=lambda x: (x["date"], x["filename"]))
+                # Dated recordings lead, in acquisition order. Undated ones
+                # follow in record-name order, which keeps enumeration
+                # reproducible without implying where they belong in time.
+                recs.sort(
+                    key=lambda x: (
+                        x["date"] is None,
+                        x["date"] if x["date"] is not None else datetime.datetime.min,
+                        x["filename"],
+                    )
+                )
                 recordings[sid] = recs
-        
+
+        if undated_records:
+            print(
+                f"[INFO] PTB: {dated_count} recording(s) state an acquisition "
+                f"date and {len(undated_records)} do not. The undated "
+                "recordings stay available to 'all-available' and take no part "
+                "in the record-order regimes: "
+                + ", ".join(sorted(undated_records))
+            )
+
         return recordings
 
     def _process_signal(self, sig, fs):
@@ -3605,6 +3675,10 @@ class load_ptbxl_dataset():
         if data_split_mode not in valid_modes:
             raise ValueError(f"Invalid mode: {data_split_mode}. Use {valid_modes}")
         self.data_split_mode = data_split_mode
+        # Recorded so that the temporal-date policy reaches the cache
+        # identity: a cache built under a different policy describes a
+        # different partition and must not be reused.
+        self.temporal_date_policy = TEMPORAL_DATE_POLICY
 
     def download(self):
         """Downloads and extracts the dataset if not already present."""

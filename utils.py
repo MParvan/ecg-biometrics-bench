@@ -1677,6 +1677,7 @@ _CACHE_RELEVANT_LOADER_ATTRIBUTES = (
     "electrode_unit",
     "target_leads",
     "leads",
+    "temporal_date_policy",
     "single_segment_range",
     "train_parts",
     "enrol_parts",
