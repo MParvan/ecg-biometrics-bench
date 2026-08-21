@@ -558,6 +558,14 @@ def validate_experiment_arguments(args, parser):
             minimum=1,
         )
 
+    if args.split_seed is not None:
+        # Optional: null follows the training seed; otherwise a non-negative
+        # integer. require_integer rejects bool (True/False) explicitly.
+        require_integer(
+            "split_seed",
+            minimum=0,
+        )
+
     # ---------------------------------------------------------
     # 5. Floating-point and fraction parameters
     # ---------------------------------------------------------
@@ -1272,8 +1280,9 @@ def get_parser():
     train_group.add_argument('--lr', type=float, default=1e-3, help="Learning rate (default: 0.001).")
     train_group.add_argument('--test_split', type=float, default=0.2, help="Percentage for Test set (default: 0.2).")
     train_group.add_argument('--val_split', type=float, default=0.0, help="Percentage for Validation set (default: 0.0).")
-    train_group.add_argument('--seed', type=int, default=42, help="Random seed for reproducibility.")
-    train_group.add_argument('--n_runs', type=int, default=1, help="Number of independent runs using consecutive random seeds.")
+    train_group.add_argument('--seed', type=int, default=42, help="Training/general stochastic seed (model initialization, training DataLoader shuffling, augmentation, and verification-pair sampling in the balanced/random modes). When --split_seed is omitted (or YAML null), it also supplies the data-role allocation seed.")
+    train_group.add_argument('--n_runs', type=int, default=1, help="Number of repeated runs using consecutive training seeds. The data-role split schedule follows the --split_seed policy.")
+    train_group.add_argument('--split_seed', type=int, default=None, help="Seed for randomized data-role allocation. Omit this option (or use YAML null) to follow the per-run training seed; provide a non-negative integer to hold the randomized partition fixed across training seeds.")
 
     # ----------------------------------------------------
     # TRAINING-ONLY DATA AUGMENTATION
@@ -1721,6 +1730,7 @@ def main():
         'lr': args.lr,
         'val_split': args.val_split,
         'seed': args.seed,
+        'split_seed': args.split_seed,
         'n_runs': args.n_runs,
         'device': args.device,
         'visualize': args.visualize,

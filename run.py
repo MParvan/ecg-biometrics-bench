@@ -4036,11 +4036,18 @@ def _add_seed_metadata(
     hyperparams,
     base_seed,
     n_runs,
+    split_seed=None,
 ):
     """
     Add the complete random-seed schedule to experiment metadata.
 
-    Multi-run experiments use consecutive seeds beginning at ``base_seed``.
+    Multi-run experiments use consecutive training seeds beginning at
+    ``base_seed``. ``split_seed`` records the data-role allocation policy:
+    when ``None`` the split follows the per-run training seed
+    (``split_seed_policy = "follow_seed"``); otherwise the partition is held
+    fixed at the configured value (``"fixed"``). Field names are neutral; the
+    manuscript supplies any interpretation.
+
     A copied dictionary is returned so the caller's original metadata is not
     modified unexpectedly.
     """
@@ -4052,16 +4059,30 @@ def _add_seed_metadata(
             "n_runs must be greater than or equal to 1."
         )
 
+    run_seeds = [
+        base_seed + run_index
+        for run_index in range(n_runs)
+    ]
+
+    if split_seed is None:
+        resolved_split_seeds = list(run_seeds)
+        split_seed_policy = "follow_seed"
+        configured_split_seed = None
+    else:
+        configured_split_seed = int(split_seed)
+        resolved_split_seeds = [configured_split_seed] * n_runs
+        split_seed_policy = "fixed"
+
     updated_hyperparams = dict(hyperparams)
 
     updated_hyperparams.update(
         {
             "base_seed": base_seed,
             "n_runs": n_runs,
-            "run_seeds": [
-                base_seed + run_index
-                for run_index in range(n_runs)
-            ],
+            "run_seeds": run_seeds,
+            "configured_split_seed": configured_split_seed,
+            "resolved_split_seeds": resolved_split_seeds,
+            "split_seed_policy": split_seed_policy,
         }
     )
 
@@ -4080,7 +4101,7 @@ def run_closed_set_identification(x, y, model_class, epochs=150, batch_size=256,
                                   save_results_and_settings=False, loader=None, 
                                   n_runs=1, _return_stats=False,
                                   intelligent_weight_loading=True,
-                                  augmentation_config=None):
+                                  augmentation_config=None, split_seed=None):
     """
     Standard Closed-Set Identification Pipeline (Intra-session).
     Determines "Who is this person?" from a known pool of subjects seen during training.
@@ -4094,7 +4115,8 @@ def run_closed_set_identification(x, y, model_class, epochs=150, batch_size=256,
         lr (float): Learning rate for the Adam optimizer.
         test_split (float): Fraction of the data to hold out for testing (0.0 to 1.0).
         val_split (float): Fraction of the training data to use for early stopping validation.
-        seed (int): Random seed for reproducibility across splits and weights.
+        seed (int): Training/general stochastic seed controlling model initialization, training DataLoader shuffling, augmentation, and other stochastic operations not governed by split_seed (such as validation-EER pair sampling and verification-pair sampling in the balanced/random modes). When split_seed is None, seed also supplies the resolved data-role allocation seed.
+        split_seed (int or None): Optional seed for randomized data-role allocation such as train/test beat splits, subject-cohort splits, and validation allocation. None follows the current per-run training seed; an explicit integer holds the randomized partition fixed across training seeds where such a partition exists.
         device (str): Computation device ('cuda', 'cpu', or 'auto').
         visualize (bool): If True, displays and optionally saves a Confusion Matrix.
         use_template (bool): 
@@ -4115,7 +4137,7 @@ def run_closed_set_identification(x, y, model_class, epochs=150, batch_size=256,
         probe_fusion_size (int): Number of consecutive probe beats to average before making a decision.
         save_results_and_settings (bool): If True, logs results and parameters to a text file.
         loader (object): Dataset loader instance (used for extracting metadata for logging).
-        n_runs (int): Number of independent runs (with varying seeds) for statistical validation.
+        n_runs (int): Number of repeated runs using consecutive training seeds. The data-role split schedule follows the split_seed policy (it follows the training seeds when split_seed is None, and stays fixed when an explicit split_seed is given).
         _return_stats (bool): Internal flag used to pass data back during multi-seed recursion.
 
     Returns:
@@ -4139,6 +4161,7 @@ def run_closed_set_identification(x, y, model_class, epochs=150, batch_size=256,
         hyperparams,
         base_seed=seed,
         n_runs=n_runs,
+        split_seed=split_seed,
     )
 
     # 2. MULTI-RUN AGGREGATOR (Handles statistical validation)
@@ -4186,6 +4209,7 @@ def run_closed_set_identification(x, y, model_class, epochs=150, batch_size=256,
             hyperparams,
             base_seed=base_seed,
             n_runs=n_runs,
+            split_seed=split_seed,
         )
 
         per_run_results = (
@@ -4244,6 +4268,7 @@ def run_closed_set_identification(x, y, model_class, epochs=150, batch_size=256,
     ] = augmentation_config
 
     _set_seed(seed); device = _get_device(device)
+    resolved_split_seed = seed if split_seed is None else split_seed
     partition_stage_started = _start_runtime_stage()
     task_title = "Closed-Set Identification"
     mode_str = f"Template ({template_fusion_method}, {matching_method})" if use_template else "Softmax"
@@ -4287,7 +4312,7 @@ def run_closed_set_identification(x, y, model_class, epochs=150, batch_size=256,
             x,
             y,
             holdout_split=test_split,
-            seed=seed,
+            seed=resolved_split_seed,
             aligned_values=sqi_scores,
         )
     )
@@ -4360,7 +4385,7 @@ def run_closed_set_identification(x, y, model_class, epochs=150, batch_size=256,
             X_train,
             y_train_enc,
             holdout_split=val_split,
-            seed=seed,
+            seed=resolved_split_seed,
         )
     )
 
@@ -4598,7 +4623,7 @@ def run_closed_set_verification(x, y, model_class, epochs=150, batch_size=256, l
                                 save_results_and_settings=False, 
                                 loader=None, n_runs=1, _return_stats=False,
                                 intelligent_weight_loading=True,
-                                augmentation_config=None):
+                                augmentation_config=None, split_seed=None):
     """
     Standard Closed-Set Verification Pipeline (Intra-session).
     Determines "Is this person who they claim to be?" (1:1 matching) for subjects known to the model.
@@ -4615,7 +4640,8 @@ def run_closed_set_verification(x, y, model_class, epochs=150, batch_size=256, l
         num_pairs (int): Total number of Genuine and Impostor pairs to generate for evaluation.
         sampling_mode (str): Logic used to pair beats together.
             Options: ['all', 'balanced', 'random']
-        seed (int): Random seed for reproducibility.
+        seed (int): Training/general stochastic seed controlling model initialization, training DataLoader shuffling, augmentation, and other stochastic operations not governed by split_seed (such as validation-EER pair sampling and verification-pair sampling in the balanced/random modes). When split_seed is None, seed also supplies the resolved data-role allocation seed.
+        split_seed (int or None): Optional seed for randomized data-role allocation such as train/test beat splits, subject-cohort splits, and validation allocation. None follows the current per-run training seed; an explicit integer holds the randomized partition fixed across training seeds where such a partition exists.
         device (str): Computation device ('cuda', 'cpu', or 'auto').
         visualize (bool): If True, generates t-SNE scatter plots of the test embeddings.
         use_template (bool): 
@@ -4636,7 +4662,7 @@ def run_closed_set_verification(x, y, model_class, epochs=150, batch_size=256, l
                                           set first, and applies it to the Test set to simulate deployment.
         save_results_and_settings (bool): If True, logs results and parameters to a text file.
         loader (object): Dataset loader instance (used for extracting metadata for logging).
-        n_runs (int): Number of independent runs (with varying seeds) for statistical validation.
+        n_runs (int): Number of repeated runs using consecutive training seeds. The data-role split schedule follows the split_seed policy (it follows the training seeds when split_seed is None, and stays fixed when an explicit split_seed is given).
         _return_stats (bool): Internal flag used to pass data back during multi-seed recursion.
 
     Returns:
@@ -4669,6 +4695,7 @@ def run_closed_set_verification(x, y, model_class, epochs=150, batch_size=256, l
         hyperparams,
         base_seed=seed,
         n_runs=n_runs,
+        split_seed=split_seed,
     )
 
     # --- MULTI-RUN AGGREGATOR ---
@@ -4710,6 +4737,7 @@ def run_closed_set_verification(x, y, model_class, epochs=150, batch_size=256, l
             hyperparams,
             base_seed=base_seed,
             n_runs=n_runs,
+            split_seed=split_seed,
         )
 
         per_run_results = (
@@ -4761,6 +4789,7 @@ def run_closed_set_verification(x, y, model_class, epochs=150, batch_size=256, l
     ] = augmentation_config
 
     _set_seed(seed); device = _get_device(device)
+    resolved_split_seed = seed if split_seed is None else split_seed
     partition_stage_started = _start_runtime_stage()
     task_title = "Closed-Set Verification"
     mode_str = f"Template ({template_fusion_method}, size={template_size})" if use_template else "Cloud Pairs (Test Only)"
@@ -4803,7 +4832,7 @@ def run_closed_set_verification(x, y, model_class, epochs=150, batch_size=256, l
             x,
             y,
             holdout_split=test_split,
-            seed=seed,
+            seed=resolved_split_seed,
             aligned_values=sqi_scores,
         )
     )
@@ -4871,7 +4900,7 @@ def run_closed_set_verification(x, y, model_class, epochs=150, batch_size=256, l
             X_train,
             y_train_enc,
             holdout_split=val_split,
-            seed=seed,
+            seed=resolved_split_seed,
         )
     )
 
@@ -5131,7 +5160,7 @@ def run_subject_disjoint_identification(x, y, model_class, epochs=150, batch_siz
                                         save_results_and_settings=False, loader=None, 
                                         n_runs=1, _return_stats=False,
                                         intelligent_weight_loading=True,
-                                        augmentation_config=None):
+                                        augmentation_config=None, split_seed=None):
     """
     Subject-Disjoint Identification Pipeline.
     Evaluates identification performance on subjects entirely UNSEEN during the training phase.
@@ -5146,7 +5175,8 @@ def run_subject_disjoint_identification(x, y, model_class, epochs=150, batch_siz
         lr (float): Learning rate for the Adam optimizer.
         test_split (float): Fraction of unique SUBJECTS to hold out for the disjoint test set.
         val_split (float): Fraction of training subjects to use for early stopping.
-        seed (int): Random seed for reproducibility.
+        seed (int): Training/general stochastic seed controlling model initialization, training DataLoader shuffling, augmentation, and other stochastic operations not governed by split_seed (such as validation-EER pair sampling and verification-pair sampling in the balanced/random modes). When split_seed is None, seed also supplies the resolved data-role allocation seed.
+        split_seed (int or None): Optional seed for randomized data-role allocation such as train/test beat splits, subject-cohort splits, and validation allocation. None follows the current per-run training seed; an explicit integer holds the randomized partition fixed across training seeds where such a partition exists.
         device (str): Computation device ('cuda', 'cpu', or 'auto').
         visualize (bool): If True, generates t-SNE scatter plots of the unseen embeddings.
         use_template (bool): MUST be True for Subject-Disjoint identification (requires a gallery).
@@ -5164,7 +5194,7 @@ def run_subject_disjoint_identification(x, y, model_class, epochs=150, batch_siz
         probe_fusion_size (int): Number of consecutive probe beats to average before searching the gallery.
         save_results_and_settings (bool): If True, logs results and parameters to a text file.
         loader (object): Dataset loader instance (used for extracting metadata for logging).
-        n_runs (int): Number of independent runs (with varying seeds) for statistical validation.
+        n_runs (int): Number of repeated runs using consecutive training seeds. The data-role split schedule follows the split_seed policy (it follows the training seeds when split_seed is None, and stays fixed when an explicit split_seed is given).
         _return_stats (bool): Internal flag used to pass data back during multi-seed recursion.
 
     Returns:
@@ -5208,6 +5238,7 @@ def run_subject_disjoint_identification(x, y, model_class, epochs=150, batch_siz
         hyperparams,
         base_seed=seed,
         n_runs=n_runs,
+        split_seed=split_seed,
     )
 
     if n_runs > 1:
@@ -5246,6 +5277,7 @@ def run_subject_disjoint_identification(x, y, model_class, epochs=150, batch_siz
             hyperparams,
             base_seed=base_seed,
             n_runs=n_runs,
+            split_seed=split_seed,
         )
 
         per_run_results = (
@@ -5294,6 +5326,7 @@ def run_subject_disjoint_identification(x, y, model_class, epochs=150, batch_siz
     ] = augmentation_config
 
     _set_seed(seed); device = _get_device(device)
+    resolved_split_seed = seed if split_seed is None else split_seed
     partition_stage_started = _start_runtime_stage()
     task_title = "Subject-Disjoint Identification"
     mode_str = f"Gallery: First {template_size} beats | Fusion: {template_fusion_method}"
@@ -5349,7 +5382,7 @@ def run_subject_disjoint_identification(x, y, model_class, epochs=150, batch_siz
         unique_subjs,
         test_split=test_split,
         val_split=val_split,
-        seed=seed,
+        seed=resolved_split_seed,
     )
 
     partitions = (
@@ -5438,7 +5471,7 @@ def run_subject_disjoint_identification(x, y, model_class, epochs=150, batch_siz
     # Create a Validation split from the SEEN Training subjects
     if val_split > 0.0:
         X_tr, X_val_seen, y_tr, y_val_seen = train_test_split(
-            X_train, y_train_remap, test_size=val_split, stratify=y_train_remap, random_state=seed
+            X_train, y_train_remap, test_size=val_split, stratify=y_train_remap, random_state=resolved_split_seed
         )
         # Create loader ONLY if we actually made a split
         val_loader_seen = _make_loader(X_val_seen, y_val_seen, batch_size, shuffle=False)
@@ -5676,7 +5709,7 @@ def run_subject_disjoint_verification(x, y, model_class, epochs=150, batch_size=
                                       save_results_and_settings=False, 
                                       loader=None, n_runs=1, _return_stats=False,
                                       intelligent_weight_loading=True,
-                                      augmentation_config=None):
+                                      augmentation_config=None, split_seed=None):
     """
     Subject-Disjoint Verification Pipeline (Subject-Disjoint 1:1 Matching).
     Tests the system's ability to verify the identity of completely new users.
@@ -5694,7 +5727,8 @@ def run_subject_disjoint_verification(x, y, model_class, epochs=150, batch_size=
         num_pairs (int): Total number of Genuine and Impostor pairs to generate.
         sampling_mode (str): Logic used to pair beats together.
             Options: ['all', 'balanced', 'random']
-        seed (int): Random seed for reproducibility.
+        seed (int): Training/general stochastic seed controlling model initialization, training DataLoader shuffling, augmentation, and other stochastic operations not governed by split_seed (such as validation-EER pair sampling and verification-pair sampling in the balanced/random modes). When split_seed is None, seed also supplies the resolved data-role allocation seed.
+        split_seed (int or None): Optional seed for randomized data-role allocation such as train/test beat splits, subject-cohort splits, and validation allocation. None follows the current per-run training seed; an explicit integer holds the randomized partition fixed across training seeds where such a partition exists.
         device (str): Computation device ('cuda', 'cpu', or 'auto').
         visualize (bool): If True, generates t-SNE scatter plots of the unseen embeddings.
         use_template (bool): 
@@ -5714,7 +5748,7 @@ def run_subject_disjoint_verification(x, y, model_class, epochs=150, batch_size=
         use_deployment_evaluation (bool): Uses an unseen validation group to find a Global Threshold.
         save_results_and_settings (bool): If True, logs results and parameters to a text file.
         loader (object): Dataset loader instance (used for extracting metadata for logging).
-        n_runs (int): Number of independent runs (with varying seeds) for statistical validation.
+        n_runs (int): Number of repeated runs using consecutive training seeds. The data-role split schedule follows the split_seed policy (it follows the training seeds when split_seed is None, and stays fixed when an explicit split_seed is given).
         _return_stats (bool): Internal flag used to pass data back during multi-seed recursion.
 
     Returns:
@@ -5744,6 +5778,7 @@ def run_subject_disjoint_verification(x, y, model_class, epochs=150, batch_size=
         hyperparams,
         base_seed=seed,
         n_runs=n_runs,
+        split_seed=split_seed,
     )
 
     if n_runs > 1:
@@ -5782,6 +5817,7 @@ def run_subject_disjoint_verification(x, y, model_class, epochs=150, batch_size=
             hyperparams,
             base_seed=base_seed,
             n_runs=n_runs,
+            split_seed=split_seed,
         )
 
         per_run_results = (
@@ -5843,6 +5879,7 @@ def run_subject_disjoint_verification(x, y, model_class, epochs=150, batch_size=
     ] = augmentation_config
 
     _set_seed(seed); device = _get_device(device)
+    resolved_split_seed = seed if split_seed is None else split_seed
     partition_stage_started = _start_runtime_stage()
     task_title = "Subject-Disjoint Verification"        
     mode_str = f"Template ({template_fusion_method}, First {template_size})" if use_template else "Cloud Pairs (Test Only)"
@@ -5900,7 +5937,7 @@ def run_subject_disjoint_verification(x, y, model_class, epochs=150, batch_size=
         unique_subjs,
         test_split=test_split,
         val_split=val_split,
-        seed=seed,
+        seed=resolved_split_seed,
     )
 
     partitions = (
@@ -5987,7 +6024,7 @@ def run_subject_disjoint_verification(x, y, model_class, epochs=150, batch_size=
     # This gives us the smooth Cross-Entropy loss anchor for the composite metric
     if val_split > 0.0:
         X_tr, X_val_seen, y_tr, y_val_seen = train_test_split(
-            X_train, y_train_remap, test_size=val_split, stratify=y_train_remap, random_state=seed
+            X_train, y_train_remap, test_size=val_split, stratify=y_train_remap, random_state=resolved_split_seed
         )
         # Create loader ONLY if we actually made a split
         val_loader_seen = _make_loader(X_val_seen, y_val_seen, batch_size, shuffle=False)
@@ -6257,7 +6294,7 @@ def run_cross_session_identification(x_train, y_train, x_test, y_test, model_cla
                                      sqi_keep_pct=0.8, probe_fusion_size=3, save_results_and_settings=False, 
                                      loader=None, n_runs=1, _return_stats=False,
                                      intelligent_weight_loading=True,
-                                     augmentation_config=None):
+                                     augmentation_config=None, split_seed=None):
     """
     Cross-Session Identification Pipeline (Temporal Robustness).
     Evaluates system robustness against physiological aging and sensor variations over time.
@@ -6273,7 +6310,8 @@ def run_cross_session_identification(x_train, y_train, x_test, y_test, model_cla
         batch_size (int): Number of samples per training batch.
         lr (float): Learning rate for the Adam optimizer.
         val_split (float): Fraction of Session 1 data to use for early stopping.
-        seed (int): Random seed for reproducibility.
+        seed (int): Training/general stochastic seed controlling model initialization, training DataLoader shuffling, augmentation, and other stochastic operations not governed by split_seed (such as validation-EER pair sampling and verification-pair sampling in the balanced/random modes). When split_seed is None, seed also supplies the resolved data-role allocation seed.
+        split_seed (int or None): Optional seed for randomized data-role allocation such as train/test beat splits, subject-cohort splits, and validation allocation. None follows the current per-run training seed; an explicit integer holds the randomized partition fixed across training seeds where such a partition exists. For cross-session tasks the evaluation partition is protocol-defined and fixed; split_seed affects only a randomized validation allocation when validation is active.
         device (str): Computation device ('cuda', 'cpu', or 'auto').
         visualize (bool): If True, generates t-SNE scatter plots of the cross-session embeddings.
         use_template (bool): 
@@ -6294,7 +6332,7 @@ def run_cross_session_identification(x_train, y_train, x_test, y_test, model_cla
         probe_fusion_size (int): Number of consecutive Session 2 beats to average before making a decision.
         save_results_and_settings (bool): If True, logs results and parameters to a text file.
         loader (object): Dataset loader instance (used for extracting metadata for logging).
-        n_runs (int): Number of independent runs (with varying seeds) for statistical validation.
+        n_runs (int): Number of repeated runs using consecutive training seeds. The data-role split schedule follows the split_seed policy (it follows the training seeds when split_seed is None, and stays fixed when an explicit split_seed is given).
         _return_stats (bool): Internal flag used to pass data back during multi-seed recursion.
 
     Returns:
@@ -6317,6 +6355,7 @@ def run_cross_session_identification(x_train, y_train, x_test, y_test, model_cla
         hyperparams,
         base_seed=seed,
         n_runs=n_runs,
+        split_seed=split_seed,
     )
 
     if n_runs > 1:
@@ -6355,6 +6394,7 @@ def run_cross_session_identification(x_train, y_train, x_test, y_test, model_cla
             hyperparams,
             base_seed=base_seed,
             n_runs=n_runs,
+            split_seed=split_seed,
         )
 
         per_run_results = (
@@ -6403,6 +6443,7 @@ def run_cross_session_identification(x_train, y_train, x_test, y_test, model_cla
     ] = augmentation_config
 
     _set_seed(seed); device = _get_device(device)
+    resolved_split_seed = seed if split_seed is None else split_seed
     partition_stage_started = _start_runtime_stage()
     task_title = "Cross-Session Identification"
     mode_str = f"Template ({template_fusion_method}, size={template_size or 'All'})" if use_template else "Softmax Classifier"
@@ -6504,7 +6545,7 @@ def run_cross_session_identification(x_train, y_train, x_test, y_test, model_cla
     # Validation Split (from Session 1)
     if val_split > 0.0:
         X_tr, X_val, y_tr, y_val = train_test_split(
-            x_train_full, y_train_enc, test_size=val_split, stratify=y_train_enc, random_state=seed
+            x_train_full, y_train_enc, test_size=val_split, stratify=y_train_enc, random_state=resolved_split_seed
         )
         val_loader = _make_loader(X_val, y_val, batch_size, shuffle=False)
         print(f"Session 1 Split: Train={len(X_tr)}, Val={len(X_val)} | Session 2 Probes={len(x_test_filtered)}")
@@ -6704,7 +6745,7 @@ def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class
                                    save_results_and_settings=False, loader=None, 
                                    n_runs=1, _return_stats=False,
                                    intelligent_weight_loading=True,
-                                   augmentation_config=None):
+                                   augmentation_config=None, split_seed=None):
     """
     Cross-Session Verification Pipeline (Temporal Robustness 1:1).
     Attempts to verify if a subject is who they claim to be across different time-separated recording sessions.
@@ -6722,7 +6763,8 @@ def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class
         num_pairs (int): Total number of Genuine and Impostor pairs to generate.
         sampling_mode (str): Logic used to pair beats together.
             Options: ['all', 'balanced', 'random']
-        seed (int): Random seed for reproducibility.
+        seed (int): Training/general stochastic seed controlling model initialization, training DataLoader shuffling, augmentation, and other stochastic operations not governed by split_seed (such as validation-EER pair sampling and verification-pair sampling in the balanced/random modes). When split_seed is None, seed also supplies the resolved data-role allocation seed.
+        split_seed (int or None): Optional seed for randomized data-role allocation such as train/test beat splits, subject-cohort splits, and validation allocation. None follows the current per-run training seed; an explicit integer holds the randomized partition fixed across training seeds where such a partition exists. For cross-session tasks the evaluation partition is protocol-defined and fixed; split_seed affects only a randomized validation allocation when validation is active.
         device (str): Computation device ('cuda', 'cpu', or 'auto').
         visualize (bool): If True, generates t-SNE scatter plots of the cross-session embeddings.
         use_template (bool):
@@ -6743,7 +6785,7 @@ def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class
         use_deployment_evaluation (bool): Uses Session 1 Validation data to calculate a Global Threshold.
         save_results_and_settings (bool): If True, logs results and parameters to a text file.
         loader (object): Dataset loader instance (used for extracting metadata for logging).
-        n_runs (int): Number of independent runs (with varying seeds) for statistical validation.
+        n_runs (int): Number of repeated runs using consecutive training seeds. The data-role split schedule follows the split_seed policy (it follows the training seeds when split_seed is None, and stays fixed when an explicit split_seed is given).
         _return_stats (bool): Internal flag used to pass data back during multi-seed recursion.
 
     Returns:
@@ -6772,6 +6814,7 @@ def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class
         hyperparams,
         base_seed=seed,
         n_runs=n_runs,
+        split_seed=split_seed,
     )
 
     if n_runs > 1:
@@ -6810,6 +6853,7 @@ def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class
             hyperparams,
             base_seed=base_seed,
             n_runs=n_runs,
+            split_seed=split_seed,
         )
 
         per_run_results = (
@@ -6861,6 +6905,7 @@ def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class
     ] = augmentation_config
 
     _set_seed(seed); device = _get_device(device)
+    resolved_split_seed = seed if split_seed is None else split_seed
     partition_stage_started = _start_runtime_stage()
     task_title = "Cross-Session Verification"
     mode_str = f"Template ({template_fusion_method}, size={template_size or 'All'})" if use_template else "Cloud Pairs (Session 2 Only)"
@@ -6981,7 +7026,7 @@ def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class
     # ====================================================
     if val_split > 0.0:
         X_tr, X_val, y_tr, y_val = train_test_split(
-            x_train_full, y_train_enc, test_size=val_split, stratify=y_train_enc, random_state=seed
+            x_train_full, y_train_enc, test_size=val_split, stratify=y_train_enc, random_state=resolved_split_seed
         )
         val_loader = _make_loader(X_val, y_val, batch_size, shuffle=False)
         print(f"Session 1 Split: Train={len(X_tr)}, Val={len(X_val)} | Session 2 Probes={len(x_test_filtered)}")
@@ -7211,7 +7256,7 @@ def run_subject_disjoint_cross_session_identification(
         sqi_s2=None, sqi_threshold=0.05, sqi_keep_pct=0.8, probe_fusion_size=3, save_results_and_settings=False, 
         loader=None, n_runs=1, _return_stats=False,
         intelligent_weight_loading=True,
-        augmentation_config=None):
+        augmentation_config=None, split_seed=None):
     """
     The Ultimate Biometric Test: Subject-Disjoint + Temporal Robustness Identification.
     1. Trains a feature extractor on Session 1 of Subject Group A.
@@ -7229,7 +7274,8 @@ def run_subject_disjoint_cross_session_identification(
         lr (float): Learning rate for the Adam optimizer.
         test_split (float): Fraction of unique SUBJECTS to isolate for the Group B tests.
         val_split (float): Fraction of Group A subjects to use for early stopping validation.
-        seed (int): Random seed for reproducibility.
+        seed (int): Training/general stochastic seed controlling model initialization, training DataLoader shuffling, augmentation, and other stochastic operations not governed by split_seed (such as validation-EER pair sampling and verification-pair sampling in the balanced/random modes). When split_seed is None, seed also supplies the resolved data-role allocation seed.
+        split_seed (int or None): Optional seed for randomized data-role allocation such as train/test beat splits, subject-cohort splits, and validation allocation. None follows the current per-run training seed; an explicit integer holds the randomized partition fixed across training seeds where such a partition exists.
         device (str): Computation device ('cuda', 'cpu', or 'auto').
         visualize (bool): If True, generates t-SNE scatter plots of the unseen temporal embeddings.
         use_template (bool): MUST be True for this task (requires a gallery to identify unseen subjects).
@@ -7248,7 +7294,7 @@ def run_subject_disjoint_cross_session_identification(
         probe_fusion_size (int): Number of consecutive Session 2 beats to average before searching the gallery.
         save_results_and_settings (bool): If True, logs results and parameters to a text file.
         loader (object): Dataset loader instance (used for extracting metadata for logging).
-        n_runs (int): Number of independent runs (with varying seeds) for statistical validation.
+        n_runs (int): Number of repeated runs using consecutive training seeds. The data-role split schedule follows the split_seed policy (it follows the training seeds when split_seed is None, and stays fixed when an explicit split_seed is given).
         _return_stats (bool): Internal flag used to pass data back during multi-seed recursion.
 
     Returns:
@@ -7271,6 +7317,7 @@ def run_subject_disjoint_cross_session_identification(
         hyperparams,
         base_seed=seed,
         n_runs=n_runs,
+        split_seed=split_seed,
     )
 
     if n_runs > 1:
@@ -7309,6 +7356,7 @@ def run_subject_disjoint_cross_session_identification(
             hyperparams,
             base_seed=base_seed,
             n_runs=n_runs,
+            split_seed=split_seed,
         )
 
         per_run_results = (
@@ -7360,6 +7408,7 @@ def run_subject_disjoint_cross_session_identification(
     ] = augmentation_config
 
     _set_seed(seed); device = _get_device(device)
+    resolved_split_seed = seed if split_seed is None else split_seed
     partition_stage_started = _start_runtime_stage()
     task_title = "Subject-Disjoint Cross-Session ID"
     mode_str = f"Gallery: Session 1 ({template_fusion_method}, size={template_size or 'All'})"
@@ -7410,7 +7459,7 @@ def run_subject_disjoint_cross_session_identification(
         common_subs,
         test_split=test_split,
         val_split=val_split,
-        seed=seed,
+        seed=resolved_split_seed,
     )
 
     print(
@@ -7481,7 +7530,7 @@ def run_subject_disjoint_cross_session_identification(
     # This gives us the smooth Cross-Entropy loss anchor for the composite metric
     if val_split > 0.0:
         X_tr, X_val_seen, y_tr, y_val_seen = train_test_split(
-            X_train, y_train_enc, test_size=val_split, stratify=y_train_enc, random_state=seed
+            X_train, y_train_enc, test_size=val_split, stratify=y_train_enc, random_state=resolved_split_seed
         )
         val_loader_seen = _make_loader(X_val_seen, y_val_seen, batch_size, shuffle=False)
     else:
@@ -7679,7 +7728,7 @@ def run_subject_disjoint_cross_session_verification(
         use_deployment_evaluation=False, target_fars=None,
         save_results_and_settings=False, loader=None, n_runs=1, _return_stats=False,
         intelligent_weight_loading=True,
-        augmentation_config=None):
+        augmentation_config=None, split_seed=None):
     """
     The Ultimate Biometric Test: Subject-Disjoint + Temporal Robustness 1:1 Verification.
     Verifies the identity of subjects completely excluded from representation learning, across different recording days.
@@ -7699,7 +7748,8 @@ def run_subject_disjoint_cross_session_verification(
         num_pairs (int): Total number of Genuine and Impostor pairs to generate for evaluation.
         sampling_mode (str): Logic used to pair beats together.
             Options: ['all', 'balanced', 'random']
-        seed (int): Random seed for reproducibility.
+        seed (int): Training/general stochastic seed controlling model initialization, training DataLoader shuffling, augmentation, and other stochastic operations not governed by split_seed (such as validation-EER pair sampling and verification-pair sampling in the balanced/random modes). When split_seed is None, seed also supplies the resolved data-role allocation seed.
+        split_seed (int or None): Optional seed for randomized data-role allocation such as train/test beat splits, subject-cohort splits, and validation allocation. None follows the current per-run training seed; an explicit integer holds the randomized partition fixed across training seeds where such a partition exists.
         device (str): Computation device ('cuda', 'cpu', or 'auto').
         visualize (bool): If True, generates t-SNE scatter plots of the unseen temporal embeddings.
         use_template (bool):
@@ -7720,7 +7770,7 @@ def run_subject_disjoint_cross_session_verification(
         use_deployment_evaluation (bool): Uses unseen validation subjects from Group A to calculate a Global Threshold.
         save_results_and_settings (bool): If True, logs results and parameters to a text file.
         loader (object): Dataset loader instance (used for extracting metadata for logging).
-        n_runs (int): Number of independent runs (with varying seeds) for statistical validation.
+        n_runs (int): Number of repeated runs using consecutive training seeds. The data-role split schedule follows the split_seed policy (it follows the training seeds when split_seed is None, and stays fixed when an explicit split_seed is given).
         _return_stats (bool): Internal flag used to pass data back during multi-seed recursion.
 
     Returns:
@@ -7749,6 +7799,7 @@ def run_subject_disjoint_cross_session_verification(
         hyperparams,
         base_seed=seed,
         n_runs=n_runs,
+        split_seed=split_seed,
     )
 
     if n_runs > 1:
@@ -7787,6 +7838,7 @@ def run_subject_disjoint_cross_session_verification(
             hyperparams,
             base_seed=base_seed,
             n_runs=n_runs,
+            split_seed=split_seed,
         )
 
         per_run_results = (
@@ -7841,6 +7893,7 @@ def run_subject_disjoint_cross_session_verification(
     ] = augmentation_config
 
     _set_seed(seed); device = _get_device(device)
+    resolved_split_seed = seed if split_seed is None else split_seed
     partition_stage_started = _start_runtime_stage()
     task_title = "Subject-Disjoint Cross-Session Verification"
     mode_str = f"Template ({template_fusion_method}, S1 Enroll -> S2 Probe)" if use_template else "Cloud Pairs (S2 vs S2)"
@@ -7889,7 +7942,7 @@ def run_subject_disjoint_cross_session_verification(
         common_subs,
         test_split=test_split,
         val_split=val_split,
-        seed=seed,
+        seed=resolved_split_seed,
     )
 
     print(
@@ -7954,7 +8007,7 @@ def run_subject_disjoint_cross_session_verification(
     # This gives us the smooth Cross-Entropy loss anchor for the composite metric
     if val_split > 0.0:
         X_tr, X_val_seen, y_tr, y_val_seen = train_test_split(
-            X_train, y_train_enc, test_size=val_split, stratify=y_train_enc, random_state=seed
+            X_train, y_train_enc, test_size=val_split, stratify=y_train_enc, random_state=resolved_split_seed
         )
         val_loader_seen = _make_loader(X_val_seen, y_val_seen, batch_size, shuffle=False)
     else:
