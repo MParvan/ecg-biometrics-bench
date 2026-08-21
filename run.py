@@ -3503,11 +3503,49 @@ def _prepare_multi_run_arguments(local_arguments):
 # WEIGHT CACHE CONFIGURATION
 # =============================================================================
 
+def _collect_validation_arrays(val_split, scope):
+    """
+    Gather the validation arrays that can influence the selected/final
+    weights, for the weight-cache fingerprint.
+
+    Validation affects the returned weights through best-checkpoint
+    selection, learning-rate rollback and early stopping. When validation is
+    inactive (``val_split`` not positive) this returns ``None`` so the
+    weight-cache identity is unchanged. Only arrays present in the caller's
+    scope and not ``None`` are included, which covers the seen validation
+    (all tasks) and the unseen-subject / session validation (subject-disjoint
+    and cross-session tasks).
+    """
+    try:
+        active = float(val_split) > 0.0
+    except (TypeError, ValueError):
+        active = False
+
+    if not active:
+        return None
+
+    candidate_names = (
+        "X_val",
+        "y_val",
+        "X_val_seen",
+        "y_val_seen",
+        "X_val_s1",
+        "y_val_s1_enc",
+    )
+    collected = {
+        name: scope[name]
+        for name in candidate_names
+        if scope.get(name) is not None
+    }
+    return collected or None
+
+
 def _build_weight_cache_config(
     loader,
     training_config,
     training_samples=None,
     training_labels=None,
+    validation_arrays=None,
 ):
     """
     Build the complete identity for reusable trained model weights.
@@ -3540,6 +3578,20 @@ def _build_weight_cache_config(
             }
         )
 
+    if validation_arrays:
+        # Validation can change the selected/final weights (best-checkpoint
+        # selection, LR rollback, early stopping); its arrays therefore
+        # belong to the identity when validation is active. The field is
+        # omitted entirely when inactive, preserving existing identities.
+        fingerprintable = {
+            name: array
+            for name, array in validation_arrays.items()
+            if array is not None
+        }
+        if fingerprintable:
+            complete_config[
+                "validation_partition"
+            ] = _fingerprint_array_collection(fingerprintable)
     complete_config[
         "loader_identity"
     ] = _build_loader_cache_identity(
@@ -4475,11 +4527,15 @@ def run_closed_set_identification(x, y, model_class, epochs=150, batch_size=256,
         "augmentation": augmentation_config,
         }
 
+        validation_arrays = _collect_validation_arrays(
+            val_split, locals()
+        )
         train_config = _build_weight_cache_config(
             loader,
             train_config,
             training_samples=X_tr,
             training_labels=y_tr,
+            validation_arrays=validation_arrays,
         )
         
         cached_model, uid = _timed_runtime_call(
@@ -4983,11 +5039,15 @@ def run_closed_set_verification(x, y, model_class, epochs=150, batch_size=256, l
             "augmentation": augmentation_config,
         }
 
+        validation_arrays = _collect_validation_arrays(
+            val_split, locals()
+        )
         train_config = _build_weight_cache_config(
             loader,
             train_config,
             training_samples=X_tr,
             training_labels=y_tr,
+            validation_arrays=validation_arrays,
         )
         
         cached_model, uid = _timed_runtime_call(
@@ -5530,11 +5590,15 @@ def run_subject_disjoint_identification(x, y, model_class, epochs=150, batch_siz
             "matching_method": matching_method  # Affects early stopping EER!
         }
 
+        validation_arrays = _collect_validation_arrays(
+            val_split, locals()
+        )
         train_config = _build_weight_cache_config(
             loader,
             train_config,
             training_samples=X_tr,
             training_labels=y_tr,
+            validation_arrays=validation_arrays,
         )
         
         cached_model, uid = _timed_runtime_call(
@@ -6083,11 +6147,15 @@ def run_subject_disjoint_verification(x, y, model_class, epochs=150, batch_size=
             "matching_method": matching_method  # Affects early stopping EER!
         }
 
+        validation_arrays = _collect_validation_arrays(
+            val_split, locals()
+        )
         train_config = _build_weight_cache_config(
             loader,
             train_config,
             training_samples=X_tr,
             training_labels=y_tr,
+            validation_arrays=validation_arrays,
         )
         
         cached_model, uid = _timed_runtime_call(
@@ -6600,11 +6668,15 @@ def run_cross_session_identification(x_train, y_train, x_test, y_test, model_cla
             "augmentation": augmentation_config,
         }
 
+        validation_arrays = _collect_validation_arrays(
+            val_split, locals()
+        )
         train_config = _build_weight_cache_config(
             loader,
             train_config,
             training_samples=X_tr,
             training_labels=y_tr,
+            validation_arrays=validation_arrays,
         )
         
         cached_model, uid = _timed_runtime_call(
@@ -7081,11 +7153,15 @@ def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class
             "augmentation": augmentation_config,
         }
 
+        validation_arrays = _collect_validation_arrays(
+            val_split, locals()
+        )
         train_config = _build_weight_cache_config(
             loader,
             train_config,
             training_samples=X_tr,
             training_labels=y_tr,
+            validation_arrays=validation_arrays,
         )
         
         cached_model, uid = _timed_runtime_call(
@@ -7586,11 +7662,15 @@ def run_subject_disjoint_cross_session_identification(
             "matching_method": matching_method # Affects early stopping EER!
         }
 
+        validation_arrays = _collect_validation_arrays(
+            val_split, locals()
+        )
         train_config = _build_weight_cache_config(
             loader,
             train_config,
             training_samples=X_tr,
             training_labels=y_tr,
+            validation_arrays=validation_arrays,
         )
         
         cached_model, uid = _timed_runtime_call(
@@ -8063,11 +8143,15 @@ def run_subject_disjoint_cross_session_verification(
             "matching_method": matching_method # Affects early stopping EER!
         }
 
+        validation_arrays = _collect_validation_arrays(
+            val_split, locals()
+        )
         train_config = _build_weight_cache_config(
             loader,
             train_config,
             training_samples=X_tr,
             training_labels=y_tr,
+            validation_arrays=validation_arrays,
         )
 
         cached_model, uid = _timed_runtime_call(
