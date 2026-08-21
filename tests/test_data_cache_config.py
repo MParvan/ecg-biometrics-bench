@@ -14,11 +14,15 @@ from utils import _generate_config_hash
 
 
 class DummyLoader:
-    def __init__(self, signal_type="filtered"):
+    def __init__(self, signal_type="filtered", electrode_unit=None):
         # The channel is resolved by the loader, which may take it from the
         # dataset configuration rather than from the command line, so the cache
         # identity reads it back from here.
         self.signal_type = signal_type
+
+        # The CYBHi acquiring unit is resolved the same way: it may be left
+        # unset on the command line and taken from the dataset configuration.
+        self.electrode_unit = electrode_unit
 
         self.cfg = {
             "root_dir": "synthetic_dataset",
@@ -165,6 +169,43 @@ class DataCacheConfigurationTests(unittest.TestCase):
         self.assertEqual(
             config["signal_type"],
             "raw",
+        )
+
+    def test_electrode_unit_changes_the_cache_hash(self):
+        config_1 = build_data_cache_config(
+            make_args(),
+            DummyLoader(electrode_unit="8B"),
+            task_type="cross_session",
+        )
+        config_2 = build_data_cache_config(
+            make_args(),
+            DummyLoader(electrode_unit="85"),
+            task_type="cross_session",
+        )
+
+        self.assertNotEqual(
+            _generate_config_hash(config_1),
+            _generate_config_hash(config_2),
+        )
+
+    def test_cache_records_the_unit_the_loader_resolved(self):
+        """
+        The CYBHi acquiring unit may be left unset on the command line and
+        resolved from config.yaml, so the cache identity must name the unit the
+        loader actually read rather than the absent argument.
+        """
+        args = make_args()
+        args.electrode_unit = None
+
+        config = build_data_cache_config(
+            args,
+            DummyLoader(electrode_unit="85"),
+            task_type="cross_session",
+        )
+
+        self.assertEqual(
+            config["electrode_unit"],
+            "85",
         )
 
     def test_effective_loader_settings_are_recorded(self):

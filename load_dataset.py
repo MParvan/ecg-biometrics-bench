@@ -2551,11 +2551,12 @@ class load_cybhi_dataset():
                 - '8B': hand palms, Ag/AgCl electrodes. The default.
                 - '85': index and middle fingers, electrolycra.
                 - 'both': pool the two, for an electrode-material comparison.
-            Every short-term acquisition was recorded by both units at once, so
-            the choice holds subject and moment fixed and varies only the
-            electrode. The electrolycra recordings carry markedly more noise
-            and yield far fewer detectable beats, which is what the dataset was
-            built to demonstrate. Defaults to the value in ``config.yaml``.
+            Every short-term acquisition was recorded by both units at once,
+            so reading one unit keeps the electrode configuration fixed within
+            an identity: pooling would let enrollment and probe draw the same
+            moment from different sensors. The choice holds subject and moment
+            fixed and varies only the electrode, which is the comparison the
+            dataset was built for. Defaults to the value in ``config.yaml``.
             The long-term collection has one unit and is unaffected.
         num_beats_to_merge (int): Number of consecutive beats to fuse into a single sample.
         beat_merge_method (str): Strategy for fusing beats. Options: ['average', 'concat']
@@ -2640,11 +2641,47 @@ class load_cybhi_dataset():
         self.probe_sessions = to_list(probe_sessions)
         
         self.required_cross_sessions = list(set(self.train_sessions + self.enroll_sessions + self.probe_sessions))
-        
+
         if self.data_split_mode == "single-session" and not self.session_for_single_session_evaluation:
             raise ValueError("You must provide `session_for_single_session_evaluation`.")
         if self.data_split_mode == "cross-session" and not self.required_cross_sessions:
             raise ValueError("You must provide at least one valid train, enroll, or probe session.")
+
+        self._reject_mixed_collections()
+
+    def _reject_mixed_collections(self):
+        """
+        Refuse a protocol that draws on both CYBHi collections at once.
+
+        The short-term and long-term collections are two separate studies with
+        two separate cohorts: 65 participants in one, 63 in the other. Ten
+        subject codes appear in both, and each such code belongs to a
+        different person in each collection, so an experiment spanning the two
+        would file two people under one identity.
+        """
+        # Only the sessions the active mode reads matter: the other mode's
+        # arguments keep their constructor defaults and are never used.
+        if self.data_split_mode == "single-session":
+            requested = set(self.session_for_single_session_evaluation)
+        else:
+            requested = set(self.required_cross_sessions)
+
+        short_term = sorted(
+            s for s in requested if s.startswith("short-term")
+        )
+        long_term = sorted(
+            s for s in requested if s.startswith("long-term")
+        )
+
+        if short_term and long_term:
+            raise ValueError(
+                "CYBHi: a protocol cannot span the short-term and long-term "
+                "collections. They are two separate cohorts, and some subject "
+                "codes appear in both while naming different people, so "
+                f"combining {short_term} with {long_term} would file two "
+                "people under one identity. Evaluate each collection in its "
+                "own experiment."
+            )
 
     def download(self):
         _download_and_extract(self.url, self.zip_path, self.dataset_root, "CYBHi", cleanup=self.cleanup_zip)
@@ -2657,18 +2694,26 @@ class load_cybhi_dataset():
         clean = filename.replace('.txt', '').replace('._', '')
         parts = clean.split('-')
 
-        rec_date = datetime.date.min
+        rec_date = None
         sid = "UNKNOWN"
         session_code = "UNKNOWN"
         unit = "UNKNOWN"
 
         if len(parts) >= 3:
-            # 1. Date (e.g., 20110715)
+            # 1. Date (e.g., 20110715). A CYBHi recording always states a
+            # genuine YYYYMMDD acquisition date, and the long-term collection
+            # reads it to order the two visits, so an unparseable date is
+            # refused rather than replaced with a stand-in.
             if len(parts[0]) == 8 and parts[0].isdigit():
                 try:
                     rec_date = datetime.datetime.strptime(parts[0], "%Y%m%d").date()
                 except ValueError:
-                    pass
+                    rec_date = None
+            if rec_date is None:
+                raise ValueError(
+                    "CYBHi filename states no parseable acquisition date: "
+                    f"{filename!r}. Expected a leading YYYYMMDD field."
+                )
 
             # 2. Subject ID (e.g., MLS)
             sid = parts[1].upper()
@@ -2851,7 +2896,9 @@ class load_cybhi_dataset():
             if is_valid:
                 kept_subjects += 1
                 for s in target_sessions:
-                    # CYBHi has multiple sensors per session (e.g. 8B and 85). We pool them both!
+                    # The acquiring-unit selection already happened during
+                    # enumeration, so each session holds recordings from one
+                    # unit unless 'both' was requested explicitly.
                     for signal_dict in tagged_sessions[s]:
                         segments = self._process_signal(signal_dict['signal'], signal_dict['fs'])
                         if len(segments) > 0:

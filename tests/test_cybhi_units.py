@@ -3,15 +3,17 @@ Pin how CYBHi selects recordings from its two simultaneous acquiring units.
 
 Every short-term acquisition was recorded at once by unit 8B, from the hand
 palms with Ag/AgCl electrodes, and unit 85, from the fingers with electrolycra.
-The electrolycra recordings mostly defeat beat detection, so the loader reads
-one unit at a time, Ag/AgCl by default. The long-term collection has a single
-unit and is unaffected.
+The loader reads one unit at a time so that a single identity never mixes two
+electrode configurations, with Ag/AgCl as the reference configuration; 85 and
+'both' stay available for electrode comparisons. The long-term collection has
+a single unit and is unaffected.
 
 The collection a recording belongs to is decided by the directory names on its
 path, never by substrings of the whole path, which would make the result
 depend on where the repository is cloned.
 """
 
+import datetime
 import shutil
 import sys
 import tempfile
@@ -159,6 +161,85 @@ class CYBHiPathIndependenceTests(unittest.TestCase):
         self.assertIn("long-term_S1", tags["AA"])
         self.assertIn("long-term_S2", tags["AA"])
         self.assertNotIn("short-term_A0", tags.get("AA", {}))
+
+
+class CYBHiCollectionSeparationTests(unittest.TestCase):
+    """
+    The two collections are separate cohorts: 65 short-term participants and
+    63 long-term participants. Ten subject codes appear in both while naming
+    different people, so a protocol spanning the collections would file two
+    people under one identity and must be refused before any data is read.
+    """
+
+    def test_cross_session_protocol_cannot_span_the_collections(self):
+        with self.assertRaises(ValueError) as context:
+            load_cybhi_dataset(
+                data_split_mode="cross-session",
+                train_sessions=["short-term_CI"],
+                enroll_sessions=["short-term_CI"],
+                probe_sessions=["long-term_S2"],
+            )
+
+        self.assertIn("collections", str(context.exception))
+
+    def test_single_session_pool_cannot_span_the_collections(self):
+        with self.assertRaises(ValueError) as context:
+            load_cybhi_dataset(
+                data_split_mode="single-session",
+                session_for_single_session_evaluation=[
+                    "short-term_CI",
+                    "long-term_S1",
+                ],
+            )
+
+        self.assertIn("collections", str(context.exception))
+
+    def test_protocols_inside_one_collection_are_unaffected(self):
+        load_cybhi_dataset(
+            data_split_mode="cross-session",
+            train_sessions=["short-term_CI"],
+            enroll_sessions=["short-term_CI"],
+            probe_sessions=["short-term_A1", "short-term_A2"],
+        )
+
+        load_cybhi_dataset(
+            data_split_mode="cross-session",
+            train_sessions=["long-term_S1"],
+            enroll_sessions=["long-term_S1"],
+            probe_sessions=["long-term_S2"],
+        )
+
+
+class CYBHiDateParsingTests(unittest.TestCase):
+    """A CYBHi acquisition date is genuine or the filename is refused.
+
+    The long-term collection orders its two visits by the parsed date, so an
+    unparseable date must never be filled in with a stand-in that would pose as
+    a real acquisition time."""
+
+    def _loader(self):
+        return load_cybhi_dataset(
+            data_split_mode="single-session",
+            session_for_single_session_evaluation=["short-term_CI"],
+        )
+
+    def test_a_valid_filename_parses_its_genuine_date(self):
+        rec_date, sid, code, unit = self._loader()._parse_file_info(
+            "20110715-MLS-CI-8B.txt"
+        )
+        self.assertEqual(rec_date, datetime.date(2011, 7, 15))
+        self.assertEqual((sid, code, unit), ("MLS", "CI", "8B"))
+
+    def test_an_unparseable_date_is_rejected(self):
+        with self.assertRaisesRegex(
+            ValueError, "no parseable acquisition date"
+        ):
+            self._loader()._parse_file_info("NOTADATE-MLS-CI-8B.txt")
+
+    def test_a_short_date_field_is_rejected_not_defaulted(self):
+        # A malformed date must raise, never return datetime.date.min.
+        with self.assertRaises(ValueError):
+            self._loader()._parse_file_info("2011-MLS-CI-8B.txt")
 
 
 if __name__ == "__main__":

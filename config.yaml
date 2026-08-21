@@ -201,9 +201,10 @@ datasets:
     fs: 1000
     # Short-term acquisitions were recorded simultaneously by two units:
     # "8B" from the hand palms with Ag/AgCl electrodes, "85" from the fingers
-    # with electrolycra. The electrolycra recordings mostly defeat beat
-    # detection, so the Ag/AgCl unit is the default; "both" pools the two for
-    # an electrode comparison. Overridden by the electrode_unit argument.
+    # with electrolycra. One unit is read at a time so that a single identity
+    # never mixes two electrode configurations; the Ag/AgCl unit is the
+    # reference configuration. "85" and "both" remain available for dedicated
+    # electrode comparisons. Overridden by the electrode_unit argument.
     electrode_unit: "8B"
     # Column holding the ECG in the seven-column short-term files; long-term
     # files have a single column and fall back to it.

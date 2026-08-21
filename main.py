@@ -420,6 +420,7 @@ def _normalize_minute_range_list(
 OPTIONAL_CHOICE_ARGUMENTS = frozenset(
     {
         "signal_type",
+        "electrode_unit",
     }
 )
 
@@ -1009,6 +1010,13 @@ def build_data_cache_config(args, loader, task_type):
             "signal_type",
             None,
         ),
+        # Read back for the same reason: the acquiring unit may have been left
+        # unset on the command line and resolved from config.yaml.
+        "electrode_unit": getattr(
+            loader,
+            "electrode_unit",
+            None,
+        ),
         "train_sessions": args.train_sessions,
         "enroll_sessions": args.enroll_sessions,
         "probe_sessions": args.probe_sessions,
@@ -1152,6 +1160,15 @@ def get_parser():
     data_group.add_argument('--signal_type', type=str, default=None, choices=['raw', 'filtered'],
                             help="For ECG-ID: which stored channel to read. Omit to use the "
                                  "dataset default in config.yaml, which is the raw channel.")
+    data_group.add_argument('--electrode_unit', type=str, default=None,
+                            choices=['8B', '85', 'both'],
+                            help="For the CYBHi short-term collection: which acquiring unit "
+                                 "to read. '8B' is the Ag/AgCl palm unit, '85' the electrolycra "
+                                 "finger unit, and 'both' pools them. Every short-term "
+                                 "acquisition was recorded by both units at once, so pooling "
+                                 "mixes two electrode configurations into one identity. The "
+                                 "long-term collection was acquired by a single unit and is "
+                                 "unaffected. Omit to use the dataset default in config.yaml.")
     data_group.add_argument(
         "--single_segment_range",
         type=float,
@@ -1481,6 +1498,11 @@ def main():
         loader_kwargs[
             "signal_type"
         ] = args.signal_type
+
+    if args.dataset == "cybhi":
+        loader_kwargs[
+            "electrode_unit"
+        ] = args.electrode_unit
 
     if args.dataset in {
         "mitbih",

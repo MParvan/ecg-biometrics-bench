@@ -8,6 +8,8 @@
 # Run with: python main.py --config "path/to/this_file.yaml"
 # ============================================================================
 dataset: cybhi
+# The long-term collection was acquired by a single unit (35), so there is
+# no electrode choice to make here.
 task: 8
 data_split_mode: cross-session
 num_beats_to_merge: 1

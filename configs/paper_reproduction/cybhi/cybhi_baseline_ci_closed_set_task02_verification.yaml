@@ -8,6 +8,9 @@
 # Run with: python main.py --config "path/to/this_file.yaml"
 # ============================================================================
 dataset: cybhi
+# Every short-term acquisition was recorded by two units at once, so one is
+# selected to keep the electrode configuration fixed within an identity.
+electrode_unit: "8B"
 task: 2
 data_split_mode: single-session
 num_beats_to_merge: 1

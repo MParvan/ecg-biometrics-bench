@@ -7,6 +7,8 @@
 # to the architecture alone.
 # =========================================================
 dataset: cybhi
+# The long-term collection was acquired by a single unit (35), so there is
+# no electrode choice to make here.
 task: 6
 data_split_mode: cross-session
 num_beats_to_merge: 1
