@@ -15,6 +15,24 @@ from utils import (
     _generate_pairs,
     _set_seed,
 )
+from load_dataset import _ProvenanceBuilder
+
+
+def _one_block_per_subject(labels):
+    """Provenance placing each subject's probes in a single source segment."""
+    builder = _ProvenanceBuilder()
+    for subject in sorted(set(np.asarray(labels).tolist())):
+        count = int(np.sum(np.asarray(labels) == subject))
+        builder.add_block(
+            count,
+            record_id=f"r{subject}",
+            session_id=f"r{subject}",
+            acquisition_time=None,
+            acquisition_order=0,
+            source_segment_id=f"r{subject}#0",
+            source_segment_order=0.0,
+        )
+    return builder.build()
 
 
 TEMPLATE_METHODS = [
@@ -577,6 +595,7 @@ class ProbeFusionTests(unittest.TestCase):
                 scores,
                 labels,
                 fusion_size=2,
+                provenance=_one_block_per_subject(labels),
             )
         )
 
@@ -595,9 +614,11 @@ class ProbeFusionTests(unittest.TestCase):
             np.asarray([0, 1]),
         )
 
-    def test_subject_with_fewer_probes_is_still_retained(
+    def test_subject_with_fewer_probes_produces_no_decision(
         self,
     ):
+        # Fixed-depth fusion: a source block holding fewer than fusion_size
+        # probes yields no fused decision; those observations are dropped.
         scores = np.asarray(
             [
                 [0.9, 0.1],
@@ -611,28 +632,27 @@ class ProbeFusionTests(unittest.TestCase):
             [0, 0, 1]
         )
 
-        fused_scores, fused_labels = (
+        fused_scores, fused_labels, diagnostics = (
             _apply_score_fusion(
                 scores,
                 labels,
                 fusion_size=2,
+                provenance=_one_block_per_subject(labels),
+                return_diagnostics=True,
             )
         )
 
-        self.assertEqual(
-            fused_scores.shape,
-            (2, 2),
-        )
-
+        # Only subject 0 (two probes) produces a decision; subject 1 is dropped.
         np.testing.assert_array_equal(
             fused_labels,
-            np.asarray([0, 1]),
+            np.asarray([0]),
         )
-
         np.testing.assert_allclose(
-            fused_scores[1],
-            scores[2],
+            fused_scores[0],
+            np.asarray([0.85, 0.15]),
         )
+        self.assertEqual(diagnostics["identities_without_a_fused_decision"], 1)
+        self.assertEqual(diagnostics["dropped_remainder_observations"], 1)
 
 
 if __name__ == "__main__":

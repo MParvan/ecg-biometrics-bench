@@ -1719,8 +1719,8 @@ def main():
                 "cybhi",
                 "heartprint",
             ]:
-                x, y = loader.load_session(
-                    "train"
+                x, y, provenance = loader.load_session(
+                    "train", return_provenance=True
                 )
             else:
                 if args.data_split_mode in [
@@ -1728,10 +1728,12 @@ def main():
                     "single-session",
                     "single-segment",
                 ]:
-                    x, y = loader.load_all_data()
+                    x, y, provenance = loader.load_all_data(
+                        return_provenance=True
+                    )
                 else:
-                    x, y = loader.load_session(
-                        "train"
+                    x, y, provenance = loader.load_session(
+                        "train", return_provenance=True
                     )
 
             print(f"\n[INFO] Data Loaded: X={x.shape}, Y={y.shape}")
@@ -1741,8 +1743,12 @@ def main():
                 
         # Tasks 5 to 8: Cross-Session (Requires S1 and S2 arrays)
         elif args.task in [5, 6, 7, 8]:
-            x_s1, y_s1 = loader.load_session("train")
-            x_s2, y_s2 = loader.load_session("test")
+            x_s1, y_s1, provenance_s1 = loader.load_session(
+                "train", return_provenance=True
+            )
+            x_s2, y_s2, provenance_s2 = loader.load_session(
+                "test", return_provenance=True
+            )
             
             print(f"\n[INFO] Session 1 (Enroll) Loaded: X={x_s1.shape}, Y={y_s1.shape}")
             print(f"[INFO] Session 2 (Probe) Loaded:  X={x_s2.shape}, Y={y_s2.shape}")
@@ -1804,6 +1810,7 @@ def main():
                 test_split=args.test_split, 
                 probe_fusion_size=args.probe_fusion_size,
                 sqi_scores=args.sqi_method,
+                provenance=provenance,
                 **common_args
             )
 
@@ -1827,6 +1834,7 @@ def main():
                 test_split=args.test_split,
                 probe_fusion_size=args.probe_fusion_size,
                 sqi_scores=args.sqi_method,
+                provenance=provenance,
                 **common_args
             )
 
@@ -1850,6 +1858,8 @@ def main():
                 probe_fusion_size=args.probe_fusion_size,
                 sqi_train=args.sqi_method,
                 sqi_test=args.sqi_method,
+                provenance_s1=provenance_s1,
+                provenance_s2=provenance_s2,
                 **common_args
             )
 
@@ -1874,6 +1884,8 @@ def main():
                 probe_fusion_size=args.probe_fusion_size,
                 sqi_s1=args.sqi_method,
                 sqi_s2=args.sqi_method,
+                provenance_s1=provenance_s1,
+                provenance_s2=provenance_s2,
                 **common_args
             )
 

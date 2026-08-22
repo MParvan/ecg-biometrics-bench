@@ -80,32 +80,52 @@ class SyntheticLoader:
         )
 
         self.load_all_data = Mock(
-            return_value=(
-                self.intra_x,
-                self.intra_y,
-            )
+            side_effect=self._load_all_data
         )
 
         self.load_session = Mock(
             side_effect=self._load_session
         )
 
-    def _load_session(self, session_name):
+    def _synthetic_provenance(self, labels):
+        from load_dataset import _ProvenanceBuilder
+
+        builder = _ProvenanceBuilder()
+        for subject in sorted(set(labels.tolist())):
+            count = int(np.sum(labels == subject))
+            builder.add_block(
+                count,
+                record_id=f"{subject}_r",
+                session_id=f"{subject}_r",
+                acquisition_time=None,
+                acquisition_order=0,
+                source_segment_id=f"{subject}_r#0",
+                source_segment_order=0.0,
+            )
+        return builder.build()
+
+    def _load_all_data(self, return_provenance=False):
+        if return_provenance:
+            if not hasattr(self, "intra_provenance"):
+                self.intra_provenance = self._synthetic_provenance(self.intra_y)
+            return self.intra_x, self.intra_y, self.intra_provenance
+        return self.intra_x, self.intra_y
+
+    def _load_session(self, session_name, return_provenance=False):
         if session_name == "train":
-            return (
-                self.session_1_x,
-                self.session_1_y,
+            x, y, attribute = self.session_1_x, self.session_1_y, "s1_provenance"
+        elif session_name == "test":
+            x, y, attribute = self.session_2_x, self.session_2_y, "s2_provenance"
+        else:
+            raise ValueError(
+                f"Unexpected synthetic session: {session_name}"
             )
 
-        if session_name == "test":
-            return (
-                self.session_2_x,
-                self.session_2_y,
-            )
-
-        raise ValueError(
-            f"Unexpected synthetic session: {session_name}"
-        )
+        if return_provenance:
+            if not hasattr(self, attribute):
+                setattr(self, attribute, self._synthetic_provenance(y))
+            return x, y, getattr(self, attribute)
+        return x, y
 
 
 def build_cli_arguments(task):
@@ -525,7 +545,9 @@ class MainCLIRoutingTests(unittest.TestCase):
                 )
 
                 if task in INTRA_SESSION_TASKS:
-                    loader.load_all_data.assert_called_once_with()
+                    loader.load_all_data.assert_called_once_with(
+                        return_provenance=True
+                    )
                     loader.load_session.assert_not_called()
 
                     self.assertEqual(
@@ -547,10 +569,12 @@ class MainCLIRoutingTests(unittest.TestCase):
                         loader.load_session.call_args_list,
                         [
                             call(
-                                "train"
+                                "train",
+                                return_provenance=True,
                             ),
                             call(
-                                "test"
+                                "test",
+                                return_provenance=True,
                             ),
                         ],
                     )
@@ -575,6 +599,28 @@ class MainCLIRoutingTests(unittest.TestCase):
                         positional_arguments[3],
                         loader.session_2_y,
                     )
+
+                # Identification runners receive the exact provenance objects the
+                # loader returned; verification runners receive none.
+                if task in (1, 3):
+                    self.assertIs(
+                        keyword_arguments["provenance"],
+                        loader.intra_provenance,
+                    )
+                elif task in (5, 7):
+                    self.assertIs(
+                        keyword_arguments["provenance_s1"],
+                        loader.s1_provenance,
+                    )
+                    self.assertIs(
+                        keyword_arguments["provenance_s2"],
+                        loader.s2_provenance,
+                    )
+                elif task in (2, 4):
+                    self.assertNotIn("provenance", keyword_arguments)
+                else:
+                    self.assertNotIn("provenance_s1", keyword_arguments)
+                    self.assertNotIn("provenance_s2", keyword_arguments)
 
                 self.assert_common_arguments(
                     keyword_arguments,

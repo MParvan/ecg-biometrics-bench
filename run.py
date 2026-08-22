@@ -47,7 +47,7 @@ from scipy.interpolate import interp1d
 from scipy import stats
 
 from utils import (
-    _apply_score_fusion, _make_loader, _encode_labels, _get_device, _set_seed,
+    _apply_score_fusion, _source_order_indices, _make_loader, _encode_labels, _get_device, _set_seed,
     _apply_outlier_filter, _compute_sqi, _compute_score_matrix,
     _get_embeddings, _create_templates, _generate_pairs,
     _find_optimal_threshold, _evaluate_with_global_threshold, _summarize_verification_pairs,
@@ -2585,6 +2585,10 @@ def _partition_closed_set_cross_session_samples(
             filtered_x_session_2,
             filtered_y_session_2,
         ),
+        "indices": {
+            "session_1": np.flatnonzero(session_1_mask),
+            "session_2": np.flatnonzero(session_2_mask),
+        },
         "subjects": eligible_subjects,
         "dropped_subjects": {
             "session_1_only": np.setdiff1d(
@@ -2745,10 +2749,22 @@ def _partition_subject_disjoint_samples(
         test_subjects
     )
 
+    def subject_indices(subjects):
+        return np.flatnonzero(np.isin(y, subjects))
+
     return {
         "train": train_partition,
         "validation": validation_partition,
         "test": test_partition,
+        "indices": {
+            "train": subject_indices(train_subjects),
+            "validation": (
+                subject_indices(validation_subjects)
+                if len(validation_subjects) > 0
+                else np.empty((0,), dtype=int)
+            ),
+            "test": subject_indices(test_subjects),
+        },
     }
 
 
@@ -2914,6 +2930,16 @@ def _partition_subject_disjoint_cross_session_samples(
         "validation": validation_partition,
         "enrollment": enrollment_partition,
         "probe": probe_partition,
+        "indices": {
+            "train": np.flatnonzero(train_mask_s1),
+            "validation": (
+                np.flatnonzero(validation_mask_s1)
+                if len(validation_subjects) > 0
+                else np.empty((0,), dtype=int)
+            ),
+            "enrollment": np.flatnonzero(enrollment_mask_s1),
+            "probe": np.flatnonzero(probe_mask_s2),
+        },
     }
 
 def _split_enrollment_probe_embeddings(
@@ -2921,13 +2947,18 @@ def _split_enrollment_probe_embeddings(
     labels,
     subjects,
     template_size,
+    provenance=None,
 ):
     """
-    Split each subject's ordered embeddings into enrollment and probe sets.
+    Split each subject's embeddings into an enrollment gallery and a probe set.
 
-    The first ``template_size`` embeddings of every subject are assigned to
-    enrollment. All remaining embeddings from that subject are assigned to
-    the probe set. Input order is preserved within every subject.
+    Without ``provenance`` the first ``template_size`` embeddings of each
+    subject, in input order, enrol and the rest probe (backward-compatible
+    behavior). With ``provenance`` the enrollment *membership* is the genuinely
+    first ``template_size`` beats in source order; the remaining beats probe in
+    their original input order. The returned ``indices["enrollment"]`` and
+    ``indices["probe"]`` align exactly with the returned embedding/label
+    arrays, so a caller can subset a parallel array such as provenance.
     """
     embeddings = np.asarray(
         embeddings
@@ -3012,11 +3043,17 @@ def _split_enrollment_probe_embeddings(
             "present in labels."
         )
 
+    if provenance is not None:
+        provenance.validate(len(labels))
+
     enrollment_embeddings = []
     enrollment_labels = []
 
     probe_embeddings = []
     probe_labels = []
+
+    enrollment_index_blocks = []
+    probe_index_blocks = []
 
     for subject in subjects:
         subject_indices = np.flatnonzero(
@@ -3031,13 +3068,23 @@ def _split_enrollment_probe_embeddings(
                 "at least one additional probe sample."
             )
 
-        enrollment_indices = subject_indices[
-            :template_size
-        ]
-
-        probe_indices = subject_indices[
-            template_size:
-        ]
+        if provenance is None:
+            # Backward-compatible input-order behavior: the first template_size
+            # embeddings of the subject enrol.
+            enrollment_indices = subject_indices[:template_size]
+            probe_indices = subject_indices[template_size:]
+        else:
+            # Enrol the genuinely first template_size beats in source order;
+            # remaining beats stay probes in their original input order.
+            source_order = _source_order_indices(
+                provenance.subset(subject_indices)
+            )
+            enrollment_indices = subject_indices[source_order][:template_size]
+            enrolled = set(enrollment_indices.tolist())
+            probe_indices = np.asarray(
+                [index for index in subject_indices if index not in enrolled],
+                dtype=int,
+            )
 
         enrollment_embeddings.append(
             embeddings[
@@ -3063,6 +3110,9 @@ def _split_enrollment_probe_embeddings(
             ]
         )
 
+        enrollment_index_blocks.append(enrollment_indices)
+        probe_index_blocks.append(probe_indices)
+
     return {
         "enrollment": (
             np.vstack(
@@ -3080,6 +3130,10 @@ def _split_enrollment_probe_embeddings(
                 probe_labels
             ),
         ),
+        "indices": {
+            "enrollment": np.concatenate(enrollment_index_blocks),
+            "probe": np.concatenate(probe_index_blocks),
+        },
     }
 
 
@@ -4153,7 +4207,7 @@ def run_closed_set_identification(x, y, model_class, epochs=150, batch_size=256,
                                   save_results_and_settings=False, loader=None, 
                                   n_runs=1, _return_stats=False,
                                   intelligent_weight_loading=True,
-                                  augmentation_config=None, split_seed=None):
+                                  augmentation_config=None, split_seed=None, provenance=None):
     """
     Standard Closed-Set Identification Pipeline (Intra-session).
     Determines "Who is this person?" from a known pool of subjects seen during training.
@@ -4186,7 +4240,11 @@ def run_closed_set_identification(x, y, model_class, epochs=150, batch_size=256,
         sqi_scores (str or np.ndarray): SQI calculation method (e.g., 'kurtosis') or pre-computed array.
         sqi_threshold (float): Absolute minimum SQI score required to keep a beat (0.0 to 1.0).
         sqi_keep_pct (float): Top percentage of beats to keep per subject after filtering.
-        probe_fusion_size (int): Number of consecutive probe beats to average before making a decision.
+        probe_fusion_size (int): Probe fusion depth. With 1, each probe beat
+            yields one decision. With k>1, complete non-overlapping groups of k
+            probe beats within one source block (subject, session, record,
+            segment), ordered by source provenance, are averaged into one
+            decision; an incomplete final group is dropped.
         save_results_and_settings (bool): If True, logs results and parameters to a text file.
         loader (object): Dataset loader instance (used for extracting metadata for logging).
         n_runs (int): Number of repeated runs using consecutive training seeds. The data-role split schedule follows the split_seed policy (it follows the training seeds when split_seed is None, and stays fixed when an explicit split_seed is given).
@@ -4355,6 +4413,8 @@ def run_closed_set_identification(x, y, model_class, epochs=150, batch_size=256,
     x, y = x[valid_mask], y[valid_mask]
     if sqi_scores is not None: 
         sqi_scores = sqi_scores[valid_mask]
+    if provenance is not None:
+        provenance = provenance.subset(valid_mask)
 
     # ====================================================
     # 3. SPLIT DATA & SQI SCORES
@@ -4385,20 +4445,42 @@ def run_closed_set_identification(x, y, model_class, epochs=150, batch_size=256,
         "holdout"
     ]
 
+    provenance_train = None
+    provenance_test = None
+    if provenance is not None:
+        provenance_train = provenance.subset(
+            train_test_partitions["indices"]["retained"]
+        )
+        provenance_test = provenance.subset(
+            train_test_partitions["indices"]["holdout"]
+        )
+
     # ====================================================
     # 4. APPLY FILTERS INDEPENDENTLY
     # ====================================================
     if outlier_filtering_on_train and sqi_train is not None:
         print("\n[INFO] Filtering Train Set (Enrollment)...")
-        X_train, y_train = _apply_outlier_filter(
-            X_train, y_train, sqi_train, absolute_threshold=sqi_threshold, keep_percentage=sqi_keep_pct
-        )
+        if provenance_train is not None:
+            X_train, y_train, retained_indices = _apply_outlier_filter(
+                X_train, y_train, sqi_train, absolute_threshold=sqi_threshold, keep_percentage=sqi_keep_pct, return_indices=True
+            )
+            provenance_train = provenance_train.subset(retained_indices)
+        else:
+            X_train, y_train = _apply_outlier_filter(
+                X_train, y_train, sqi_train, absolute_threshold=sqi_threshold, keep_percentage=sqi_keep_pct
+            )
 
     if outlier_filtering_on_test and sqi_test is not None:
         print("\n[INFO] Filtering Test Set (Probes)...")
-        X_test, y_test = _apply_outlier_filter(
-            X_test, y_test, sqi_test, absolute_threshold=sqi_threshold, keep_percentage=sqi_keep_pct, apply_subject_ranking=False
-        )
+        if provenance_test is not None:
+            X_test, y_test, retained_indices = _apply_outlier_filter(
+                X_test, y_test, sqi_test, absolute_threshold=sqi_threshold, keep_percentage=sqi_keep_pct, apply_subject_ranking=False, return_indices=True
+            )
+            provenance_test = provenance_test.subset(retained_indices)
+        else:
+            X_test, y_test = _apply_outlier_filter(
+                X_test, y_test, sqi_test, absolute_threshold=sqi_threshold, keep_percentage=sqi_keep_pct, apply_subject_ranking=False
+            )
 
     # ====================================================
     # 5. CLASS SYNCHRONIZATION & ENCODING
@@ -4420,6 +4502,8 @@ def run_closed_set_identification(x, y, model_class, epochs=150, batch_size=256,
         print(f"[WARN] Dropping {orphaned_test_beats} Test beats because their corresponding Train subjects were filtered out.")
 
     X_test, y_test = X_test[test_mask], y_test[test_mask]
+    if provenance_test is not None:
+        provenance_test = provenance_test.subset(test_mask)
 
     if len(valid_train_classes) < 2:
         raise ValueError("[ERROR] Data filtering was too aggressive. Not enough subjects left to continue!")
@@ -4590,7 +4674,7 @@ def run_closed_set_identification(x, y, model_class, epochs=150, batch_size=256,
         
         # Create Templates
         templates, temp_labels = _create_templates(
-            train_emb, train_lab, method=template_fusion_method, max_beats=template_size
+            train_emb, train_lab, method=template_fusion_method, max_beats=template_size, provenance=provenance_train
         )
         
         # Extract Embeddings from TEST set (Probe)
@@ -4615,9 +4699,20 @@ def run_closed_set_identification(x, y, model_class, epochs=150, batch_size=256,
     # ====================================================
     # 5. APPLY SCORE-LEVEL FUSION (If requested)
     # ====================================================
-    final_scores, final_labels = _apply_score_fusion(
-        final_scores, final_labels, fusion_size=probe_fusion_size
+    final_scores, final_labels, fusion_diagnostics = _apply_score_fusion(
+        final_scores,
+        final_labels,
+        fusion_size=probe_fusion_size,
+        provenance=provenance_test,
+        return_diagnostics=True,
     )
+    if probe_fusion_size > 1 and len(final_labels) == 0:
+        raise ValueError(
+            "Probe fusion produced no complete fused decisions for any "
+            "identity: with the configured probe fusion size no source "
+            "segment holds enough probe beats to form a group. Reduce the "
+            "probe fusion size or provide more probe data."
+        )
 
     if visualize:
         viz = Visualizer()
@@ -4645,6 +4740,7 @@ def run_closed_set_identification(x, y, model_class, epochs=150, batch_size=256,
         "Train Samples": len(X_tr),
         "Validation Samples": len(X_val) if X_val is not None else 0,
         "Test (Probe) Samples": len(X_test),
+        "Probe Fusion": fusion_diagnostics,
     }
 
     if _return_stats:
@@ -5220,7 +5316,7 @@ def run_subject_disjoint_identification(x, y, model_class, epochs=150, batch_siz
                                         save_results_and_settings=False, loader=None, 
                                         n_runs=1, _return_stats=False,
                                         intelligent_weight_loading=True,
-                                        augmentation_config=None, split_seed=None):
+                                        augmentation_config=None, split_seed=None, provenance=None):
     """
     Subject-Disjoint Identification Pipeline.
     Evaluates identification performance on subjects entirely UNSEEN during the training phase.
@@ -5251,7 +5347,11 @@ def run_subject_disjoint_identification(x, y, model_class, epochs=150, batch_siz
         sqi_scores (str or np.ndarray): SQI calculation method (e.g., 'kurtosis') or pre-computed array.
         sqi_threshold (float): Absolute minimum SQI score required to keep a beat (0.0 to 1.0).
         sqi_keep_pct (float): Top percentage of beats to keep per subject after filtering.
-        probe_fusion_size (int): Number of consecutive probe beats to average before searching the gallery.
+        probe_fusion_size (int): Probe fusion depth. With 1, each probe beat
+            yields one decision. With k>1, complete non-overlapping groups of k
+            probe beats within one source block (subject, session, record,
+            segment), ordered by source provenance, are averaged into one
+            decision; an incomplete final group is dropped.
         save_results_and_settings (bool): If True, logs results and parameters to a text file.
         loader (object): Dataset loader instance (used for extracting metadata for logging).
         n_runs (int): Number of repeated runs using consecutive training seeds. The data-role split schedule follows the split_seed policy (it follows the training seeds when split_seed is None, and stays fixed when an explicit split_seed is given).
@@ -5422,6 +5522,8 @@ def run_subject_disjoint_identification(x, y, model_class, epochs=150, batch_siz
     x, y = x[valid_mask], y[valid_mask]
     if sqi_scores is not None: 
         sqi_scores = sqi_scores[valid_mask]
+    if provenance is not None:
+        provenance = provenance.subset(valid_mask)
 
     # ====================================================
     # 3. SPLIT SUBJECTS (Strictly Disjoint)
@@ -5474,6 +5576,10 @@ def run_subject_disjoint_identification(x, y, model_class, epochs=150, batch_siz
         sqi_test,
     ) = partitions["test"]
 
+    provenance_test = None
+    if provenance is not None:
+        provenance_test = provenance.subset(partitions["indices"]["test"])
+
     print(
         "Subject Split: "
         f"Train={len(train_subs)}, "
@@ -5491,14 +5597,22 @@ def run_subject_disjoint_identification(x, y, model_class, epochs=150, batch_siz
 
     if outlier_filtering_on_test and sqi_scores is not None:
         print("\n[INFO] Filtering Test Set (Gallery & Probes)...")
-        X_test, y_test = _apply_outlier_filter(
-            X_test,
-            y_test,
-            sqi_test,
-            absolute_threshold=sqi_threshold,
-            keep_percentage=sqi_keep_pct,
-            apply_subject_ranking=False,
-        )
+        if provenance_test is not None:
+            X_test, y_test, retained_indices = _apply_outlier_filter(
+                X_test, y_test, sqi_test, absolute_threshold=sqi_threshold,
+                keep_percentage=sqi_keep_pct, apply_subject_ranking=False,
+                return_indices=True,
+            )
+            provenance_test = provenance_test.subset(retained_indices)
+        else:
+            X_test, y_test = _apply_outlier_filter(
+                X_test,
+                y_test,
+                sqi_test,
+                absolute_threshold=sqi_threshold,
+                keep_percentage=sqi_keep_pct,
+                apply_subject_ranking=False,
+            )
 
     # ====================================================
     # 5. POST-FILTER SYNCHRONIZATION
@@ -5513,6 +5627,8 @@ def run_subject_disjoint_identification(x, y, model_class, epochs=150, batch_siz
         
     test_survivor_mask = np.isin(y_test, valid_test_subs)
     X_test, y_test = X_test[test_survivor_mask], y_test[test_survivor_mask]
+    if provenance_test is not None:
+        provenance_test = provenance_test.subset(test_survivor_mask)
     test_subs_final = valid_test_subs
     
     if len(test_subs_final) < 2:
@@ -5664,6 +5780,7 @@ def run_subject_disjoint_identification(x, y, model_class, epochs=150, batch_siz
             test_lab,
             subjects=test_subs_final,
             template_size=template_size,
+            provenance=provenance_test,
         )
     )
 
@@ -5680,6 +5797,12 @@ def run_subject_disjoint_identification(x, y, model_class, epochs=150, batch_siz
     ) = enrollment_probe_partitions[
         "probe"
     ]
+
+    provenance_probe = None
+    if provenance_test is not None:
+        provenance_probe = provenance_test.subset(
+            enrollment_probe_partitions["indices"]["probe"]
+        )
     
     # 8. Apply Template Fusion Strategy to the Gallery
     gallery_emb, gallery_lab = _create_templates(
@@ -5700,9 +5823,20 @@ def run_subject_disjoint_identification(x, y, model_class, epochs=150, batch_siz
     # ====================================================
     # 10. APPLY SCORE-LEVEL FUSION
     # ====================================================
-    final_scores, final_labels = _apply_score_fusion(
-        scores, probe_mapped, fusion_size=probe_fusion_size
+    final_scores, final_labels, fusion_diagnostics = _apply_score_fusion(
+        scores,
+        probe_mapped,
+        fusion_size=probe_fusion_size,
+        provenance=provenance_probe,
+        return_diagnostics=True,
     )
+    if probe_fusion_size > 1 and len(final_labels) == 0:
+        raise ValueError(
+            "Probe fusion produced no complete fused decisions for any "
+            "identity: with the configured probe fusion size no source "
+            "segment holds enough probe beats to form a group. Reduce the "
+            "probe fusion size or provide more probe data."
+        )
 
     if visualize:
         # Visualizing original un-fused test embeddings
@@ -5738,6 +5872,7 @@ def run_subject_disjoint_identification(x, y, model_class, epochs=150, batch_siz
         "Test Subjects": len(test_subs_final),
         "Gallery Size": len(gallery_emb),
         "Probe Samples": len(emb_probe),
+        "Probe Fusion": fusion_diagnostics,
     }
 
     if _return_stats:
@@ -6362,7 +6497,7 @@ def run_cross_session_identification(x_train, y_train, x_test, y_test, model_cla
                                      sqi_keep_pct=0.8, probe_fusion_size=3, save_results_and_settings=False, 
                                      loader=None, n_runs=1, _return_stats=False,
                                      intelligent_weight_loading=True,
-                                     augmentation_config=None, split_seed=None):
+                                     augmentation_config=None, split_seed=None, provenance_s1=None, provenance_s2=None):
     """
     Cross-Session Identification Pipeline (Temporal Robustness).
     Evaluates system robustness against physiological aging and sensor variations over time.
@@ -6397,7 +6532,11 @@ def run_cross_session_identification(x_train, y_train, x_test, y_test, model_cla
         sqi_test (str or np.ndarray): SQI calculation method or pre-computed array for Session 2.
         sqi_threshold (float): Absolute minimum SQI score required to keep a beat (0.0 to 1.0).
         sqi_keep_pct (float): Top percentage of beats to keep per subject after filtering.
-        probe_fusion_size (int): Number of consecutive Session 2 beats to average before making a decision.
+        probe_fusion_size (int): Probe fusion depth. With 1, each probe beat
+            yields one decision. With k>1, complete non-overlapping groups of k
+            probe beats within one source block (subject, session, record,
+            segment), ordered by source provenance, are averaged into one
+            decision; an incomplete final group is dropped.
         save_results_and_settings (bool): If True, logs results and parameters to a text file.
         loader (object): Dataset loader instance (used for extracting metadata for logging).
         n_runs (int): Number of repeated runs using consecutive training seeds. The data-role split schedule follows the split_seed policy (it follows the training seeds when split_seed is None, and stays fixed when an explicit split_seed is given).
@@ -6540,18 +6679,32 @@ def run_cross_session_identification(x_train, y_train, x_test, y_test, model_cla
     # ====================================================
     if sqi_train is not None:
         print("\n[INFO] Filtering Session 1 (Enrollment)...")
-        x_train, y_train = _apply_outlier_filter(x_train, y_train, sqi_train, sqi_threshold, sqi_keep_pct)
+        if provenance_s1 is not None:
+            x_train, y_train, retained_indices = _apply_outlier_filter(
+                x_train, y_train, sqi_train, sqi_threshold, sqi_keep_pct, return_indices=True
+            )
+            provenance_s1 = provenance_s1.subset(retained_indices)
+        else:
+            x_train, y_train = _apply_outlier_filter(x_train, y_train, sqi_train, sqi_threshold, sqi_keep_pct)
 
     if sqi_test is not None:
         print("\n[INFO] Filtering Session 2 (Probes)...")
-        x_test, y_test = _apply_outlier_filter(
-            x_test,
-            y_test,
-            sqi_test,
-            absolute_threshold=sqi_threshold,
-            keep_percentage=sqi_keep_pct,
-            apply_subject_ranking=False,
-        )
+        if provenance_s2 is not None:
+            x_test, y_test, retained_indices = _apply_outlier_filter(
+                x_test, y_test, sqi_test, absolute_threshold=sqi_threshold,
+                keep_percentage=sqi_keep_pct, apply_subject_ranking=False,
+                return_indices=True,
+            )
+            provenance_s2 = provenance_s2.subset(retained_indices)
+        else:
+            x_test, y_test = _apply_outlier_filter(
+                x_test,
+                y_test,
+                sqi_test,
+                absolute_threshold=sqi_threshold,
+                keep_percentage=sqi_keep_pct,
+                apply_subject_ranking=False,
+            )
 
     # ====================================================
     # 3. SYNCHRONISE KNOWN SUBJECTS ACROSS SESSIONS
@@ -6580,6 +6733,17 @@ def run_cross_session_identification(x_train, y_train, x_test, y_test, model_cla
     ) = cross_session_partitions[
         "session_2"
     ]
+
+    provenance_enroll = None
+    provenance_probe = None
+    if provenance_s1 is not None:
+        provenance_enroll = provenance_s1.subset(
+            cross_session_partitions["indices"]["session_1"]
+        )
+    if provenance_s2 is not None:
+        provenance_probe = provenance_s2.subset(
+            cross_session_partitions["indices"]["session_2"]
+        )
 
     dropped_subjects = (
         cross_session_partitions[
@@ -6730,7 +6894,7 @@ def run_cross_session_identification(x_train, y_train, x_test, y_test, model_cla
         emb_enroll, lab_enroll = _get_embeddings(model, enroll_loader, device)
         
         gallery_emb, gallery_lab = _create_templates(
-            emb_enroll, lab_enroll, method=template_fusion_method, max_beats=template_size
+            emb_enroll, lab_enroll, method=template_fusion_method, max_beats=template_size, provenance=provenance_enroll
         )
         
         emb_probe, lab_probe = _get_embeddings(model, probe_loader, device)
@@ -6754,9 +6918,20 @@ def run_cross_session_identification(x_train, y_train, x_test, y_test, model_cla
     # ====================================================
     # 7. APPLY SCORE-LEVEL FUSION
     # ====================================================
-    final_scores, final_labels = _apply_score_fusion(
-        final_scores, final_labels, fusion_size=probe_fusion_size
+    final_scores, final_labels, fusion_diagnostics = _apply_score_fusion(
+        final_scores,
+        final_labels,
+        fusion_size=probe_fusion_size,
+        provenance=provenance_probe,
+        return_diagnostics=True,
     )
+    if probe_fusion_size > 1 and len(final_labels) == 0:
+        raise ValueError(
+            "Probe fusion produced no complete fused decisions for any "
+            "identity: with the configured probe fusion size no source "
+            "segment holds enough probe beats to form a group. Reduce the "
+            "probe fusion size or provide more probe data."
+        )
 
     if visualize and use_template:
         viz = Visualizer()
@@ -6782,6 +6957,7 @@ def run_cross_session_identification(x_train, y_train, x_test, y_test, model_cla
         "Total Cross-Session Subjects": len(classes),
         "Enrollment (S1) Samples": len(x_train_full),
         "Probe (S2) Samples": len(x_test_filtered),
+        "Probe Fusion": fusion_diagnostics,
     }
 
     if _return_stats:
@@ -7332,7 +7508,7 @@ def run_subject_disjoint_cross_session_identification(
         sqi_s2=None, sqi_threshold=0.05, sqi_keep_pct=0.8, probe_fusion_size=3, save_results_and_settings=False, 
         loader=None, n_runs=1, _return_stats=False,
         intelligent_weight_loading=True,
-        augmentation_config=None, split_seed=None):
+        augmentation_config=None, split_seed=None, provenance_s1=None, provenance_s2=None):
     """
     The Ultimate Biometric Test: Subject-Disjoint + Temporal Robustness Identification.
     1. Trains a feature extractor on Session 1 of Subject Group A.
@@ -7367,7 +7543,11 @@ def run_subject_disjoint_cross_session_identification(
         sqi_s2 (str or np.ndarray): SQI calculation method or pre-computed array for Session 2.
         sqi_threshold (float): Absolute minimum SQI score required to keep a beat (0.0 to 1.0).
         sqi_keep_pct (float): Top percentage of beats to keep per subject after filtering.
-        probe_fusion_size (int): Number of consecutive Session 2 beats to average before searching the gallery.
+        probe_fusion_size (int): Probe fusion depth. With 1, each probe beat
+            yields one decision. With k>1, complete non-overlapping groups of k
+            probe beats within one source block (subject, session, record,
+            segment), ordered by source provenance, are averaged into one
+            decision; an incomplete final group is dropped.
         save_results_and_settings (bool): If True, logs results and parameters to a text file.
         loader (object): Dataset loader instance (used for extracting metadata for logging).
         n_runs (int): Number of repeated runs using consecutive training seeds. The data-role split schedule follows the split_seed policy (it follows the training seeds when split_seed is None, and stays fixed when an explicit split_seed is given).
@@ -7504,18 +7684,32 @@ def run_subject_disjoint_cross_session_identification(
 
     if sqi_s1 is not None:
         print("\n[INFO] Filtering Session 1 (Representation & Enrollment)...")
-        x_s1, y_s1 = _apply_outlier_filter(x_s1, y_s1, sqi_s1, sqi_threshold, sqi_keep_pct)
+        if provenance_s1 is not None:
+            x_s1, y_s1, retained_indices = _apply_outlier_filter(
+                x_s1, y_s1, sqi_s1, sqi_threshold, sqi_keep_pct, return_indices=True
+            )
+            provenance_s1 = provenance_s1.subset(retained_indices)
+        else:
+            x_s1, y_s1 = _apply_outlier_filter(x_s1, y_s1, sqi_s1, sqi_threshold, sqi_keep_pct)
 
     if sqi_s2 is not None:
         print("\n[INFO] Filtering Session 2 (Probes)...")
-        x_s2, y_s2 = _apply_outlier_filter(
-            x_s2,
-            y_s2,
-            sqi_s2,
-            absolute_threshold=sqi_threshold,
-            keep_percentage=sqi_keep_pct,
-            apply_subject_ranking=False,
-        )
+        if provenance_s2 is not None:
+            x_s2, y_s2, retained_indices = _apply_outlier_filter(
+                x_s2, y_s2, sqi_s2, absolute_threshold=sqi_threshold,
+                keep_percentage=sqi_keep_pct, apply_subject_ranking=False,
+                return_indices=True,
+            )
+            provenance_s2 = provenance_s2.subset(retained_indices)
+        else:
+            x_s2, y_s2 = _apply_outlier_filter(
+                x_s2,
+                y_s2,
+                sqi_s2,
+                absolute_threshold=sqi_threshold,
+                keep_percentage=sqi_keep_pct,
+                apply_subject_ranking=False,
+            )
 
     # ====================================================
     # 2. INTERSECT AND SPLIT SUBJECTS (STRICTLY DISJOINT)
@@ -7576,6 +7770,17 @@ def run_subject_disjoint_cross_session_identification(
         X_probe,
         Y_probe,
     ) = partitions["probe"]
+
+    provenance_enroll = None
+    provenance_probe = None
+    if provenance_s1 is not None:
+        provenance_enroll = provenance_s1.subset(
+            partitions["indices"]["enrollment"]
+        )
+    if provenance_s2 is not None:
+        provenance_probe = provenance_s2.subset(
+            partitions["indices"]["probe"]
+        )
 
     # ====================================================
     # 3. ENCODE LABELS (CRITICAL FIX FOR PYTORCH TENSORS)
@@ -7727,7 +7932,7 @@ def run_subject_disjoint_cross_session_identification(
     emb_enroll, lab_enroll = _get_embeddings(model, enroll_loader, device)
     
     gallery_emb, gallery_lab = _create_templates(
-        emb_enroll, lab_enroll, method=template_fusion_method, max_beats=template_size
+        emb_enroll, lab_enroll, method=template_fusion_method, max_beats=template_size, provenance=provenance_enroll
     )
 
     print(f"[INFO] Probing with Unseen Subjects from Session 2...")
@@ -7747,7 +7952,20 @@ def run_subject_disjoint_cross_session_identification(
     # ====================================================
     # 6. APPLY SCORE-LEVEL FUSION & EVALUATE
     # ====================================================
-    final_scores, final_labels = _apply_score_fusion(scores, lab_probe, fusion_size=probe_fusion_size)
+    final_scores, final_labels, fusion_diagnostics = _apply_score_fusion(
+        scores,
+        lab_probe,
+        fusion_size=probe_fusion_size,
+        provenance=provenance_probe,
+        return_diagnostics=True,
+    )
+    if probe_fusion_size > 1 and len(final_labels) == 0:
+        raise ValueError(
+            "Probe fusion produced no complete fused decisions for any "
+            "identity: with the configured probe fusion size no source "
+            "segment holds enough probe beats to form a group. Reduce the "
+            "probe fusion size or provide more probe data."
+        )
 
     if visualize:
         viz = Visualizer()
@@ -7776,6 +7994,7 @@ def run_subject_disjoint_cross_session_identification(
         "Train (S1) Samples": len(X_train),
         "Enrollment (S1) Samples": len(X_enroll),
         "Probe (S2) Samples": len(X_probe),
+        "Probe Fusion": fusion_diagnostics,
     }
 
     if _return_stats:

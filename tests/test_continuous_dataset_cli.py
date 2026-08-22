@@ -46,32 +46,53 @@ class SyntheticContinuousLoader:
         )
 
         self.load_all_data = Mock(
-            return_value=(
-                self.train_x,
-                self.train_y,
-            )
+            side_effect=self._load_all_data
         )
 
         self.load_session = Mock(
             side_effect=self._load_session
         )
 
-    def _load_session(self, session_name):
-        if session_name == "train":
+    def _synthetic_provenance(self, labels):
+        from load_dataset import _ProvenanceBuilder
+
+        builder = _ProvenanceBuilder()
+        for subject in sorted(set(labels.tolist())):
+            count = int(np.sum(labels == subject))
+            builder.add_block(
+                count,
+                record_id=f"{subject}_r",
+                session_id=f"{subject}_r",
+                acquisition_time=None,
+                acquisition_order=0,
+                source_segment_id=f"{subject}_r#0",
+                source_segment_order=0.0,
+            )
+        return builder.build()
+
+    def _load_all_data(self, return_provenance=False):
+        if return_provenance:
             return (
                 self.train_x,
                 self.train_y,
+                self._synthetic_provenance(self.train_y),
+            )
+        return self.train_x, self.train_y
+
+    def _load_session(self, session_name, return_provenance=False):
+        if session_name == "train":
+            x, y = self.train_x, self.train_y
+        elif session_name == "test":
+            x, y = self.test_x, self.test_y
+        else:
+            raise ValueError(
+                f"Unexpected synthetic session: {session_name}"
             )
 
-        if session_name == "test":
-            return (
-                self.test_x,
-                self.test_y,
-            )
+        if return_provenance:
+            return x, y, self._synthetic_provenance(y)
+        return x, y
 
-        raise ValueError(
-            f"Unexpected session: {session_name}"
-        )
 
 
 class ContinuousDatasetCLITests(
@@ -146,8 +167,8 @@ class ContinuousDatasetCLITests(
         self.assertEqual(
             loader.load_session.call_args_list,
             [
-                call("train"),
-                call("test"),
+                call("train", return_provenance=True),
+                call("test", return_provenance=True),
             ],
         )
 
@@ -225,7 +246,7 @@ class ContinuousDatasetCLITests(
             temporal_guard_minutes=0.0,
         )
 
-        loader.load_all_data.assert_called_once_with()
+        loader.load_all_data.assert_called_once_with(return_provenance=True)
         loader.load_session.assert_not_called()
         runner_mock.assert_called_once()
 

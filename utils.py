@@ -72,7 +72,7 @@ def _make_loader(x, y, batch_size, shuffle=True, device='cpu'):
         
     return DataLoader(ds, batch_size=batch_size, shuffle=shuffle)
 
-def _create_templates(embeddings, labels, method='mean', max_beats=None):
+def _create_templates(embeddings, labels, method='mean', max_beats=None, provenance=None):
     """
     Aggregate enrollment embeddings into subject templates.
 
@@ -95,9 +95,14 @@ def _create_templates(embeddings, labels, method='mean', max_beats=None):
         - ``geometric_median``: iterative geometric median.
         - ``none``: retain all enrollment embeddings without fusion.
     max_beats : int or None
-        Maximum number of enrollment embeddings used per subject. The
-        first ``max_beats`` samples are selected. ``None`` uses all
-        available samples.
+        Enrollment budget: the first ``max_beats`` beats per subject are used,
+        selected in genuine source order when ``provenance`` is supplied and in
+        input order otherwise. ``None`` uses all available beats.
+    provenance : BeatProvenance or None
+        Optional per-beat source provenance, index-aligned with ``embeddings``.
+        When supplied for a fusing method it orders the finite first-N budget by
+        source. ``method='none'`` returns the enrollment embeddings before the
+        budget is applied; its finite-budget semantics are handled separately.
 
     Returns
     -------
@@ -106,6 +111,9 @@ def _create_templates(embeddings, labels, method='mean', max_beats=None):
     """
     if method == 'none' or method is None:
         return embeddings, labels
+
+    if provenance is not None:
+        provenance.validate(len(labels))
     
     if max_beats is not None:
         try: max_beats = int(max_beats)
@@ -121,9 +129,14 @@ def _create_templates(embeddings, labels, method='mean', max_beats=None):
         # 1. Get all available indices for this subject
         idxs = np.where(labels == label)[0]
         
-        # 2. Apply Input Constraint (First N Beats)
+        # 2. Apply the enrolment budget: the genuinely first N beats in source
+        # order when provenance is available, otherwise input order.
         if max_beats is not None and len(idxs) > max_beats:
-            idxs = idxs[:max_beats]
+            if provenance is not None:
+                order = _source_order_indices(provenance.subset(idxs))
+                idxs = idxs[order][:max_beats]
+            else:
+                idxs = idxs[:max_beats]
             
         subj_embs = embeddings[idxs]
         if len(subj_embs) == 0: continue
@@ -278,34 +291,185 @@ def _compute_pair_score(v1, v2, method='cosine'):
     else:
         raise ValueError(f"Unknown matching method: {method}")
     
-def _apply_score_fusion(scores, labels, fusion_size=1):
+def _source_order_indices(provenance):
     """
-    Applies Score-Level Fusion (Continuous Authentication) to probe beats.
-    Groups a subject's test scores into blocks of 'fusion_size' and averages them.
+    Order the beats of one subject and role by truthful source order.
+
+    When every acquisition that needs ordering states a genuine
+    ``acquisition_time`` the beats are ordered chronologically; otherwise the
+    deterministic ``acquisition_order`` orders the whole set (dated and undated
+    are never mixed and called chronology). Within an acquisition the order is
+    ``source_segment_order`` then the within-source position (``rpeak_index``
+    when present, otherwise ``beat_ordinal``). The original index breaks ties so
+    the order is fully deterministic.
     """
+    columns = provenance.columns
+    count = len(provenance)
+    if count == 0:
+        return np.empty((0,), dtype=int)
+
+    times = columns["acquisition_time"]
+    all_dated = all(value is not None for value in times)
+    acquisition_order = [int(value) for value in columns["acquisition_order"]]
+    if all_dated:
+        # Genuine time first; the stable acquisition_order breaks a tie between
+        # records sharing a date so shuffled array position never decides it.
+        primary = list(times)
+    else:
+        primary = list(acquisition_order)
+
+    record_id = [str(value) for value in columns["record_id"]]
+    segment_id = [str(value) for value in columns["source_segment_id"]]
+    rpeak = np.asarray(columns["rpeak_index"])
+    use_rpeak = bool(rpeak.size and np.all(rpeak >= 0))
+    segment_order = columns["source_segment_order"]
+    beat_ordinal = columns["beat_ordinal"]
+
+    def sort_key(index):
+        within = (
+            float(rpeak[index]) if use_rpeak else int(beat_ordinal[index])
+        )
+        return (
+            primary[index],
+            acquisition_order[index],
+            record_id[index],
+            float(segment_order[index]),
+            segment_id[index],
+            within,
+            index,
+        )
+
+    return np.asarray(sorted(range(count), key=sort_key), dtype=int)
+
+
+def _source_block_keys(provenance):
+    """
+    The source block each beat belongs to. A fused probe group never bridges the
+    sessions/acquisitions, physical records or source segments of a subject.
+    """
+    columns = provenance.columns
+    return list(
+        zip(
+            columns["session_id"].tolist(),
+            columns["record_id"].tolist(),
+            columns["source_segment_id"].tolist(),
+        )
+    )
+
+
+def _empty_fusion_diagnostics(count):
+    return {
+        "fusion_size": 1,
+        "raw_probe_observations": int(count),
+        "fused_probe_decisions": int(count),
+        "dropped_remainder_observations": 0,
+        "source_blocks_below_fusion_size": 0,
+        "identities_without_a_fused_decision": 0,
+    }
+
+
+def _apply_score_fusion(
+    scores,
+    labels,
+    fusion_size=1,
+    provenance=None,
+    return_diagnostics=False,
+):
+    """
+    Fuse the probe scores of one subject in fixed-depth groups within a source
+    block.
+
+    A fused group averages exactly ``fusion_size`` probe observations that share
+    a subject, session/acquisition, physical record and source segment, taken in
+    truthful source order. Groups never bridge those boundaries. The final
+    incomplete remainder of a block (fewer than ``fusion_size`` observations) is
+    dropped rather than scored at a smaller depth, and a block holding fewer than
+    ``fusion_size`` observations produces no fused decision.
+
+    ``fusion_size = 1`` returns the scores and labels unchanged (one-beat
+    scoring). For ``fusion_size > 1`` per-beat provenance is required so the
+    source boundaries can be honoured.
+    """
+    scores = np.asarray(scores)
+    labels = np.asarray(labels)
+
     if fusion_size <= 1:
+        if return_diagnostics:
+            return scores, labels, _empty_fusion_diagnostics(len(labels))
         return scores, labels
 
-    print(f"[INFO] Applying Score-Level Fusion (Averaging every {fusion_size} consecutive probe beats)...")
-    fused_scores, fused_labels = [], []
-    
-    for subj in np.unique(labels):
-        subj_scores = scores[labels == subj]
-        num_blocks = len(subj_scores) // fusion_size
-        
-        # If a subject has fewer beats than the fusion size, just average what they have
-        if num_blocks == 0:
-            fused_scores.append(np.mean(subj_scores, axis=0))
-            fused_labels.append(subj)
-            continue
-            
-        # Extract non-overlapping blocks and average them
-        for i in range(num_blocks):
-            block = subj_scores[i * fusion_size : (i + 1) * fusion_size]
-            fused_scores.append(np.mean(block, axis=0))
-            fused_labels.append(subj)
-            
-    return np.array(fused_scores), np.array(fused_labels)
+    if provenance is None:
+        raise ValueError(
+            "Probe fusion with fusion_size > 1 requires per-beat provenance so "
+            "fused groups stay within one subject, acquisition, record and "
+            "source segment. Provide provenance or evaluate with fusion_size = 1."
+        )
+    provenance.validate(len(labels))
+
+    print(
+        f"[INFO] Applying score-level fusion in groups of {fusion_size} within "
+        "one source segment at a time..."
+    )
+
+    fused_scores = []
+    fused_labels = []
+    dropped_remainder = 0
+    short_blocks = 0
+    zero_decision_subjects = 0
+
+    block_keys = _source_block_keys(provenance)
+
+    for subject in np.unique(labels):
+        subject_indices = np.flatnonzero(labels == subject)
+        subject_produced = 0
+
+        blocks = {}
+        for index in subject_indices:
+            blocks.setdefault(block_keys[index], []).append(index)
+
+        for block_key in sorted(blocks):
+            member_indices = np.asarray(blocks[block_key], dtype=int)
+            order = _source_order_indices(provenance.subset(member_indices))
+            ordered = member_indices[order]
+
+            complete_groups = len(ordered) // fusion_size
+            if complete_groups == 0:
+                short_blocks += 1
+                dropped_remainder += len(ordered)
+                continue
+
+            for group in range(complete_groups):
+                members = ordered[
+                    group * fusion_size : (group + 1) * fusion_size
+                ]
+                fused_scores.append(np.mean(scores[members], axis=0))
+                fused_labels.append(subject)
+                subject_produced += 1
+
+            dropped_remainder += len(ordered) - complete_groups * fusion_size
+
+        if subject_produced == 0:
+            zero_decision_subjects += 1
+
+    if fused_scores:
+        fused_scores = np.asarray(fused_scores)
+    else:
+        fused_scores = np.empty((0,) + scores.shape[1:], dtype=scores.dtype)
+    fused_labels = np.asarray(fused_labels)
+
+    if return_diagnostics:
+        diagnostics = {
+            "fusion_size": int(fusion_size),
+            "raw_probe_observations": int(len(labels)),
+            "fused_probe_decisions": int(len(fused_labels)),
+            "dropped_remainder_observations": int(dropped_remainder),
+            "source_blocks_below_fusion_size": int(short_blocks),
+            "identities_without_a_fused_decision": int(zero_decision_subjects),
+        }
+        return fused_scores, fused_labels, diagnostics
+
+    return fused_scores, fused_labels
+
 
 def _find_optimal_threshold(scores, labels):
     """
@@ -1521,6 +1685,7 @@ def _apply_outlier_filter(
     absolute_threshold=0.05,
     keep_percentage=0.8,
     apply_subject_ranking=True,
+    return_indices=False,
 ):
     """
     Filter ECG samples using a Signal Quality Index.
@@ -1533,6 +1698,9 @@ def _apply_outlier_filter(
     subject. This option is appropriate for controlled training or
     enrollment data, but must not be used for operational probe data because
     it requires access to ground-truth subject labels.
+
+    Set ``return_indices=True`` to also receive the exact retained indices
+    (relative to the supplied arrays) for aligning a parallel array.
     """
     x = np.asarray(x)
     y = np.asarray(y)
@@ -1604,6 +1772,12 @@ def _apply_outlier_filter(
         f"Dropped {len(x) - len(final_indices)} samples. "
         f"Retained {len(final_indices)}."
     )
+
+    if return_indices:
+        # ``final_indices`` are the exact samples retained, relative to the
+        # arrays passed in, so a caller can align a parallel array such as
+        # per-beat provenance with the filtered output.
+        return x[final_indices], y[final_indices], final_indices
 
     return x[final_indices], y[final_indices]
 
