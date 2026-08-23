@@ -59,6 +59,8 @@ CONFIG_KEY_ALIASES = {
     # Backward-compatible names used by experiment configuration files.
     "save_results_and_settings": "save_results",
     "enroll_parts": "enrol_parts",
+    "num_pairs": "pair_sampling_budget",
+    "sampling_mode": "pair_sampling_mode",
 }
 
 
@@ -153,6 +155,55 @@ def _parse_explicit_cli_arguments(parser, argv):
     return vars(
         parser.parse_args(argv)
     )
+
+
+
+def _normalize_explicit_cli_pair_sampling_aliases(
+    values,
+    parser,
+):
+    """
+    Normalize legacy verification-pair CLI names to canonical names.
+
+    Normalization occurs before YAML and command-line values are merged so
+    explicit command-line arguments retain their normal precedence.
+    """
+    normalized = dict(
+        values
+    )
+
+    aliases = {
+        "num_pairs": "pair_sampling_budget",
+        "sampling_mode": "pair_sampling_mode",
+    }
+
+    for legacy_name, canonical_name in aliases.items():
+        if legacy_name not in normalized:
+            continue
+
+        legacy_value = normalized.pop(
+            legacy_name
+        )
+
+        if canonical_name in normalized:
+            canonical_value = normalized[
+                canonical_name
+            ]
+
+            if canonical_value != legacy_value:
+                parser.error(
+                    "Conflicting command-line values were "
+                    f"provided through '--{legacy_name}' "
+                    f"and '--{canonical_name}'."
+                )
+
+            continue
+
+        normalized[
+            canonical_name
+        ] = legacy_value
+
+    return normalized
 
 
 def _load_yaml_defaults(config_path, parser):
@@ -261,6 +312,13 @@ def parse_experiment_arguments(argv=None):
         )
     )
 
+    explicit_cli_values = (
+        _normalize_explicit_cli_pair_sampling_aliases(
+            explicit_cli_values,
+            parser,
+        )
+    )
+
     yaml_defaults = {}
     config_path = explicit_cli_values.get(
         "config"
@@ -291,6 +349,7 @@ def parse_experiment_arguments(argv=None):
         ),
         parser,
     )
+
 
 def _normalize_minute_range(
     value,
@@ -531,7 +590,6 @@ def validate_experiment_arguments(args, parser):
         "epochs",
         "batch_size",
         "n_runs",
-        "num_pairs",
         "num_beats_to_merge",
         "beat_merge_stride",
         "probe_fusion_size",
@@ -541,6 +599,148 @@ def validate_experiment_arguments(args, parser):
             argument_name,
             minimum=1,
         )
+
+    # Verification pair-sampling configuration.
+    valid_pair_sampling_modes = (
+        "all",
+        "all_genuine",
+        "balanced",
+        "random",
+    )
+
+    legacy_sampling_mode = getattr(
+        args,
+        "sampling_mode",
+        None,
+    )
+
+    canonical_sampling_mode = getattr(
+        args,
+        "pair_sampling_mode",
+        None,
+    )
+
+    if (
+        legacy_sampling_mode is not None
+        and legacy_sampling_mode
+        not in valid_pair_sampling_modes
+    ):
+        parser.error(
+            "Invalid value for 'sampling_mode': "
+            f"{legacy_sampling_mode!r}. "
+            "Expected one of: "
+            f"{list(valid_pair_sampling_modes)}."
+        )
+
+    if (
+        canonical_sampling_mode is not None
+        and canonical_sampling_mode
+        not in valid_pair_sampling_modes
+    ):
+        parser.error(
+            "Invalid value for 'pair_sampling_mode': "
+            f"{canonical_sampling_mode!r}. "
+            "Expected one of: "
+            f"{list(valid_pair_sampling_modes)}."
+        )
+
+    if getattr(
+        args,
+        "num_pairs",
+        None,
+    ) is not None:
+        require_integer(
+            "num_pairs",
+            minimum=1,
+        )
+
+    if getattr(
+        args,
+        "pair_sampling_budget",
+        None,
+    ) is not None:
+        require_integer(
+            "pair_sampling_budget",
+            minimum=1,
+        )
+
+    require_integer(
+        "max_impostor_pairs",
+        minimum=1,
+    )
+
+    require_integer(
+        "pair_sampling_seed",
+        minimum=0,
+    )
+
+    try:
+        (
+            resolved_pair_sampling_mode,
+            resolved_pair_sampling_budget,
+        ) = utils._resolve_pair_sampling_arguments(
+            pair_sampling_mode=getattr(
+                args,
+                "pair_sampling_mode",
+                None,
+            ),
+            pair_sampling_budget=getattr(
+                args,
+                "pair_sampling_budget",
+                None,
+            ),
+            sampling_mode=getattr(
+                args,
+                "sampling_mode",
+                None,
+            ),
+            num_pairs=getattr(
+                args,
+                "num_pairs",
+                None,
+            ),
+        )
+    except ValueError as error:
+        parser.error(
+            str(error)
+        )
+
+    args.pair_sampling_mode = (
+        resolved_pair_sampling_mode
+    )
+
+    args.pair_sampling_budget = (
+        resolved_pair_sampling_budget
+    )
+
+    # Legacy names are accepted only at the input boundary. Downstream code
+    # and experiment metadata use the canonical pair-sampling vocabulary.
+    args.sampling_mode = None
+    args.num_pairs = None
+
+    if args.task not in {
+        2,
+        4,
+        6,
+        8,
+    }:
+        args.pair_sampling_mode = None
+        args.pair_sampling_budget = None
+        args.max_impostor_pairs = None
+        args.pair_sampling_seed = None
+
+    elif args.pair_sampling_mode == "all":
+        args.pair_sampling_budget = None
+        args.max_impostor_pairs = None
+        args.pair_sampling_seed = None
+
+    elif args.pair_sampling_mode == "all_genuine":
+        args.pair_sampling_budget = None
+
+    else:
+        # balanced and random use a total sampling budget and a dedicated
+        # sampling seed. The impostor-only cap is specific to all_genuine.
+        args.max_impostor_pairs = None
 
     if args.beat_merge_stride > args.num_beats_to_merge:
         parser.error(
@@ -1172,21 +1372,34 @@ def validate_experiment_arguments(args, parser):
     return args
 
 
+
+
 def build_effective_configuration(args):
     """
     Return a detached snapshot of every resolved experiment argument.
 
-    The snapshot is attached to the loader because the experiment logger
-    already records public loader attributes. This keeps the complete final
-    configuration alongside the result without changing the task APIs.
+    Legacy pair-sampling aliases are omitted because their resolved
+    canonical values are recorded explicitly.
     """
+    excluded_aliases = {
+        "num_pairs",
+        "sampling_mode",
+    }
+
     return copy.deepcopy(
         dict(
             sorted(
-                vars(args).items()
+                (
+                    name,
+                    value,
+                )
+                for name, value
+                in vars(args).items()
+                if name not in excluded_aliases
             )
         )
     )
+
 
 
 
@@ -2114,14 +2327,57 @@ def get_parser():
     eval_group.add_argument('--matching_method', type=str, default='cosine',
                             choices=['cosine', 'euclidean', 'manhattan', 'correlation'],
                             help="Distance metric for verification/identification.")
-    eval_group.add_argument('--num_pairs', type=int, default=10000,
-                            help="Number of pairs to generate for Verification Tasks (default: 10000).")
+    eval_group.add_argument(
+        '--pair_sampling_mode',
+        type=str,
+        default=None,
+        help=(
+            "Verification comparison strategy: all, all_genuine, "
+            "balanced, or random. The default remains exhaustive all."
+        ),
+    )
+    eval_group.add_argument(
+        '--pair_sampling_budget',
+        type=int,
+        default=None,
+        help=(
+            "Requested comparison budget for balanced and random "
+            "verification sampling. Defaults to 10000 for those modes."
+        ),
+    )
+    eval_group.add_argument(
+        '--max_impostor_pairs',
+        type=int,
+        default=1000000,
+        help=(
+            "Maximum number of uniformly sampled impostor comparisons "
+            "for all_genuine verification."
+        ),
+    )
+    eval_group.add_argument(
+        '--pair_sampling_seed',
+        type=int,
+        default=42,
+        help=(
+            "Dedicated random seed for stochastic verification-pair "
+            "sampling."
+        ),
+    )
+    eval_group.add_argument(
+        '--num_pairs',
+        type=int,
+        default=None,
+        help=(
+            "Backward-compatible alias for --pair_sampling_budget."
+        ),
+    )
     eval_group.add_argument(
         '--sampling_mode',
         type=str,
-        default='all',
-        choices=['all', 'balanced', 'random'],
-        help="Verification pair generation strategy."
+        default=None,
+        help=(
+            "Backward-compatible alias for --pair_sampling_mode."
+        ),
     )
 
     eval_group.add_argument(
@@ -2686,8 +2942,10 @@ def main():
             run_closed_set_verification(
                 x, y, 
                 test_split=args.test_split,
-                num_pairs=args.num_pairs,
-                sampling_mode=args.sampling_mode,
+                pair_sampling_budget=args.pair_sampling_budget,
+                pair_sampling_mode=args.pair_sampling_mode,
+                max_impostor_pairs=args.max_impostor_pairs,
+                pair_sampling_seed=args.pair_sampling_seed,
                 use_deployment_evaluation=args.use_deployment_evaluation,
                 target_fars=args.target_fars,
                 sqi_scores=args.sqi_method,
@@ -2711,8 +2969,10 @@ def main():
             run_subject_disjoint_verification(
                 x, y, 
                 test_split=args.test_split,
-                num_pairs=args.num_pairs,
-                sampling_mode=args.sampling_mode,
+                pair_sampling_budget=args.pair_sampling_budget,
+                pair_sampling_mode=args.pair_sampling_mode,
+                max_impostor_pairs=args.max_impostor_pairs,
+                pair_sampling_seed=args.pair_sampling_seed,
                 use_deployment_evaluation=args.use_deployment_evaluation,
                 target_fars=args.target_fars,
                 sqi_scores=args.sqi_method,
@@ -2739,8 +2999,10 @@ def main():
         elif args.task == 6:
             run_cross_session_verification(
                 x_train, y_train, x_probe, y_probe,
-                num_pairs=args.num_pairs,
-                sampling_mode=args.sampling_mode,
+                pair_sampling_budget=args.pair_sampling_budget,
+                pair_sampling_mode=args.pair_sampling_mode,
+                max_impostor_pairs=args.max_impostor_pairs,
+                pair_sampling_seed=args.pair_sampling_seed,
                 use_deployment_evaluation=args.use_deployment_evaluation,
                 target_fars=args.target_fars,
                 sqi_train=args.sqi_method,
@@ -2774,8 +3036,10 @@ def main():
             run_subject_disjoint_cross_session_verification(
                 x_train, y_train, x_probe, y_probe,
                 test_split=args.test_split,
-                num_pairs=args.num_pairs,
-                sampling_mode=args.sampling_mode,
+                pair_sampling_budget=args.pair_sampling_budget,
+                pair_sampling_mode=args.pair_sampling_mode,
+                max_impostor_pairs=args.max_impostor_pairs,
+                pair_sampling_seed=args.pair_sampling_seed,
                 use_deployment_evaluation=args.use_deployment_evaluation,
                 target_fars=args.target_fars,
                 sqi_s1=args.sqi_method,

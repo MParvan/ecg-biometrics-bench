@@ -368,11 +368,11 @@ class MainCLIRoutingTests(unittest.TestCase):
                 0.25,
             )
             self.assertEqual(
-                keyword_arguments["num_pairs"],
+                keyword_arguments["pair_sampling_budget"],
                 40,
             )
             self.assertEqual(
-                keyword_arguments["sampling_mode"],
+                keyword_arguments["pair_sampling_mode"],
                 "balanced",
             )
             self.assertFalse(
@@ -403,11 +403,11 @@ class MainCLIRoutingTests(unittest.TestCase):
 
         elif task == 6:
             self.assertEqual(
-                keyword_arguments["num_pairs"],
+                keyword_arguments["pair_sampling_budget"],
                 40,
             )
             self.assertEqual(
-                keyword_arguments["sampling_mode"],
+                keyword_arguments["pair_sampling_mode"],
                 "balanced",
             )
             self.assertFalse(
@@ -450,11 +450,11 @@ class MainCLIRoutingTests(unittest.TestCase):
                 0.25,
             )
             self.assertEqual(
-                keyword_arguments["num_pairs"],
+                keyword_arguments["pair_sampling_budget"],
                 40,
             )
             self.assertEqual(
-                keyword_arguments["sampling_mode"],
+                keyword_arguments["pair_sampling_mode"],
                 "balanced",
             )
             self.assertFalse(
@@ -727,7 +727,7 @@ class MainCLIRoutingTests(unittest.TestCase):
             4,
         )
         self.assertEqual(
-            keyword_arguments["sampling_mode"],
+            keyword_arguments["pair_sampling_mode"],
             "all",
         )
 
@@ -744,9 +744,10 @@ class MainCLIRoutingTests(unittest.TestCase):
             keyword_arguments["val_split"],
             0.20,
         )
-        self.assertEqual(
-            keyword_arguments["num_pairs"],
-            24,
+        self.assertIsNone(
+            keyword_arguments[
+                "pair_sampling_budget"
+            ]
         )
         self.assertTrue(
             keyword_arguments["use_template"]

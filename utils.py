@@ -1757,137 +1757,1585 @@ def _compute_metrics_identification(
     )
 
 
-def _generate_pairs(embeddings1, labels1, embeddings2=None, labels2=None, 
-                    num_pairs=10000, sampling_mode="all", matching_method='cosine'):
+
+def _group_verification_indices_by_label(labels):
     """
-    Generates similarity scores and ground truth labels for verification.
-    
-    MODES:
-      - 'balanced': Creates 50% Genuine and 50% Imposter pairs (Prevents bias).
-      - 'random': Picks pairs completely at random (May be heavily unbalanced).
-      - 'all': Computes the full Similarity Matrix (Every possible pair).
-      
-    Args:
-        embeddings1: Query set (Probe).
-        labels1: Query labels.
-        embeddings2: (Optional) Template set (Enrollment). If None, does Intra-session (emb1 vs emb1).
+    Group verification sample indices by identity label.
+
+    Indices retain their original observation order.
     """
-    scores = []
-    labels_pair = []
-    
-    # RENAMED FOR CLARITY: 
-    # If True, we match Set 1 (Probes) against Set 2 (Templates).
-    # If False, we match Set 1 against itself (Intra-set evaluation).
-    match_two_sets = (embeddings2 is not None)
-    
-    if not match_two_sets:
+    labels = np.asarray(labels)
+
+    if labels.ndim != 1:
+        raise ValueError(
+            "Verification identity labels must be one-dimensional."
+        )
+
+    groups = collections.defaultdict(list)
+
+    for index, label in enumerate(labels):
+        groups[label].append(index)
+
+    return {
+        label: np.asarray(
+            indices,
+            dtype=np.int64,
+        )
+        for label, indices in groups.items()
+    }
+
+
+def _sample_unique_integer_ranks(
+    population_size,
+    sample_size,
+    rng,
+):
+    """
+    Uniformly sample integer ranks without replacement.
+
+    Floyd's algorithm uses memory proportional to the requested sample,
+    rather than to the full candidate population.
+    """
+    if (
+        isinstance(population_size, (bool, np.bool_))
+        or not isinstance(
+            population_size,
+            (int, np.integer),
+        )
+    ):
+        raise ValueError(
+            "population_size must be an integer."
+        )
+
+    if (
+        isinstance(sample_size, (bool, np.bool_))
+        or not isinstance(
+            sample_size,
+            (int, np.integer),
+        )
+    ):
+        raise ValueError(
+            "sample_size must be an integer."
+        )
+
+    population_size = int(population_size)
+    sample_size = int(sample_size)
+
+    if population_size < 0:
+        raise ValueError(
+            "population_size must be non-negative."
+        )
+
+    if not 0 <= sample_size <= population_size:
+        raise ValueError(
+            "sample_size must satisfy "
+            "0 <= sample_size <= population_size."
+        )
+
+    if sample_size == 0:
+        return np.empty(
+            0,
+            dtype=np.int64,
+        )
+
+    if sample_size == population_size:
+        return np.arange(
+            population_size,
+            dtype=np.int64,
+        )
+
+    selected = set()
+
+    for upper_bound in range(
+        population_size - sample_size,
+        population_size,
+    ):
+        draw = int(
+            rng.integers(
+                0,
+                upper_bound + 1,
+            )
+        )
+
+        if draw in selected:
+            selected.add(
+                upper_bound
+            )
+        else:
+            selected.add(
+                draw
+            )
+
+    if len(selected) != sample_size:
+        raise RuntimeError(
+            "Unique-rank sampling produced an "
+            "unexpected sample count."
+        )
+
+    return np.sort(
+        np.fromiter(
+            selected,
+            dtype=np.int64,
+            count=sample_size,
+        )
+    )
+
+
+def _map_offsets_excluding_indices(
+    offsets,
+    forbidden_indices,
+    lower_bound,
+    upper_bound,
+):
+    """
+    Map offsets in a filtered integer range back to original indices.
+
+    The valid population is [lower_bound, upper_bound) with every index
+    listed in forbidden_indices removed.
+    """
+    offsets = np.asarray(
+        offsets,
+        dtype=np.int64,
+    )
+
+    forbidden_indices = np.asarray(
+        forbidden_indices,
+        dtype=np.int64,
+    )
+
+    lower_bound = int(lower_bound)
+    upper_bound = int(upper_bound)
+
+    if offsets.ndim != 1:
+        raise ValueError(
+            "offsets must be one-dimensional."
+        )
+
+    if forbidden_indices.ndim != 1:
+        raise ValueError(
+            "forbidden_indices must be one-dimensional."
+        )
+
+    if lower_bound < 0:
+        raise ValueError(
+            "lower_bound must be non-negative."
+        )
+
+    if upper_bound < lower_bound:
+        raise ValueError(
+            "upper_bound must not be smaller than lower_bound."
+        )
+
+    if offsets.size == 0:
+        return np.empty(
+            0,
+            dtype=np.int64,
+        )
+
+    if np.any(offsets < 0):
+        raise ValueError(
+            "offsets must be non-negative."
+        )
+
+    if forbidden_indices.size:
+        if np.any(
+            forbidden_indices[:-1]
+            > forbidden_indices[1:]
+        ):
+            raise ValueError(
+                "forbidden_indices must be sorted."
+            )
+
+        forbidden_start = int(
+            np.searchsorted(
+                forbidden_indices,
+                lower_bound,
+                side="left",
+            )
+        )
+
+        forbidden_end = int(
+            np.searchsorted(
+                forbidden_indices,
+                upper_bound,
+                side="left",
+            )
+        )
+
+        forbidden_in_range = (
+            forbidden_indices[
+                forbidden_start:
+                forbidden_end
+            ]
+        )
+    else:
+        forbidden_in_range = (
+            forbidden_indices
+        )
+
+    available_count = (
+        upper_bound
+        - lower_bound
+        - len(forbidden_in_range)
+    )
+
+    if np.any(
+        offsets >= available_count
+    ):
+        raise ValueError(
+            "An offset exceeds the available filtered range."
+        )
+
+    # The kth allowed index can never be before lower_bound + k.
+    low = (
+        lower_bound
+        + offsets
+    ).astype(
+        np.int64,
+        copy=True,
+    )
+
+    high = np.full(
+        offsets.shape,
+        upper_bound - 1,
+        dtype=np.int64,
+    )
+
+    # Find the smallest original index for which the number of allowed
+    # positions encountered is greater than the requested zero-based offset.
+    while np.any(low < high):
+        middle = (
+            low
+            + (high - low) // 2
+        )
+
+        excluded_through_middle = (
+            np.searchsorted(
+                forbidden_in_range,
+                middle,
+                side="right",
+            )
+        )
+
+        allowed_through_middle = (
+            middle
+            - lower_bound
+            + 1
+            - excluded_through_middle
+        )
+
+        move_left = (
+            allowed_through_middle
+            > offsets
+        )
+
+        high = np.where(
+            move_left,
+            middle,
+            high,
+        )
+
+        low = np.where(
+            move_left,
+            low,
+            middle + 1,
+        )
+
+    result = low
+
+    if forbidden_in_range.size:
+        if np.any(
+            np.isin(
+                result,
+                forbidden_in_range,
+            )
+        ):
+            raise RuntimeError(
+                "Filtered-offset mapping returned "
+                "a forbidden index."
+            )
+
+    return result
+
+
+def _sample_impostor_pair_indices(
+    labels1,
+    labels2=None,
+    max_impostor_pairs=1000000,
+    pair_sampling_seed=42,
+):
+    """
+    Uniformly sample impostor comparisons without replacement.
+
+    One-set evaluation uses only unordered pairs i < j. Two-set evaluation
+    treats every row-by-column Cartesian cell as a distinct comparison.
+
+    The full comparison matrix is never materialized.
+    """
+    labels1 = np.asarray(labels1)
+
+    if labels1.ndim != 1:
+        raise ValueError(
+            "labels1 must be one-dimensional."
+        )
+
+    match_two_sets = (
+        labels2 is not None
+    )
+
+    if match_two_sets:
+        labels2 = np.asarray(labels2)
+
+        if labels2.ndim != 1:
+            raise ValueError(
+                "labels2 must be one-dimensional."
+            )
+    else:
+        labels2 = labels1
+
+    if (
+        isinstance(
+            max_impostor_pairs,
+            (bool, np.bool_),
+        )
+        or not isinstance(
+            max_impostor_pairs,
+            (int, np.integer),
+        )
+        or int(max_impostor_pairs) < 1
+    ):
+        raise ValueError(
+            "max_impostor_pairs must be a positive integer."
+        )
+
+    if (
+        isinstance(
+            pair_sampling_seed,
+            (bool, np.bool_),
+        )
+        or not isinstance(
+            pair_sampling_seed,
+            (int, np.integer),
+        )
+        or int(pair_sampling_seed) < 0
+    ):
+        raise ValueError(
+            "pair_sampling_seed must be a non-negative integer."
+        )
+
+    row_count = len(labels1)
+    column_count = len(labels2)
+
+    if (
+        row_count == 0
+        or column_count == 0
+    ):
+        return (
+            np.empty(
+                0,
+                dtype=np.int64,
+            ),
+            np.empty(
+                0,
+                dtype=np.int64,
+            ),
+            0,
+        )
+
+    column_groups = (
+        _group_verification_indices_by_label(
+            labels2
+        )
+    )
+
+    row_impostor_counts = np.zeros(
+        row_count,
+        dtype=np.int64,
+    )
+
+    if match_two_sets:
+        for row_index, label in enumerate(
+            labels1
+        ):
+            same_identity_columns = (
+                column_groups.get(
+                    label
+                )
+            )
+
+            same_identity_count = (
+                0
+                if same_identity_columns is None
+                else len(same_identity_columns)
+            )
+
+            row_impostor_counts[
+                row_index
+            ] = (
+                column_count
+                - same_identity_count
+            )
+
+    else:
+        identity_counts = {
+            label: len(indices)
+            for label, indices
+            in column_groups.items()
+        }
+
+        seen_counts = (
+            collections.defaultdict(int)
+        )
+
+        for row_index, label in enumerate(
+            labels1
+        ):
+            later_samples = (
+                row_count
+                - row_index
+                - 1
+            )
+
+            later_same_identity = (
+                identity_counts[label]
+                - seen_counts[label]
+                - 1
+            )
+
+            row_impostor_counts[
+                row_index
+            ] = (
+                later_samples
+                - later_same_identity
+            )
+
+            seen_counts[label] += 1
+
+    if np.any(
+        row_impostor_counts < 0
+    ):
+        raise RuntimeError(
+            "Impostor row counts cannot be negative."
+        )
+
+    row_ends = np.cumsum(
+        row_impostor_counts,
+        dtype=np.int64,
+    )
+
+    total_impostor_pairs = (
+        int(row_ends[-1])
+        if row_ends.size
+        else 0
+    )
+
+    sample_size = min(
+        total_impostor_pairs,
+        int(max_impostor_pairs),
+    )
+
+    if sample_size == 0:
+        return (
+            np.empty(
+                0,
+                dtype=np.int64,
+            ),
+            np.empty(
+                0,
+                dtype=np.int64,
+            ),
+            total_impostor_pairs,
+        )
+
+    rng = np.random.default_rng(
+        int(pair_sampling_seed)
+    )
+
+    sampled_ranks = (
+        _sample_unique_integer_ranks(
+            total_impostor_pairs,
+            sample_size,
+            rng,
+        )
+    )
+
+    row_indices = np.searchsorted(
+        row_ends,
+        sampled_ranks,
+        side="right",
+    ).astype(
+        np.int64,
+        copy=False,
+    )
+
+    row_starts = np.zeros_like(
+        row_ends
+    )
+
+    if len(row_starts) > 1:
+        row_starts[1:] = (
+            row_ends[:-1]
+        )
+
+    offsets_within_row = (
+        sampled_ranks
+        - row_starts[
+            row_indices
+        ]
+    )
+
+    column_indices = np.empty(
+        sample_size,
+        dtype=np.int64,
+    )
+
+    unique_rows, group_starts = (
+        np.unique(
+            row_indices,
+            return_index=True,
+        )
+    )
+
+    group_ends = np.concatenate(
+        (
+            group_starts[1:],
+            np.asarray(
+                [sample_size],
+                dtype=np.int64,
+            ),
+        )
+    )
+
+    empty_forbidden = np.empty(
+        0,
+        dtype=np.int64,
+    )
+
+    for row_index, start, end in zip(
+        unique_rows,
+        group_starts,
+        group_ends,
+    ):
+        row_index = int(row_index)
+        start = int(start)
+        end = int(end)
+
+        label = labels1[
+            row_index
+        ]
+
+        forbidden_indices = (
+            column_groups.get(
+                label,
+                empty_forbidden,
+            )
+        )
+
+        lower_bound = (
+            0
+            if match_two_sets
+            else row_index + 1
+        )
+
+        column_indices[
+            start:end
+        ] = (
+            _map_offsets_excluding_indices(
+                offsets_within_row[
+                    start:end
+                ],
+                forbidden_indices,
+                lower_bound=lower_bound,
+                upper_bound=column_count,
+            )
+        )
+
+    if not np.all(
+        labels1[row_indices]
+        != labels2[column_indices]
+    ):
+        raise RuntimeError(
+            "Impostor sampling generated a "
+            "same-identity comparison."
+        )
+
+    if (
+        not match_two_sets
+        and not np.all(
+            row_indices
+            < column_indices
+        )
+    ):
+        raise RuntimeError(
+            "One-set verification must use only i < j pairs."
+        )
+
+    return (
+        row_indices,
+        column_indices,
+        total_impostor_pairs,
+    )
+
+
+
+def _resolve_pair_sampling_arguments(
+    pair_sampling_mode=None,
+    pair_sampling_budget=None,
+    sampling_mode=None,
+    num_pairs=None,
+):
+    """
+    Resolve canonical verification pair-sampling arguments and legacy aliases.
+
+    ``pair_sampling_mode`` and ``pair_sampling_budget`` are the canonical
+    names. ``sampling_mode`` and ``num_pairs`` remain supported as aliases.
+    """
+    if pair_sampling_mode is None:
+        resolved_mode = (
+            "all"
+            if sampling_mode is None
+            else sampling_mode
+        )
+    else:
+        resolved_mode = pair_sampling_mode
+
+        if (
+            sampling_mode is not None
+            and sampling_mode
+            != pair_sampling_mode
+        ):
+            raise ValueError(
+                "Conflicting pair sampling modes were provided "
+                "through pair_sampling_mode and sampling_mode."
+            )
+
+    valid_modes = {
+        "all",
+        "all_genuine",
+        "balanced",
+        "random",
+    }
+
+    if resolved_mode not in valid_modes:
+        raise ValueError(
+            "Unknown verification pair sampling mode: "
+            f"{resolved_mode!r}."
+        )
+
+    if pair_sampling_budget is None:
+        resolved_budget = (
+            10000
+            if num_pairs is None
+            else num_pairs
+        )
+    else:
+        resolved_budget = pair_sampling_budget
+
+        if (
+            num_pairs is not None
+            and num_pairs
+            != pair_sampling_budget
+        ):
+            raise ValueError(
+                "Conflicting pair sampling budgets were provided "
+                "through pair_sampling_budget and num_pairs."
+            )
+
+    if (
+        isinstance(
+            resolved_budget,
+            (bool, np.bool_),
+        )
+        or not isinstance(
+            resolved_budget,
+            (int, np.integer),
+        )
+        or int(resolved_budget) < 1
+    ):
+        raise ValueError(
+            "pair_sampling_budget must be a positive integer."
+        )
+
+    return (
+        resolved_mode,
+        int(resolved_budget),
+    )
+
+
+def _verification_pair_rng(
+    pair_sampling_seed,
+):
+    """
+    Return the RNG used for stochastic verification-pair sampling.
+
+    A supplied seed creates an isolated Generator. ``None`` preserves the
+    legacy global NumPy RNG behavior required by training-validation callers.
+    """
+    if pair_sampling_seed is None:
+        return np.random
+
+    if (
+        isinstance(
+            pair_sampling_seed,
+            (bool, np.bool_),
+        )
+        or not isinstance(
+            pair_sampling_seed,
+            (int, np.integer),
+        )
+        or int(pair_sampling_seed) < 0
+    ):
+        raise ValueError(
+            "pair_sampling_seed must be a non-negative integer."
+        )
+
+    return np.random.default_rng(
+        int(pair_sampling_seed)
+    )
+
+
+def _compute_aligned_pair_scores(
+    embeddings1,
+    embeddings2,
+    method="cosine",
+):
+    """
+    Score corresponding rows from two equally shaped embedding arrays.
+    """
+    embeddings1 = np.asarray(
+        embeddings1
+    )
+
+    embeddings2 = np.asarray(
+        embeddings2
+    )
+
+    if (
+        embeddings1.ndim != 2
+        or embeddings2.ndim != 2
+        or embeddings1.shape
+        != embeddings2.shape
+    ):
+        raise ValueError(
+            "Aligned pair scoring requires equally shaped "
+            "two-dimensional embedding arrays."
+        )
+
+    if method == "cosine":
+        numerator = np.sum(
+            embeddings1
+            * embeddings2,
+            axis=1,
+        )
+
+        denominator = (
+            (
+                np.linalg.norm(
+                    embeddings1,
+                    axis=1,
+                )
+                + 1e-10
+            )
+            * (
+                np.linalg.norm(
+                    embeddings2,
+                    axis=1,
+                )
+                + 1e-10
+            )
+        )
+
+        return (
+            numerator
+            / denominator
+        )
+
+    if method == "euclidean":
+        return -np.linalg.norm(
+            embeddings1
+            - embeddings2,
+            axis=1,
+        )
+
+    if method == "manhattan":
+        return -np.sum(
+            np.abs(
+                embeddings1
+                - embeddings2
+            ),
+            axis=1,
+        )
+
+    if method == "correlation":
+        centered1 = (
+            embeddings1
+            - np.mean(
+                embeddings1,
+                axis=1,
+                keepdims=True,
+            )
+        )
+
+        centered2 = (
+            embeddings2
+            - np.mean(
+                embeddings2,
+                axis=1,
+                keepdims=True,
+            )
+        )
+
+        numerator = np.sum(
+            centered1
+            * centered2,
+            axis=1,
+        )
+
+        denominator = (
+            np.linalg.norm(
+                centered1,
+                axis=1,
+            )
+            * np.linalg.norm(
+                centered2,
+                axis=1,
+            )
+        )
+
+        with np.errstate(
+            divide="ignore",
+            invalid="ignore",
+        ):
+            return (
+                numerator
+                / denominator
+            )
+
+    raise ValueError(
+        f"Unknown matching method: {method}"
+    )
+
+
+def _score_selected_pair_indices(
+    embeddings1,
+    embeddings2,
+    row_indices,
+    column_indices,
+    matching_method,
+    chunk_size=65536,
+):
+    """
+    Score selected comparisons without constructing a Cartesian score matrix.
+    """
+    embeddings1 = np.asarray(
+        embeddings1
+    )
+
+    embeddings2 = np.asarray(
+        embeddings2
+    )
+
+    row_indices = np.asarray(
+        row_indices,
+        dtype=np.int64,
+    )
+
+    column_indices = np.asarray(
+        column_indices,
+        dtype=np.int64,
+    )
+
+    if row_indices.shape != column_indices.shape:
+        raise ValueError(
+            "Selected pair-index arrays must have equal shape."
+        )
+
+    scores = np.empty(
+        len(row_indices),
+        dtype=float,
+    )
+
+    for start in range(
+        0,
+        len(row_indices),
+        chunk_size,
+    ):
+        end = min(
+            start + chunk_size,
+            len(row_indices),
+        )
+
+        scores[
+            start:end
+        ] = _compute_aligned_pair_scores(
+            embeddings1[
+                row_indices[start:end]
+            ],
+            embeddings2[
+                column_indices[start:end]
+            ],
+            method=matching_method,
+        )
+
+    return scores
+
+
+def _score_all_genuine_comparisons(
+    embeddings1,
+    labels1,
+    embeddings2,
+    labels2,
+    match_two_sets,
+    matching_method,
+    chunk_size=65536,
+):
+    """
+    Score every genuine verification comparison exactly once.
+
+    One-set evaluation scores unordered same-identity pairs. Two-set
+    evaluation scores every same-identity Cartesian cell. Only bounded
+    chunks of embeddings are materialized while scoring.
+    """
+    embeddings1 = np.asarray(
+        embeddings1
+    )
+
+    embeddings2 = np.asarray(
+        embeddings2
+    )
+
+    labels1 = np.asarray(
+        labels1
+    )
+
+    labels2 = np.asarray(
+        labels2
+    )
+
+    if (
+        embeddings1.ndim != 2
+        or embeddings2.ndim != 2
+    ):
+        raise ValueError(
+            "Verification embeddings must be two-dimensional."
+        )
+
+    if (
+        embeddings1.shape[1]
+        != embeddings2.shape[1]
+    ):
+        raise ValueError(
+            "Verification embedding sets must have "
+            "the same feature dimension."
+        )
+
+    groups1 = (
+        _group_verification_indices_by_label(
+            labels1
+        )
+    )
+
+    groups2 = (
+        _group_verification_indices_by_label(
+            labels2
+        )
+    )
+
+    if match_two_sets:
+        genuine_count = sum(
+            len(indices1)
+            * len(
+                groups2.get(
+                    label,
+                    (),
+                )
+            )
+            for label, indices1
+            in groups1.items()
+        )
+    else:
+        genuine_count = sum(
+            len(indices)
+            * (
+                len(indices) - 1
+            )
+            // 2
+            for indices
+            in groups1.values()
+        )
+
+    scores = np.empty(
+        genuine_count,
+        dtype=float,
+    )
+
+    cursor = 0
+
+    if match_two_sets:
+        for label, row_indices in (
+            groups1.items()
+        ):
+            column_indices = (
+                groups2.get(
+                    label
+                )
+            )
+
+            if column_indices is None:
+                continue
+
+            for row_index in row_indices:
+                for start in range(
+                    0,
+                    len(column_indices),
+                    chunk_size,
+                ):
+                    selected_columns = (
+                        column_indices[
+                            start:
+                            start + chunk_size
+                        ]
+                    )
+
+                    count = len(
+                        selected_columns
+                    )
+
+                    left_embeddings = (
+                        np.broadcast_to(
+                            embeddings1[
+                                int(row_index)
+                            ],
+                            (
+                                count,
+                                embeddings1.shape[1],
+                            ),
+                        )
+                    )
+
+                    scores[
+                        cursor:
+                        cursor + count
+                    ] = (
+                        _compute_aligned_pair_scores(
+                            left_embeddings,
+                            embeddings2[
+                                selected_columns
+                            ],
+                            method=matching_method,
+                        )
+                    )
+
+                    cursor += count
+
+    else:
+        for identity_indices in (
+            groups1.values()
+        ):
+            for position, row_index in enumerate(
+                identity_indices[:-1]
+            ):
+                later_indices = (
+                    identity_indices[
+                        position + 1:
+                    ]
+                )
+
+                for start in range(
+                    0,
+                    len(later_indices),
+                    chunk_size,
+                ):
+                    selected_columns = (
+                        later_indices[
+                            start:
+                            start + chunk_size
+                        ]
+                    )
+
+                    count = len(
+                        selected_columns
+                    )
+
+                    left_embeddings = (
+                        np.broadcast_to(
+                            embeddings1[
+                                int(row_index)
+                            ],
+                            (
+                                count,
+                                embeddings1.shape[1],
+                            ),
+                        )
+                    )
+
+                    scores[
+                        cursor:
+                        cursor + count
+                    ] = (
+                        _compute_aligned_pair_scores(
+                            left_embeddings,
+                            embeddings2[
+                                selected_columns
+                            ],
+                            method=matching_method,
+                        )
+                    )
+
+                    cursor += count
+
+    if cursor != genuine_count:
+        raise RuntimeError(
+            "Genuine comparison scoring produced "
+            "an unexpected comparison count."
+        )
+
+    return scores
+
+
+
+def _generate_pairs(
+    embeddings1,
+    labels1,
+    embeddings2=None,
+    labels2=None,
+    num_pairs=None,
+    sampling_mode=None,
+    matching_method="cosine",
+    *,
+    pair_sampling_budget=None,
+    pair_sampling_mode=None,
+    max_impostor_pairs=1000000,
+    pair_sampling_seed=None,
+):
+    """
+    Generate verification scores and binary comparison labels.
+
+    Canonical pair-sampling arguments are ``pair_sampling_mode`` and
+    ``pair_sampling_budget``. ``sampling_mode`` and ``num_pairs`` remain
+    supported as legacy aliases.
+
+    Modes:
+      - all: evaluate the complete comparison space.
+      - all_genuine: evaluate every genuine comparison and uniformly sample
+        impostor comparisons without replacement up to max_impostor_pairs.
+      - balanced: sample equal genuine and impostor classes using the pair
+        sampling budget.
+      - random: draw comparison attempts at random using the pair sampling
+        budget.
+
+    In one-set evaluation, comparisons are unordered and self-comparisons are
+    excluded. In two-set evaluation, each probe-by-enrollment Cartesian cell
+    is a distinct comparison.
+    """
+    (
+        resolved_mode,
+        resolved_budget,
+    ) = _resolve_pair_sampling_arguments(
+        pair_sampling_mode=(
+            pair_sampling_mode
+        ),
+        pair_sampling_budget=(
+            pair_sampling_budget
+        ),
+        sampling_mode=sampling_mode,
+        num_pairs=num_pairs,
+    )
+
+    embeddings1 = np.asarray(
+        embeddings1
+    )
+
+    labels1 = np.asarray(
+        labels1
+    )
+
+    match_two_sets = (
+        embeddings2 is not None
+    )
+
+    if match_two_sets:
+        embeddings2 = np.asarray(
+            embeddings2
+        )
+
+        if labels2 is None:
+            raise ValueError(
+                "labels2 is required when embeddings2 is provided."
+            )
+
+        labels2 = np.asarray(
+            labels2
+        )
+    else:
         embeddings2 = embeddings1
         labels2 = labels1
 
-    if len(labels1) == 0 or len(labels2) == 0:
-        return np.array([]), np.array([])
+    if len(embeddings1) != len(labels1):
+        raise ValueError(
+            "embeddings1 and labels1 must have equal length."
+        )
 
-    # --------------------------------------------------------
-    # MODE A: ALL PAIRS (Full Matrix)
-    # --------------------------------------------------------
-    if sampling_mode == "all":
-        print(f"[INFO] generating ALL pairs (Full Matrix evaluation)...")
-        sim_matrix = _compute_score_matrix(embeddings1, embeddings2, method=matching_method)
-        truth_matrix = (labels1[:, None] == labels2[None, :]).astype(int)
-        
+    if len(embeddings2) != len(labels2):
+        raise ValueError(
+            "embeddings2 and labels2 must have equal length."
+        )
+
+    if (
+        len(labels1) == 0
+        or len(labels2) == 0
+    ):
+        return (
+            np.array([]),
+            np.array([]),
+        )
+
+    if resolved_mode == "all_genuine":
+        resolved_pair_seed = (
+            42
+            if pair_sampling_seed is None
+            else pair_sampling_seed
+        )
+
+        genuine_scores = (
+            _score_all_genuine_comparisons(
+                embeddings1,
+                labels1,
+                embeddings2,
+                labels2,
+                match_two_sets=(
+                    match_two_sets
+                ),
+                matching_method=(
+                    matching_method
+                ),
+            )
+        )
+
+        (
+            impostor_rows,
+            impostor_columns,
+            total_impostor_pairs,
+        ) = _sample_impostor_pair_indices(
+            labels1,
+            (
+                labels2
+                if match_two_sets
+                else None
+            ),
+            max_impostor_pairs=(
+                max_impostor_pairs
+            ),
+            pair_sampling_seed=(
+                resolved_pair_seed
+            ),
+        )
+
+        impostor_scores = (
+            _score_selected_pair_indices(
+                embeddings1,
+                embeddings2,
+                impostor_rows,
+                impostor_columns,
+                matching_method=(
+                    matching_method
+                ),
+            )
+        )
+
+        scores = np.concatenate(
+            (
+                genuine_scores,
+                impostor_scores,
+            )
+        )
+
+        labels_pair = np.concatenate(
+            (
+                np.ones(
+                    len(genuine_scores),
+                    dtype=int,
+                ),
+                np.zeros(
+                    len(impostor_scores),
+                    dtype=int,
+                ),
+            )
+        )
+
+        print(
+            "[INFO] Verification pair generation: "
+            "all genuine comparisons retained; "
+            f"{len(impostor_scores):,} of "
+            f"{total_impostor_pairs:,} available "
+            "impostor comparisons evaluated."
+        )
+
+        return (
+            scores,
+            labels_pair,
+        )
+
+    scores = []
+    labels_pair = []
+
+    if resolved_mode == "all":
+        print(
+            "[INFO] generating ALL pairs "
+            "(Full Matrix evaluation)..."
+        )
+
+        sim_matrix = _compute_score_matrix(
+            embeddings1,
+            embeddings2,
+            method=matching_method,
+        )
+
+        truth_matrix = (
+            labels1[:, None]
+            == labels2[None, :]
+        ).astype(int)
+
         if match_two_sets:
             scores = sim_matrix.flatten()
-            labels_pair = truth_matrix.flatten()
+            labels_pair = (
+                truth_matrix.flatten()
+            )
         else:
-            upper_tri = np.triu_indices(len(labels1), k=1)
-            scores = sim_matrix[upper_tri]
-            labels_pair = truth_matrix[upper_tri]
-            
-    # --------------------------------------------------------
-    # MODE B: BALANCED (Standard)
-    # --------------------------------------------------------
-    elif sampling_mode == "balanced":
-        s1_idx = collections.defaultdict(list)
-        s2_idx = collections.defaultdict(list)
-        for i, l in enumerate(labels1): s1_idx[l].append(i)
-        for i, l in enumerate(labels2): s2_idx[l].append(i)
-        
-        common_subs = list(set(s1_idx.keys()) & set(s2_idx.keys()))
-        if len(common_subs) < 2: return np.array([]), np.array([])
+            upper_tri = np.triu_indices(
+                len(labels1),
+                k=1,
+            )
 
-        # Subjects eligible for genuine comparisons.
-        # In intra-set evaluation, each subject must have at least two
-        # different samples so that self-pairs cannot be generated.
+            scores = sim_matrix[
+                upper_tri
+            ]
+
+            labels_pair = truth_matrix[
+                upper_tri
+            ]
+
+        return (
+            np.asarray(scores),
+            np.asarray(labels_pair),
+        )
+
+    rng = _verification_pair_rng(
+        pair_sampling_seed
+    )
+
+    if resolved_mode == "balanced":
+        s1_idx = collections.defaultdict(
+            list
+        )
+
+        s2_idx = collections.defaultdict(
+            list
+        )
+
+        for index, label in enumerate(
+            labels1
+        ):
+            s1_idx[label].append(
+                index
+            )
+
+        for index, label in enumerate(
+            labels2
+        ):
+            s2_idx[label].append(
+                index
+            )
+
+        common_subjects = [
+            subject
+            for subject in s1_idx
+            if subject in s2_idx
+        ]
+
+        if len(common_subjects) < 2:
+            return (
+                np.array([]),
+                np.array([]),
+            )
+
         if match_two_sets:
-            genuine_subjects = common_subs
+            genuine_subjects = (
+                common_subjects
+            )
         else:
             genuine_subjects = [
                 subject
-                for subject in common_subs
-                if len(s1_idx[subject]) >= 2
+                for subject
+                in common_subjects
+                if len(
+                    s1_idx[subject]
+                ) >= 2
             ]
 
         if not genuine_subjects:
-            return np.array([]), np.array([])
+            return (
+                np.array([]),
+                np.array([]),
+            )
 
-        # Genuine pairs
-        for _ in range(num_pairs // 2):
-            subj = np.random.choice(genuine_subjects)
+        for _ in range(
+            resolved_budget // 2
+        ):
+            subject = rng.choice(
+                genuine_subjects
+            )
 
             if match_two_sets:
-                # Probe versus enrollment/template.
-                idx1 = np.random.choice(s1_idx[subj])
-                idx2 = np.random.choice(s2_idx[subj])
-            else:
-                # Intra-set evaluation requires two distinct samples.
-                candidate_indices = np.asarray(s1_idx[subj])
-                idx1, idx2 = np.random.choice(
-                    candidate_indices,
-                    size=2,
-                    replace=False,
+                idx1 = int(
+                    rng.choice(
+                        s1_idx[subject]
+                    )
                 )
+
+                idx2 = int(
+                    rng.choice(
+                        s2_idx[subject]
+                    )
+                )
+            else:
+                candidate_indices = (
+                    np.asarray(
+                        s1_idx[subject]
+                    )
+                )
+
+                idx1, idx2 = (
+                    rng.choice(
+                        candidate_indices,
+                        size=2,
+                        replace=False,
+                    )
+                )
+
+                idx1 = int(idx1)
+                idx2 = int(idx2)
 
             score = _compute_pair_score(
                 embeddings1[idx1],
                 embeddings2[idx2],
                 method=matching_method,
             )
-            scores.append(score)
-            labels_pair.append(1)
 
-        # Imposter Pairs
-        all_s1 = list(s1_idx.keys())
-        all_s2 = list(s2_idx.keys())
-        for _ in range(num_pairs // 2):
-            s_a = np.random.choice(all_s1)
-            possible_b = [s for s in all_s2 if s != s_a]
-            if not possible_b: continue
-            s_b = np.random.choice(possible_b)
-            
-            idx1 = np.random.choice(s1_idx[s_a])
-            idx2 = np.random.choice(s2_idx[s_b])
-            
-            score = _compute_pair_score(embeddings1[idx1], embeddings2[idx2], method=matching_method)
-            scores.append(score)
-            labels_pair.append(0)
+            scores.append(
+                score
+            )
 
-    # --------------------------------------------------------
-    # MODE C: RANDOM
-    # --------------------------------------------------------
-    elif sampling_mode == "random":
-        indices1 = np.arange(len(labels1))
-        indices2 = np.arange(len(labels2))
-        for _ in range(num_pairs):
-            i1 = np.random.choice(indices1)
-            i2 = np.random.choice(indices2)
-            
-            if not match_two_sets and i1 == i2: continue
-            
-            score = _compute_pair_score(embeddings1[i1], embeddings2[i2], method=matching_method)
-            scores.append(score)
-            labels_pair.append(1 if labels1[i1] == labels2[i2] else 0)
-            
-    return np.array(scores), np.array(labels_pair)
+            labels_pair.append(
+                1
+            )
+
+        all_s1 = list(
+            s1_idx.keys()
+        )
+
+        all_s2 = list(
+            s2_idx.keys()
+        )
+
+        for _ in range(
+            resolved_budget // 2
+        ):
+            subject_a = rng.choice(
+                all_s1
+            )
+
+            possible_b = [
+                subject
+                for subject in all_s2
+                if subject != subject_a
+            ]
+
+            if not possible_b:
+                continue
+
+            subject_b = rng.choice(
+                possible_b
+            )
+
+            idx1 = int(
+                rng.choice(
+                    s1_idx[subject_a]
+                )
+            )
+
+            idx2 = int(
+                rng.choice(
+                    s2_idx[subject_b]
+                )
+            )
+
+            score = _compute_pair_score(
+                embeddings1[idx1],
+                embeddings2[idx2],
+                method=matching_method,
+            )
+
+            scores.append(
+                score
+            )
+
+            labels_pair.append(
+                0
+            )
+
+    elif resolved_mode == "random":
+        indices1 = np.arange(
+            len(labels1)
+        )
+
+        indices2 = np.arange(
+            len(labels2)
+        )
+
+        for _ in range(
+            resolved_budget
+        ):
+            idx1 = int(
+                rng.choice(
+                    indices1
+                )
+            )
+
+            idx2 = int(
+                rng.choice(
+                    indices2
+                )
+            )
+
+            if (
+                not match_two_sets
+                and idx1 == idx2
+            ):
+                continue
+
+            score = _compute_pair_score(
+                embeddings1[idx1],
+                embeddings2[idx2],
+                method=matching_method,
+            )
+
+            scores.append(
+                score
+            )
+
+            labels_pair.append(
+                int(
+                    labels1[idx1]
+                    == labels2[idx2]
+                )
+            )
+
+    return (
+        np.asarray(scores),
+        np.asarray(labels_pair),
+    )
+
 
 # =============================================================================
 # HELPER: PREPROCESSING & OUTLIER FILTERING

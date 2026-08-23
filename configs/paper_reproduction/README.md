@@ -29,7 +29,10 @@ Filenames encode dataset, protocol, evaluation setting, task number, and task ty
 - Butterworth band-pass filtering from 0.5 to 40 Hz, order 4
 - Z-score normalization
 - Mean template fusion using all available enrollment beats (`template_size: null`)
-- Probe fusion size 3, cosine matching, balanced verification sampling
+- Probe fusion size 3 and cosine matching. Verification uses
+  `pair_sampling_mode: all_genuine`: every genuine comparison is retained,
+  while at most 1,000,000 impostor comparisons are sampled uniformly without
+  replacement (`max_impostor_pairs: 1000000`, `pair_sampling_seed: 42`).
 - ECG-ID filtered hardware channel (`signal_type` appears only in the ECG-ID
   files, because no other loader reads it)
 - Data cache and weight cache both enabled

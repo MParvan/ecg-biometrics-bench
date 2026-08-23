@@ -49,7 +49,7 @@ from scipy import stats
 from utils import (
     _apply_score_fusion, _source_order_indices, _make_loader, _encode_labels, _get_device, _set_seed,
     _apply_outlier_filter, _compute_sqi, _compute_score_matrix,
-    _get_embeddings, _create_templates, _generate_pairs,
+    _get_embeddings, _create_templates, _generate_pairs, _resolve_pair_sampling_arguments,
     _find_optimal_threshold, _evaluate_with_global_threshold, _summarize_verification_pairs,
     _build_identification_curve_artifacts,
     _build_verification_curve_artifacts,
@@ -4595,7 +4595,7 @@ def run_closed_set_identification(x, y, model_class, epochs=150, batch_size=256,
         lr (float): Learning rate for the Adam optimizer.
         test_split (float): Fraction of the data to hold out for testing (0.0 to 1.0).
         val_split (float): Fraction of the training data to use for early stopping validation.
-        seed (int): Training/general stochastic seed controlling model initialization, training DataLoader shuffling, augmentation, and other stochastic operations not governed by split_seed (such as validation-EER pair sampling and verification-pair sampling in the balanced/random modes). When split_seed is None, seed also supplies the resolved data-role allocation seed.
+        seed (int): Training/general stochastic seed controlling model initialization, training DataLoader shuffling, augmentation, and other stochastic operations not governed by split_seed (such as validation-EER pair sampling). When split_seed is None, seed also supplies the resolved data-role allocation seed.
         split_seed (int or None): Optional seed for randomized data-role allocation such as train/test beat splits, subject-cohort splits, and validation allocation. None follows the current per-run training seed; an explicit integer holds the randomized partition fixed across training seeds where such a partition exists.
         device (str): Computation device ('cuda', 'cpu', or 'auto').
         visualize (bool): If True, displays and optionally saves a Confusion Matrix.
@@ -5139,8 +5139,8 @@ def run_closed_set_identification(x, y, model_class, epochs=150, batch_size=256,
 # TASK 2: CLOSED-SET VERIFICATION
 # =============================================================================
 def run_closed_set_verification(x, y, model_class, epochs=150, batch_size=256, lr=1e-3,
-                                test_split=0.2, val_split=0.0, num_pairs=10000, 
-                                sampling_mode="all", seed=42, device=None, visualize=False,
+                                test_split=0.2, val_split=0.0, num_pairs=None,
+                                sampling_mode=None, seed=42, device=None, visualize=False,
                                 use_template=False, template_fusion_method='mean', 
                                 template_size=None, matching_method='cosine',
                                 outlier_filtering_on_train=False, outlier_filtering_on_test=False, 
@@ -5149,7 +5149,12 @@ def run_closed_set_verification(x, y, model_class, epochs=150, batch_size=256, l
                                 save_results_and_settings=False, 
                                 loader=None, n_runs=1, _return_stats=False,
                                 intelligent_weight_loading=True,
-                                augmentation_config=None, split_seed=None, provenance=None):
+                                augmentation_config=None, split_seed=None, provenance=None,
+        *,
+        pair_sampling_budget=None,
+        pair_sampling_mode=None,
+        max_impostor_pairs=1000000,
+        pair_sampling_seed=42):
     """
     Standard Closed-Set Verification Pipeline (Intra-session).
     Determines "Is this person who they claim to be?" (1:1 matching) for subjects known to the model.
@@ -5163,10 +5168,13 @@ def run_closed_set_verification(x, y, model_class, epochs=150, batch_size=256, l
         lr (float): Learning rate for the Adam optimizer.
         test_split (float): Fraction of the data to hold out for testing (0.0 to 1.0).
         val_split (float): Fraction of the training data to use for early stopping.
-        num_pairs (int): Total number of Genuine and Impostor pairs to generate for evaluation.
-        sampling_mode (str): Logic used to pair beats together.
-            Options: ['all', 'balanced', 'random']
-        seed (int): Training/general stochastic seed controlling model initialization, training DataLoader shuffling, augmentation, and other stochastic operations not governed by split_seed (such as validation-EER pair sampling and verification-pair sampling in the balanced/random modes). When split_seed is None, seed also supplies the resolved data-role allocation seed.
+        pair_sampling_mode (str or None): Verification comparison strategy. Options: ['all', 'all_genuine', 'balanced', 'random'].
+        pair_sampling_budget (int or None): Requested comparison budget for balanced and random sampling.
+        max_impostor_pairs (int): Maximum number of impostor comparisons retained by all_genuine.
+        pair_sampling_seed (int): Dedicated seed for stochastic verification-pair sampling.
+        num_pairs (int or None): Legacy alias for pair_sampling_budget.
+        sampling_mode (str or None): Legacy alias for pair_sampling_mode.
+        seed (int): Training/general stochastic seed controlling model initialization, training DataLoader shuffling, augmentation, and other stochastic operations not governed by split_seed (such as validation-EER pair sampling). When split_seed is None, seed also supplies the resolved data-role allocation seed.
         split_seed (int or None): Optional seed for randomized data-role allocation such as train/test beat splits, subject-cohort splits, and validation allocation. None follows the current per-run training seed; an explicit integer holds the randomized partition fixed across training seeds where such a partition exists.
         device (str): Computation device ('cuda', 'cpu', or 'auto').
         visualize (bool): If True, generates t-SNE scatter plots of the test embeddings.
@@ -5202,6 +5210,22 @@ def run_closed_set_verification(x, y, model_class, epochs=150, batch_size=256, l
         "Closed-Set Verification",
     )
 
+    (
+        pair_sampling_mode,
+        pair_sampling_budget,
+    ) = _resolve_pair_sampling_arguments(
+        pair_sampling_mode=pair_sampling_mode,
+        pair_sampling_budget=pair_sampling_budget,
+        sampling_mode=sampling_mode,
+        num_pairs=num_pairs,
+    )
+
+    if pair_sampling_mode not in {
+        "balanced",
+        "random",
+    }:
+        pair_sampling_budget = None
+
     # ====================================================
     # 0. Capture Hyperparameters for Logger & MULTI-RUN AGGREGATOR
     # ====================================================
@@ -5216,6 +5240,35 @@ def run_closed_set_verification(x, y, model_class, epochs=150, batch_size=256, l
         'outlier_filter_test': outlier_filtering_on_test,
         'use_deployment_eval': use_deployment_evaluation
     }
+
+    hyperparams.pop(
+        "num_pairs",
+        None,
+    )
+    hyperparams.pop(
+        "sampling_mode",
+        None,
+    )
+    hyperparams.update(
+        {
+            "pair_sampling_mode": pair_sampling_mode,
+            "pair_sampling_budget": pair_sampling_budget,
+            "max_impostor_pairs": (
+                max_impostor_pairs
+                if pair_sampling_mode == "all_genuine"
+                else None
+            ),
+            "pair_sampling_seed": (
+                pair_sampling_seed
+                if pair_sampling_mode in {
+                    "all_genuine",
+                    "balanced",
+                    "random",
+                }
+                else None
+            ),
+        }
+    )
 
     hyperparams = _add_seed_metadata(
         hyperparams,
@@ -5582,7 +5635,7 @@ def run_closed_set_verification(x, y, model_class, epochs=150, batch_size=256, l
         print(f"[INFO] Generating Calibration Pairs to find Global Threshold...")
         calib_scores, calib_pair_labels = _generate_pairs(
             embeddings1=calib_emb, labels1=calib_lab, embeddings2=None, labels2=None,
-            num_pairs=num_pairs, sampling_mode=sampling_mode, matching_method=matching_method
+            pair_sampling_budget=pair_sampling_budget, pair_sampling_mode=pair_sampling_mode, max_impostor_pairs=max_impostor_pairs, pair_sampling_seed=pair_sampling_seed, matching_method=matching_method
         )
         global_threshold = _find_optimal_threshold(calib_scores, calib_pair_labels)
         print(f"[INFO] Optimal Global Threshold Found: {global_threshold:.4f}")
@@ -5601,9 +5654,9 @@ def run_closed_set_verification(x, y, model_class, epochs=150, batch_size=256, l
             labels1=test_lab, 
             embeddings2=None, # None forces Test vs Test matching
             labels2=None, 
-            num_pairs=num_pairs, 
-            sampling_mode=sampling_mode, 
-            matching_method=matching_method
+            pair_sampling_budget=pair_sampling_budget,
+            pair_sampling_mode=pair_sampling_mode,
+            max_impostor_pairs=max_impostor_pairs, pair_sampling_seed=pair_sampling_seed, matching_method=matching_method
         )
     else:
         # STRATEGY B: Test vs Train Templates (Authentication Simulation)
@@ -5622,9 +5675,9 @@ def run_closed_set_verification(x, y, model_class, epochs=150, batch_size=256, l
             labels1=test_lab, 
             embeddings2=templates, # Enrollment
             labels2=temp_labels, 
-            num_pairs=num_pairs, 
-            sampling_mode=sampling_mode, 
-            matching_method=matching_method
+            pair_sampling_budget=pair_sampling_budget,
+            pair_sampling_mode=pair_sampling_mode,
+            max_impostor_pairs=max_impostor_pairs, pair_sampling_seed=pair_sampling_seed, matching_method=matching_method
         )
         
     if visualize:
@@ -5698,6 +5751,7 @@ def run_closed_set_verification(x, y, model_class, epochs=150, batch_size=256, l
     return eer, auc_val, dprime, tar
 
 
+
 # =============================================================================
 # TASK 3: SUBJECT-DISJOINT IDENTIFICATION (TEMPLATE MATCHING)
 # =============================================================================
@@ -5726,7 +5780,7 @@ def run_subject_disjoint_identification(x, y, model_class, epochs=150, batch_siz
         lr (float): Learning rate for the Adam optimizer.
         test_split (float): Fraction of unique SUBJECTS to hold out for the disjoint test set.
         val_split (float): Fraction of training subjects to use for early stopping.
-        seed (int): Training/general stochastic seed controlling model initialization, training DataLoader shuffling, augmentation, and other stochastic operations not governed by split_seed (such as validation-EER pair sampling and verification-pair sampling in the balanced/random modes). When split_seed is None, seed also supplies the resolved data-role allocation seed.
+        seed (int): Training/general stochastic seed controlling model initialization, training DataLoader shuffling, augmentation, and other stochastic operations not governed by split_seed (such as validation-EER pair sampling). When split_seed is None, seed also supplies the resolved data-role allocation seed.
         split_seed (int or None): Optional seed for randomized data-role allocation such as train/test beat splits, subject-cohort splits, and validation allocation. None follows the current per-run training seed; an explicit integer holds the randomized partition fixed across training seeds where such a partition exists.
         device (str): Computation device ('cuda', 'cpu', or 'auto').
         visualize (bool): If True, generates t-SNE scatter plots of the unseen embeddings.
@@ -6293,8 +6347,8 @@ def run_subject_disjoint_identification(x, y, model_class, epochs=150, batch_siz
 # TASK 4: SUBJECT-DISJOINT VERIFICATION
 # =============================================================================
 def run_subject_disjoint_verification(x, y, model_class, epochs=150, batch_size=256, lr=1e-3, 
-                                      test_split=0.2, val_split=0.0, num_pairs=10000, 
-                                      sampling_mode="all", seed=42, device=None, 
+                                      test_split=0.2, val_split=0.0, num_pairs=None,
+                                      sampling_mode=None, seed=42, device=None,
                                       visualize=False, use_template=False, template_fusion_method='mean', 
                                       template_size=1, matching_method='cosine',
                                       outlier_filtering_on_train=False, outlier_filtering_on_test=False, 
@@ -6303,7 +6357,12 @@ def run_subject_disjoint_verification(x, y, model_class, epochs=150, batch_size=
                                       save_results_and_settings=False, 
                                       loader=None, n_runs=1, _return_stats=False,
                                       intelligent_weight_loading=True,
-                                      augmentation_config=None, split_seed=None, provenance=None):
+                                      augmentation_config=None, split_seed=None, provenance=None,
+        *,
+        pair_sampling_budget=None,
+        pair_sampling_mode=None,
+        max_impostor_pairs=1000000,
+        pair_sampling_seed=42):
     """
     Subject-Disjoint Verification Pipeline (Subject-Disjoint 1:1 Matching).
     Tests the system's ability to verify the identity of completely new users.
@@ -6318,10 +6377,13 @@ def run_subject_disjoint_verification(x, y, model_class, epochs=150, batch_size=
         lr (float): Learning rate for the Adam optimizer.
         test_split (float): Fraction of unique SUBJECTS to hold out for the disjoint test set.
         val_split (float): Fraction of training subjects to use for early stopping.
-        num_pairs (int): Total number of Genuine and Impostor pairs to generate.
-        sampling_mode (str): Logic used to pair beats together.
-            Options: ['all', 'balanced', 'random']
-        seed (int): Training/general stochastic seed controlling model initialization, training DataLoader shuffling, augmentation, and other stochastic operations not governed by split_seed (such as validation-EER pair sampling and verification-pair sampling in the balanced/random modes). When split_seed is None, seed also supplies the resolved data-role allocation seed.
+        pair_sampling_mode (str or None): Verification comparison strategy. Options: ['all', 'all_genuine', 'balanced', 'random'].
+        pair_sampling_budget (int or None): Requested comparison budget for balanced and random sampling.
+        max_impostor_pairs (int): Maximum number of impostor comparisons retained by all_genuine.
+        pair_sampling_seed (int): Dedicated seed for stochastic verification-pair sampling.
+        num_pairs (int or None): Legacy alias for pair_sampling_budget.
+        sampling_mode (str or None): Legacy alias for pair_sampling_mode.
+        seed (int): Training/general stochastic seed controlling model initialization, training DataLoader shuffling, augmentation, and other stochastic operations not governed by split_seed (such as validation-EER pair sampling). When split_seed is None, seed also supplies the resolved data-role allocation seed.
         split_seed (int or None): Optional seed for randomized data-role allocation such as train/test beat splits, subject-cohort splits, and validation allocation. None follows the current per-run training seed; an explicit integer holds the randomized partition fixed across training seeds where such a partition exists.
         device (str): Computation device ('cuda', 'cpu', or 'auto').
         visualize (bool): If True, generates t-SNE scatter plots of the unseen embeddings.
@@ -6356,6 +6418,22 @@ def run_subject_disjoint_verification(x, y, model_class, epochs=150, batch_size=
         "Subject-Disjoint Verification",
     )
 
+    (
+        pair_sampling_mode,
+        pair_sampling_budget,
+    ) = _resolve_pair_sampling_arguments(
+        pair_sampling_mode=pair_sampling_mode,
+        pair_sampling_budget=pair_sampling_budget,
+        sampling_mode=sampling_mode,
+        num_pairs=num_pairs,
+    )
+
+    if pair_sampling_mode not in {
+        "balanced",
+        "random",
+    }:
+        pair_sampling_budget = None
+
     # ====================================================
     # 0. Capture Hyperparameters for Logger & MULTI-RUN AGGREGATOR
     # ====================================================
@@ -6367,6 +6445,35 @@ def run_subject_disjoint_verification(x, y, model_class, epochs=150, batch_size=
         'template_size': template_size, 'matching_method': matching_method, 
         'outlier_filter_train': outlier_filtering_on_train, 'outlier_filter_test': outlier_filtering_on_test
     }
+
+    hyperparams.pop(
+        "num_pairs",
+        None,
+    )
+    hyperparams.pop(
+        "sampling_mode",
+        None,
+    )
+    hyperparams.update(
+        {
+            "pair_sampling_mode": pair_sampling_mode,
+            "pair_sampling_budget": pair_sampling_budget,
+            "max_impostor_pairs": (
+                max_impostor_pairs
+                if pair_sampling_mode == "all_genuine"
+                else None
+            ),
+            "pair_sampling_seed": (
+                pair_sampling_seed
+                if pair_sampling_mode in {
+                    "all_genuine",
+                    "balanced",
+                    "random",
+                }
+                else None
+            ),
+        }
+    )
 
     hyperparams = _add_seed_metadata(
         hyperparams,
@@ -6774,7 +6881,7 @@ def run_subject_disjoint_verification(x, y, model_class, epochs=150, batch_size=
         print(f"[INFO] Generating Calibration Pairs to find Global Threshold...")
         calib_scores, calib_pair_labels = _generate_pairs(
             embeddings1=calib_emb, labels1=calib_lab, embeddings2=None, labels2=None,
-            num_pairs=num_pairs, sampling_mode=sampling_mode, matching_method=matching_method
+            pair_sampling_budget=pair_sampling_budget, pair_sampling_mode=pair_sampling_mode, max_impostor_pairs=max_impostor_pairs, pair_sampling_seed=pair_sampling_seed, matching_method=matching_method
         )
         global_threshold = _find_optimal_threshold(calib_scores, calib_pair_labels)
         print(f"[INFO] Optimal Global Threshold Found: {global_threshold:.4f}")
@@ -6790,7 +6897,7 @@ def run_subject_disjoint_verification(x, y, model_class, epochs=150, batch_size=
         scores, labels_pair = _generate_pairs(
             embeddings1=test_emb, labels1=test_lab, 
             embeddings2=None, labels2=None, 
-            num_pairs=num_pairs, sampling_mode=sampling_mode, matching_method=matching_method
+            pair_sampling_budget=pair_sampling_budget, pair_sampling_mode=pair_sampling_mode, max_impostor_pairs=max_impostor_pairs, pair_sampling_seed=pair_sampling_seed, matching_method=matching_method
         )
     else:
         print(
@@ -6830,7 +6937,7 @@ def run_subject_disjoint_verification(x, y, model_class, epochs=150, batch_size=
         scores, labels_pair = _generate_pairs(
             embeddings1=emb_probe, labels1=lab_probe, 
             embeddings2=templates, labels2=temp_labels, 
-            num_pairs=num_pairs, sampling_mode=sampling_mode, matching_method=matching_method
+            pair_sampling_budget=pair_sampling_budget, pair_sampling_mode=pair_sampling_mode, max_impostor_pairs=max_impostor_pairs, pair_sampling_seed=pair_sampling_seed, matching_method=matching_method
         )
         
     if visualize:
@@ -6905,6 +7012,7 @@ def run_subject_disjoint_verification(x, y, model_class, epochs=150, batch_size=
         )
 
     return eer, auc_val, dprime, tar
+
 
 
 # =============================================================================
@@ -7026,7 +7134,7 @@ def run_cross_session_identification(x_train, y_train, x_test, y_test, model_cla
         batch_size (int): Number of samples per training batch.
         lr (float): Learning rate for the Adam optimizer.
         val_split (float): Fraction of Session 1 data to use for early stopping.
-        seed (int): Training/general stochastic seed controlling model initialization, training DataLoader shuffling, augmentation, and other stochastic operations not governed by split_seed (such as validation-EER pair sampling and verification-pair sampling in the balanced/random modes). When split_seed is None, seed also supplies the resolved data-role allocation seed.
+        seed (int): Training/general stochastic seed controlling model initialization, training DataLoader shuffling, augmentation, and other stochastic operations not governed by split_seed (such as validation-EER pair sampling). When split_seed is None, seed also supplies the resolved data-role allocation seed.
         split_seed (int or None): Optional seed for randomized data-role allocation such as train/test beat splits, subject-cohort splits, and validation allocation. None follows the current per-run training seed; an explicit integer holds the randomized partition fixed across training seeds where such a partition exists. For cross-session tasks the evaluation partition is protocol-defined and fixed; split_seed affects only a randomized validation allocation when validation is active.
         device (str): Computation device ('cuda', 'cpu', or 'auto').
         visualize (bool): If True, generates t-SNE scatter plots of the cross-session embeddings.
@@ -7564,8 +7672,8 @@ def run_cross_session_identification(x_train, y_train, x_test, y_test, model_cla
 # TASK 6: CROSS-SESSION VERIFICATION
 # =============================================================================
 def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class, epochs=150, 
-                                   batch_size=256, lr=1e-3, val_split=0.0, num_pairs=10000, 
-                                   sampling_mode="all", seed=42, device=None, visualize=False, 
+                                   batch_size=256, lr=1e-3, val_split=0.0, num_pairs=None,
+                                   sampling_mode=None, seed=42, device=None, visualize=False,
                                    use_template=False, template_fusion_method='mean', template_size=None, 
                                    matching_method='cosine', outlier_filtering_on_train=False, 
                                    outlier_filtering_on_test=False, sqi_train=None, sqi_test=None, 
@@ -7575,7 +7683,12 @@ def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class
                                    n_runs=1, _return_stats=False,
                                    intelligent_weight_loading=True,
                                    augmentation_config=None, split_seed=None, provenance_s1=None, provenance_s2=None,
-                                   x_enroll=None, y_enroll=None, provenance_enroll=None):
+                                   x_enroll=None, y_enroll=None, provenance_enroll=None,
+        *,
+        pair_sampling_budget=None,
+        pair_sampling_mode=None,
+        max_impostor_pairs=1000000,
+        pair_sampling_seed=42):
     """
     Cross-session verification with protocol-defined data roles.
 
@@ -7592,10 +7705,13 @@ def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class
         batch_size (int): Number of samples per training batch.
         lr (float): Learning rate for the Adam optimizer.
         val_split (float): Fraction of Session 1 data to use for early stopping.
-        num_pairs (int): Total number of Genuine and Impostor pairs to generate.
-        sampling_mode (str): Logic used to pair beats together.
-            Options: ['all', 'balanced', 'random']
-        seed (int): Training/general stochastic seed controlling model initialization, training DataLoader shuffling, augmentation, and other stochastic operations not governed by split_seed (such as validation-EER pair sampling and verification-pair sampling in the balanced/random modes). When split_seed is None, seed also supplies the resolved data-role allocation seed.
+        pair_sampling_mode (str or None): Verification comparison strategy. Options: ['all', 'all_genuine', 'balanced', 'random'].
+        pair_sampling_budget (int or None): Requested comparison budget for balanced and random sampling.
+        max_impostor_pairs (int): Maximum number of impostor comparisons retained by all_genuine.
+        pair_sampling_seed (int): Dedicated seed for stochastic verification-pair sampling.
+        num_pairs (int or None): Legacy alias for pair_sampling_budget.
+        sampling_mode (str or None): Legacy alias for pair_sampling_mode.
+        seed (int): Training/general stochastic seed controlling model initialization, training DataLoader shuffling, augmentation, and other stochastic operations not governed by split_seed (such as validation-EER pair sampling). When split_seed is None, seed also supplies the resolved data-role allocation seed.
         split_seed (int or None): Optional seed for randomized data-role allocation such as train/test beat splits, subject-cohort splits, and validation allocation. None follows the current per-run training seed; an explicit integer holds the randomized partition fixed across training seeds where such a partition exists. For cross-session tasks the evaluation partition is protocol-defined and fixed; split_seed affects only a randomized validation allocation when validation is active.
         device (str): Computation device ('cuda', 'cpu', or 'auto').
         visualize (bool): If True, generates t-SNE scatter plots of the cross-session embeddings.
@@ -7631,6 +7747,22 @@ def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class
         "Cross-Session Verification",
     )
     
+    (
+        pair_sampling_mode,
+        pair_sampling_budget,
+    ) = _resolve_pair_sampling_arguments(
+        pair_sampling_mode=pair_sampling_mode,
+        pair_sampling_budget=pair_sampling_budget,
+        sampling_mode=sampling_mode,
+        num_pairs=num_pairs,
+    )
+
+    if pair_sampling_mode not in {
+        "balanced",
+        "random",
+    }:
+        pair_sampling_budget = None
+
     # ====================================================
     # 0. Capture Hyperparameters for Logger & MULTI-RUN AGGREGATOR
     # ====================================================
@@ -7641,6 +7773,35 @@ def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class
         'matching_method': matching_method, 'val_split': val_split,
         'outlier_filter_train': outlier_filtering_on_train, 'outlier_filter_test': outlier_filtering_on_test
     }
+
+    hyperparams.pop(
+        "num_pairs",
+        None,
+    )
+    hyperparams.pop(
+        "sampling_mode",
+        None,
+    )
+    hyperparams.update(
+        {
+            "pair_sampling_mode": pair_sampling_mode,
+            "pair_sampling_budget": pair_sampling_budget,
+            "max_impostor_pairs": (
+                max_impostor_pairs
+                if pair_sampling_mode == "all_genuine"
+                else None
+            ),
+            "pair_sampling_seed": (
+                pair_sampling_seed
+                if pair_sampling_mode in {
+                    "all_genuine",
+                    "balanced",
+                    "random",
+                }
+                else None
+            ),
+        }
+    )
 
     hyperparams = _add_seed_metadata(
         hyperparams,
@@ -8067,7 +8228,7 @@ def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class
         print(f"[INFO] Generating Calibration Pairs to find Global Threshold...")
         calib_scores, calib_pair_labels = _generate_pairs(
             embeddings1=calib_emb, labels1=calib_lab, embeddings2=None, labels2=None,
-            num_pairs=num_pairs, sampling_mode=sampling_mode, matching_method=matching_method
+            pair_sampling_budget=pair_sampling_budget, pair_sampling_mode=pair_sampling_mode, max_impostor_pairs=max_impostor_pairs, pair_sampling_seed=pair_sampling_seed, matching_method=matching_method
         )
         global_threshold = _find_optimal_threshold(calib_scores, calib_pair_labels)
         print(f"[INFO] Optimal Global Threshold Found: {global_threshold:.4f}")
@@ -8085,9 +8246,9 @@ def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class
             labels1=lab_probe, 
             embeddings2=None, # None forces test vs test matching
             labels2=None, 
-            num_pairs=num_pairs, 
-            sampling_mode=sampling_mode, 
-            matching_method=matching_method
+            pair_sampling_budget=pair_sampling_budget,
+            pair_sampling_mode=pair_sampling_mode,
+            max_impostor_pairs=max_impostor_pairs, pair_sampling_seed=pair_sampling_seed, matching_method=matching_method
         )
     else:
         # STRATEGY B: enrollment-template verification
@@ -8113,9 +8274,9 @@ def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class
             labels1=lab_probe, 
             embeddings2=templates,
             labels2=temp_labels, 
-            num_pairs=num_pairs, 
-            sampling_mode=sampling_mode, 
-            matching_method=matching_method
+            pair_sampling_budget=pair_sampling_budget,
+            pair_sampling_mode=pair_sampling_mode,
+            max_impostor_pairs=max_impostor_pairs, pair_sampling_seed=pair_sampling_seed, matching_method=matching_method
         )
 
     if visualize:
@@ -8195,6 +8356,7 @@ def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class
     return eer, auc_val, dprime, tar
 
 
+
 # =============================================================================
 # TASK 7: SUBJECT-DISJOINT CROSS-SESSION IDENTIFICATION
 # =============================================================================
@@ -8224,7 +8386,7 @@ def run_subject_disjoint_cross_session_identification(
         lr (float): Learning rate for the Adam optimizer.
         test_split (float): Fraction of unique SUBJECTS to isolate for the Group B tests.
         val_split (float): Fraction of Group A subjects to use for early stopping validation.
-        seed (int): Training/general stochastic seed controlling model initialization, training DataLoader shuffling, augmentation, and other stochastic operations not governed by split_seed (such as validation-EER pair sampling and verification-pair sampling in the balanced/random modes). When split_seed is None, seed also supplies the resolved data-role allocation seed.
+        seed (int): Training/general stochastic seed controlling model initialization, training DataLoader shuffling, augmentation, and other stochastic operations not governed by split_seed (such as validation-EER pair sampling). When split_seed is None, seed also supplies the resolved data-role allocation seed.
         split_seed (int or None): Optional seed for randomized data-role allocation such as train/test beat splits, subject-cohort splits, and validation allocation. None follows the current per-run training seed; an explicit integer holds the randomized partition fixed across training seeds where such a partition exists.
         device (str): Computation device ('cuda', 'cpu', or 'auto').
         visualize (bool): If True, generates t-SNE scatter plots of the unseen temporal embeddings.
@@ -8769,14 +8931,19 @@ def run_subject_disjoint_cross_session_identification(
 # =============================================================================
 def run_subject_disjoint_cross_session_verification(
         x_s1, y_s1, x_s2, y_s2, model_class, epochs=150, batch_size=256, lr=1e-3, test_split=0.2, val_split=0.0, 
-        num_pairs=10000, sampling_mode="all", seed=42, device=None, visualize=False, use_template=False, 
+        num_pairs=None, sampling_mode=None, seed=42, device=None, visualize=False, use_template=False,
         template_fusion_method='mean', template_size=None, matching_method='cosine', outlier_filtering_on_train=False, 
         outlier_filtering_on_test=False, sqi_s1=None, sqi_s2=None, sqi_threshold=0.05, sqi_keep_pct=0.8,
         use_deployment_evaluation=False, target_fars=None,
         save_results_and_settings=False, loader=None, n_runs=1, _return_stats=False,
         intelligent_weight_loading=True,
         augmentation_config=None, split_seed=None, provenance_s1=None, provenance_s2=None,
-        x_enroll=None, y_enroll=None, provenance_enroll=None):
+        x_enroll=None, y_enroll=None, provenance_enroll=None,
+        *,
+        pair_sampling_budget=None,
+        pair_sampling_mode=None,
+        max_impostor_pairs=1000000,
+        pair_sampling_seed=42):
     """
     Subject-disjoint cross-session verification.
 
@@ -8795,10 +8962,13 @@ def run_subject_disjoint_cross_session_verification(
         lr (float): Learning rate for the Adam optimizer.
         test_split (float): Fraction of unique SUBJECTS to isolate for the Group B tests.
         val_split (float): Fraction of Group A subjects to use for early stopping validation.
-        num_pairs (int): Total number of Genuine and Impostor pairs to generate for evaluation.
-        sampling_mode (str): Logic used to pair beats together.
-            Options: ['all', 'balanced', 'random']
-        seed (int): Training/general stochastic seed controlling model initialization, training DataLoader shuffling, augmentation, and other stochastic operations not governed by split_seed (such as validation-EER pair sampling and verification-pair sampling in the balanced/random modes). When split_seed is None, seed also supplies the resolved data-role allocation seed.
+        pair_sampling_mode (str or None): Verification comparison strategy. Options: ['all', 'all_genuine', 'balanced', 'random'].
+        pair_sampling_budget (int or None): Requested comparison budget for balanced and random sampling.
+        max_impostor_pairs (int): Maximum number of impostor comparisons retained by all_genuine.
+        pair_sampling_seed (int): Dedicated seed for stochastic verification-pair sampling.
+        num_pairs (int or None): Legacy alias for pair_sampling_budget.
+        sampling_mode (str or None): Legacy alias for pair_sampling_mode.
+        seed (int): Training/general stochastic seed controlling model initialization, training DataLoader shuffling, augmentation, and other stochastic operations not governed by split_seed (such as validation-EER pair sampling). When split_seed is None, seed also supplies the resolved data-role allocation seed.
         split_seed (int or None): Optional seed for randomized data-role allocation such as train/test beat splits, subject-cohort splits, and validation allocation. None follows the current per-run training seed; an explicit integer holds the randomized partition fixed across training seeds where such a partition exists.
         device (str): Computation device ('cuda', 'cpu', or 'auto').
         visualize (bool): If True, generates t-SNE scatter plots of the unseen temporal embeddings.
@@ -8834,6 +9004,22 @@ def run_subject_disjoint_cross_session_verification(
         "Subject-Disjoint Cross-Session Verification",
     )
     
+    (
+        pair_sampling_mode,
+        pair_sampling_budget,
+    ) = _resolve_pair_sampling_arguments(
+        pair_sampling_mode=pair_sampling_mode,
+        pair_sampling_budget=pair_sampling_budget,
+        sampling_mode=sampling_mode,
+        num_pairs=num_pairs,
+    )
+
+    if pair_sampling_mode not in {
+        "balanced",
+        "random",
+    }:
+        pair_sampling_budget = None
+
     # ====================================================
     # 0. Capture Hyperparameters for Logger & MULTI-RUN AGGREGATOR
     # ====================================================
@@ -8844,6 +9030,35 @@ def run_subject_disjoint_cross_session_verification(
         'template_size': template_size, 'matching_method': matching_method, 'outlier_filter_train': outlier_filtering_on_train, 
         'outlier_filter_test': outlier_filtering_on_test
     }
+
+    hyperparams.pop(
+        "num_pairs",
+        None,
+    )
+    hyperparams.pop(
+        "sampling_mode",
+        None,
+    )
+    hyperparams.update(
+        {
+            "pair_sampling_mode": pair_sampling_mode,
+            "pair_sampling_budget": pair_sampling_budget,
+            "max_impostor_pairs": (
+                max_impostor_pairs
+                if pair_sampling_mode == "all_genuine"
+                else None
+            ),
+            "pair_sampling_seed": (
+                pair_sampling_seed
+                if pair_sampling_mode in {
+                    "all_genuine",
+                    "balanced",
+                    "random",
+                }
+                else None
+            ),
+        }
+    )
 
     hyperparams = _add_seed_metadata(
         hyperparams,
@@ -9279,7 +9494,7 @@ def run_subject_disjoint_cross_session_verification(
         calib_scores, calib_pair_labels = _generate_pairs(
             embeddings1=calib_emb_s1, labels1=calib_lab_s1, 
             embeddings2=None, labels2=None,
-            num_pairs=num_pairs, sampling_mode=sampling_mode, matching_method=matching_method
+            pair_sampling_budget=pair_sampling_budget, pair_sampling_mode=pair_sampling_mode, max_impostor_pairs=max_impostor_pairs, pair_sampling_seed=pair_sampling_seed, matching_method=matching_method
         )
         global_threshold = _find_optimal_threshold(calib_scores, calib_pair_labels)
         print(f"[INFO] Optimal Global Threshold Found: {global_threshold:.4f}")
@@ -9295,7 +9510,7 @@ def run_subject_disjoint_cross_session_verification(
         scores, labels_pair = _generate_pairs(
             embeddings1=emb_probe, labels1=lab_probe, 
             embeddings2=None, labels2=None, 
-            num_pairs=num_pairs, sampling_mode=sampling_mode, matching_method=matching_method
+            pair_sampling_budget=pair_sampling_budget, pair_sampling_mode=pair_sampling_mode, max_impostor_pairs=max_impostor_pairs, pair_sampling_seed=pair_sampling_seed, matching_method=matching_method
         )
     else:
         print("[INFO] Building enrollment templates for unseen subjects...")
@@ -9315,9 +9530,9 @@ def run_subject_disjoint_cross_session_verification(
             labels1=lab_probe, 
             embeddings2=templates,
             labels2=temp_labels, 
-            num_pairs=num_pairs, 
-            sampling_mode=sampling_mode, 
-            matching_method=matching_method
+            pair_sampling_budget=pair_sampling_budget,
+            pair_sampling_mode=pair_sampling_mode,
+            max_impostor_pairs=max_impostor_pairs, pair_sampling_seed=pair_sampling_seed, matching_method=matching_method
         )
         
     if visualize:
@@ -9398,5 +9613,6 @@ def run_subject_disjoint_cross_session_verification(
         )
 
     return eer, auc_val, dprime, tar
+
 
 # =============================================================================

@@ -54,8 +54,9 @@ template_fusion_method: mean
 template_size: null
 probe_fusion_size: 3
 matching_method: cosine
-num_pairs: 10000
-sampling_mode: balanced
+max_impostor_pairs: 1000000
+pair_sampling_seed: 42
+pair_sampling_mode: all_genuine
 use_deployment_evaluation: false
 outlier_filtering_on_train: false
 outlier_filtering_on_test: false

@@ -108,6 +108,12 @@ Accordingly:
 - Verification evaluates genuine and impostor comparisons for the relevant
   evaluation cohort.
 
+Verification pair generation supports `all`, `all_genuine`, `balanced`, and
+`random`. The bundled paper-reproduction and model-comparison verification
+configs use `all_genuine`: every genuine comparison is retained, while at most
+1,000,000 impostor comparisons are sampled uniformly without replacement using
+a dedicated pair-sampling seed.
+
 ---
 
 ## 🗄️ Supported Datasets
@@ -287,7 +293,9 @@ python main.py \
   --use_template \
   --template_size 5 \
   --matching_method cosine \
-  --num_pairs 10000 \
+  --pair_sampling_mode all_genuine \
+  --max_impostor_pairs 1000000 \
+  --pair_sampling_seed 42 \
   --save_results
 ```
 
