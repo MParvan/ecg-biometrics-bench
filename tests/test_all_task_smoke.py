@@ -507,15 +507,15 @@ class AllTaskSmokeTests(unittest.TestCase):
             ],
             8,
         )
-        self.assertGreater(
+        self.assertEqual(
             data_statistics[
-                "Enrollment (S1) Samples"
+                "Enrollment Samples"
             ],
             0,
         )
         self.assertGreater(
             data_statistics[
-                "Probe (S2) Samples"
+                "Probe Samples"
             ],
             0,
         )
@@ -578,13 +578,13 @@ class AllTaskSmokeTests(unittest.TestCase):
         )
         self.assertGreater(
             data_statistics[
-                "Enrollment (S1) Samples"
+                "Enrollment Samples"
             ],
             0,
         )
         self.assertGreater(
             data_statistics[
-                "Probe (S2) Samples"
+                "Probe Samples"
             ],
             0,
         )
@@ -625,13 +625,13 @@ class AllTaskSmokeTests(unittest.TestCase):
         )
         self.assertGreater(
             data_statistics[
-                "Enrollment (S1) Samples"
+                "Enrollment Samples"
             ],
             0,
         )
         self.assertGreater(
             data_statistics[
-                "Probe (S2) Samples"
+                "Probe Samples"
             ],
             0,
         )

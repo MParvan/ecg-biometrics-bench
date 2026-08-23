@@ -2310,6 +2310,7 @@ def _split_closed_set_samples(
         },
     }
 
+
 def _partition_closed_set_cross_session_samples(
     x_session_1,
     y_session_1,
@@ -2317,73 +2318,111 @@ def _partition_closed_set_cross_session_samples(
     y_session_2,
     minimum_session_1_samples=2,
     minimum_session_2_samples=1,
+    x_enrollment=None,
+    y_enrollment=None,
+    minimum_enrollment_samples=1,
 ):
     """
-    Synchronise known-subject samples across two sessions.
+    Synchronize known identities across training, enrollment, and probe data.
 
-    Only identities present in both sessions and satisfying the configured
-    per-session sample requirements are retained. Original sample order is
-    preserved within each session.
+    The first and second session arguments retain their historical meaning as
+    training and probe inputs. When a separate enrollment partition is omitted,
+    enrollment reuses the training partition. This preserves the two-partition
+    interface while permitting an independent enrollment source.
 
-    Session 1 normally supplies representation-learning and enrollment
-    samples. Session 2 supplies probe samples.
+    Original sample order is preserved within every role.
     """
-    x_session_1 = np.asarray(
+    x_train = np.asarray(
         x_session_1
     )
-
-    y_session_1 = np.asarray(
+    y_train = np.asarray(
         y_session_1
     )
-
-    x_session_2 = np.asarray(
+    x_probe = np.asarray(
         x_session_2
     )
-
-    y_session_2 = np.asarray(
+    y_probe = np.asarray(
         y_session_2
     )
 
-    if x_session_1.ndim < 1:
+    if (
+        (x_enrollment is None)
+        != (y_enrollment is None)
+    ):
         raise ValueError(
-            "Session 1 samples must contain a sample dimension."
+            "x_enrollment and y_enrollment must either both "
+            "be provided or both be omitted."
         )
 
-    if x_session_2.ndim < 1:
-        raise ValueError(
-            "Session 2 samples must contain a sample dimension."
+    enrollment_reuses_training = (
+        x_enrollment is None
+    )
+
+    if enrollment_reuses_training:
+        x_enrollment = x_train
+        y_enrollment = y_train
+    else:
+        x_enrollment = np.asarray(
+            x_enrollment
+        )
+        y_enrollment = np.asarray(
+            y_enrollment
         )
 
-    if y_session_1.ndim != 1:
-        raise ValueError(
-            "Session 1 labels must be one-dimensional."
-        )
+    role_arrays = (
+        (
+            "Session 1"
+            if enrollment_reuses_training
+            else "Training",
+            x_train,
+            y_train,
+        ),
+        (
+            "Enrollment",
+            x_enrollment,
+            y_enrollment,
+        ),
+        (
+            "Session 2"
+            if enrollment_reuses_training
+            else "Probe",
+            x_probe,
+            y_probe,
+        ),
+    )
 
-    if y_session_2.ndim != 1:
-        raise ValueError(
-            "Session 2 labels must be one-dimensional."
-        )
+    for role_name, role_x, role_y in role_arrays:
+        if role_x.ndim < 1:
+            raise ValueError(
+                f"{role_name} samples must "
+                "contain a sample dimension."
+            )
 
-    if len(x_session_1) != len(y_session_1):
-        raise ValueError(
-            "Session 1 samples and labels are misaligned."
-        )
+        if role_y.ndim != 1:
+            raise ValueError(
+                f"{role_name} labels must "
+                "be one-dimensional."
+            )
 
-    if len(x_session_2) != len(y_session_2):
-        raise ValueError(
-            "Session 2 samples and labels are misaligned."
-        )
+        if len(role_x) != len(role_y):
+            raise ValueError(
+                f"{role_name} samples and "
+                "labels are misaligned."
+            )
 
     minimum_values = {
         "minimum_session_1_samples": (
             minimum_session_1_samples
+        ),
+        "minimum_enrollment_samples": (
+            minimum_enrollment_samples
         ),
         "minimum_session_2_samples": (
             minimum_session_2_samples
         ),
     }
 
-    normalised_minimums = {}
+    normalized_minimums = {}
 
     for parameter_name, value in (
         minimum_values.items()
@@ -2405,84 +2444,120 @@ def _partition_closed_set_cross_session_samples(
                 f"{parameter_name} must be a positive integer."
             )
 
-        value = int(
-            value
-        )
+        value = int(value)
 
         if value < 1:
             raise ValueError(
                 f"{parameter_name} must be a positive integer."
             )
 
-        normalised_minimums[
+        normalized_minimums[
             parameter_name
         ] = value
 
-    minimum_session_1_samples = (
-        normalised_minimums[
+    minimum_train_samples = (
+        normalized_minimums[
             "minimum_session_1_samples"
         ]
     )
 
-    minimum_session_2_samples = (
-        normalised_minimums[
+    minimum_enrollment_samples = (
+        normalized_minimums[
+            "minimum_enrollment_samples"
+        ]
+    )
+
+    minimum_probe_samples = (
+        normalized_minimums[
             "minimum_session_2_samples"
         ]
     )
 
-    session_1_subjects = np.unique(
-        y_session_1
+    train_subjects = np.unique(
+        y_train
     )
 
-    session_2_subjects = np.unique(
-        y_session_2
+    enrollment_subjects = np.unique(
+        y_enrollment
+    )
+
+    probe_subjects = np.unique(
+        y_probe
     )
 
     common_subjects = np.intersect1d(
-        session_1_subjects,
-        session_2_subjects,
+        np.intersect1d(
+            train_subjects,
+            enrollment_subjects,
+        ),
+        probe_subjects,
     )
 
     if len(common_subjects) < 2:
         raise ValueError(
             "At least two identities must be shared by "
-            "Session 1 and Session 2."
+            "the required cross-session roles."
         )
 
-    session_1_counts = {
+    train_counts = {
         subject: int(
             np.sum(
-                y_session_1 == subject
+                y_train == subject
             )
         )
         for subject in common_subjects
     }
 
-    session_2_counts = {
+    enrollment_counts = {
         subject: int(
             np.sum(
-                y_session_2 == subject
+                y_enrollment == subject
             )
         )
         for subject in common_subjects
     }
 
-    insufficient_session_1 = np.asarray(
+    probe_counts = {
+        subject: int(
+            np.sum(
+                y_probe == subject
+            )
+        )
+        for subject in common_subjects
+    }
+
+    insufficient_train = np.asarray(
         [
             subject
             for subject in common_subjects
-            if session_1_counts[subject]
-            < minimum_session_1_samples
+            if (
+                train_counts[subject]
+                < minimum_train_samples
+            )
         ],
         dtype=common_subjects.dtype,
     )
 
-    insufficient_session_2 = np.asarray(
+    insufficient_enrollment = np.asarray(
         [
             subject
             for subject in common_subjects
-            if session_2_counts[subject]
-            < minimum_session_2_samples
+            if (
+                enrollment_counts[subject]
+                < minimum_enrollment_samples
+            )
+        ],
+        dtype=common_subjects.dtype,
+    )
+
+    insufficient_probe = np.asarray(
+        [
+            subject
+            for subject in common_subjects
+            if (
+                probe_counts[subject]
+                < minimum_probe_samples
+            )
         ],
         dtype=common_subjects.dtype,
     )
@@ -2492,10 +2567,12 @@ def _partition_closed_set_cross_session_samples(
             subject
             for subject in common_subjects
             if (
-                session_1_counts[subject]
-                >= minimum_session_1_samples
-                and session_2_counts[subject]
-                >= minimum_session_2_samples
+                train_counts[subject]
+                >= minimum_train_samples
+                and enrollment_counts[subject]
+                >= minimum_enrollment_samples
+                and probe_counts[subject]
+                >= minimum_probe_samples
             )
         ],
         dtype=common_subjects.dtype,
@@ -2504,106 +2581,138 @@ def _partition_closed_set_cross_session_samples(
     if len(eligible_subjects) < 2:
         raise ValueError(
             "At least two shared identities must satisfy "
-            "the required Session 1 and Session 2 "
-            "sample counts."
+            "the required cross-session sample counts."
         )
 
-    session_1_mask = np.isin(
-        y_session_1,
+    train_mask = np.isin(
+        y_train,
         eligible_subjects,
     )
 
-    session_2_mask = np.isin(
-        y_session_2,
+    enrollment_mask = np.isin(
+        y_enrollment,
         eligible_subjects,
     )
 
-    filtered_x_session_1 = (
-        x_session_1[
-            session_1_mask
-        ]
+    probe_mask = np.isin(
+        y_probe,
+        eligible_subjects,
     )
 
-    filtered_y_session_1 = (
-        y_session_1[
-            session_1_mask
-        ]
+    train_partition = (
+        x_train[train_mask],
+        y_train[train_mask],
     )
 
-    filtered_x_session_2 = (
-        x_session_2[
-            session_2_mask
-        ]
+    enrollment_partition = (
+        x_enrollment[enrollment_mask],
+        y_enrollment[enrollment_mask],
     )
 
-    filtered_y_session_2 = (
-        y_session_2[
-            session_2_mask
-        ]
+    probe_partition = (
+        x_probe[probe_mask],
+        y_probe[probe_mask],
     )
 
     expected_subjects = set(
         eligible_subjects.tolist()
     )
 
-    retained_session_1_subjects = set(
-        np.unique(
-            filtered_y_session_1
-        ).tolist()
-    )
-
-    retained_session_2_subjects = set(
-        np.unique(
-            filtered_y_session_2
-        ).tolist()
-    )
-
-    if (
-        retained_session_1_subjects
-        != expected_subjects
+    for role_name, role_partition in (
+        ("training", train_partition),
+        ("enrollment", enrollment_partition),
+        ("probe", probe_partition),
     ):
-        raise RuntimeError(
-            "Session 1 partitioning did not preserve "
-            "exactly the eligible identities."
+        retained_subjects = set(
+            np.unique(
+                role_partition[1]
+            ).tolist()
         )
 
-    if (
-        retained_session_2_subjects
-        != expected_subjects
-    ):
-        raise RuntimeError(
-            "Session 2 partitioning did not preserve "
-            "exactly the eligible identities."
-        )
+        if retained_subjects != expected_subjects:
+            raise RuntimeError(
+                f"{role_name.capitalize()} partitioning "
+                "did not preserve exactly the eligible identities."
+            )
+
+    all_subjects = np.union1d(
+        np.union1d(
+            train_subjects,
+            enrollment_subjects,
+        ),
+        probe_subjects,
+    )
+
+    train_indices = np.flatnonzero(
+        train_mask
+    )
+
+    enrollment_indices = np.flatnonzero(
+        enrollment_mask
+    )
+
+    probe_indices = np.flatnonzero(
+        probe_mask
+    )
 
     return {
-        "session_1": (
-            filtered_x_session_1,
-            filtered_y_session_1,
-        ),
-        "session_2": (
-            filtered_x_session_2,
-            filtered_y_session_2,
-        ),
+        "train": train_partition,
+        "enrollment": enrollment_partition,
+        "probe": probe_partition,
+
+        # Backward-compatible aliases for callers that still use the
+        # historical two-session vocabulary.
+        "session_1": train_partition,
+        "session_2": probe_partition,
+
         "indices": {
-            "session_1": np.flatnonzero(session_1_mask),
-            "session_2": np.flatnonzero(session_2_mask),
+            "train": train_indices,
+            "enrollment": enrollment_indices,
+            "probe": probe_indices,
+            "session_1": train_indices,
+            "session_2": probe_indices,
         },
         "subjects": eligible_subjects,
+        "enrollment_reuses_training": (
+            enrollment_reuses_training
+        ),
         "dropped_subjects": {
+            "missing_training": np.setdiff1d(
+                all_subjects,
+                train_subjects,
+            ),
+            "missing_enrollment": np.setdiff1d(
+                all_subjects,
+                enrollment_subjects,
+            ),
+            "missing_probe": np.setdiff1d(
+                all_subjects,
+                probe_subjects,
+            ),
+            "insufficient_training": (
+                insufficient_train
+            ),
+            "insufficient_enrollment": (
+                insufficient_enrollment
+            ),
+            "insufficient_probe": (
+                insufficient_probe
+            ),
+
+            # Backward-compatible diagnostics.
             "session_1_only": np.setdiff1d(
-                session_1_subjects,
-                session_2_subjects,
+                train_subjects,
+                probe_subjects,
             ),
             "session_2_only": np.setdiff1d(
-                session_2_subjects,
-                session_1_subjects,
+                probe_subjects,
+                train_subjects,
             ),
             "insufficient_session_1": (
-                insufficient_session_1
+                insufficient_train
             ),
             "insufficient_session_2": (
-                insufficient_session_2
+                insufficient_probe
             ),
         },
     }
@@ -2768,6 +2877,7 @@ def _partition_subject_disjoint_samples(
     }
 
 
+
 def _partition_subject_disjoint_cross_session_samples(
     x_s1,
     y_s1,
@@ -2776,44 +2886,98 @@ def _partition_subject_disjoint_cross_session_samples(
     train_subjects,
     validation_subjects,
     test_subjects,
+    x_enrollment=None,
+    y_enrollment=None,
 ):
     """
-    Assign cross-session samples while enforcing temporal isolation.
+    Assign subject-disjoint training, enrollment, and probe partitions.
 
-    Session 1 supplies:
-        - representation-learning samples;
-        - unseen-subject validation samples;
-        - held-out-subject enrollment samples.
+    The historical two-session interface remains valid: when a separate
+    enrollment array is omitted, held-out identities enroll from the training
+    source. When enrollment data is supplied explicitly, held-out identities
+    enroll from that source instead.
 
-    Session 2 supplies:
-        - held-out-subject probe samples.
+    Representation-learning and validation samples always come from the
+    training role. Probe samples always come from the probe role.
     """
-    x_s1 = np.asarray(x_s1)
-    y_s1 = np.asarray(y_s1)
-    x_s2 = np.asarray(x_s2)
-    y_s2 = np.asarray(y_s2)
+    x_train = np.asarray(
+        x_s1
+    )
+    y_train = np.asarray(
+        y_s1
+    )
+    x_probe = np.asarray(
+        x_s2
+    )
+    y_probe = np.asarray(
+        y_s2
+    )
 
-    if y_s1.ndim != 1 or y_s2.ndim != 1:
+    if (
+        (x_enrollment is None)
+        != (y_enrollment is None)
+    ):
         raise ValueError(
-            "Session labels must be one-dimensional."
+            "x_enrollment and y_enrollment must either both "
+            "be provided or both be omitted."
         )
 
-    if len(x_s1) != len(y_s1):
-        raise ValueError(
-            "Session 1 samples and labels are misaligned."
+    enrollment_reuses_training = (
+        x_enrollment is None
+    )
+
+    if enrollment_reuses_training:
+        x_enrollment = x_train
+        y_enrollment = y_train
+    else:
+        x_enrollment = np.asarray(
+            x_enrollment
+        )
+        y_enrollment = np.asarray(
+            y_enrollment
         )
 
-    if len(x_s2) != len(y_s2):
-        raise ValueError(
-            "Session 2 samples and labels are misaligned."
-        )
+    role_arrays = (
+        (
+            "Session 1"
+            if enrollment_reuses_training
+            else "Training",
+            x_train,
+            y_train,
+        ),
+        (
+            "Enrollment",
+            x_enrollment,
+            y_enrollment,
+        ),
+        (
+            "Session 2"
+            if enrollment_reuses_training
+            else "Probe",
+            x_probe,
+            y_probe,
+        ),
+    )
+
+    for role_name, role_x, role_y in role_arrays:
+        if role_y.ndim != 1:
+            raise ValueError(
+                f"{role_name} labels must be one-dimensional."
+            )
+
+        if len(role_x) != len(role_y):
+            raise ValueError(
+                f"{role_name} samples and labels are misaligned."
+            )
 
     train_subjects = np.asarray(
         train_subjects
     )
+
     validation_subjects = np.asarray(
         validation_subjects
     )
+
     test_subjects = np.asarray(
         test_subjects
     )
@@ -2860,10 +3024,19 @@ def _partition_subject_disjoint_cross_session_samples(
 
     common_subjects = (
         set(
-            np.unique(y_s1).tolist()
+            np.unique(
+                y_train
+            ).tolist()
         )
         & set(
-            np.unique(y_s2).tolist()
+            np.unique(
+                y_enrollment
+            ).tolist()
+        )
+        & set(
+            np.unique(
+                y_probe
+            ).tolist()
         )
     )
 
@@ -2874,40 +3047,47 @@ def _partition_subject_disjoint_cross_session_samples(
     )
 
     if assigned_subjects != common_subjects:
+        if enrollment_reuses_training:
+            raise ValueError(
+                "The subject cohorts must cover exactly the "
+                "subjects shared by Session 1 and Session 2."
+            )
+
         raise ValueError(
             "The subject cohorts must cover exactly the "
-            "subjects shared by Session 1 and Session 2."
+            "identities shared by training, enrollment, "
+            "and probe roles."
         )
 
-    train_mask_s1 = np.isin(
-        y_s1,
+    train_mask = np.isin(
+        y_train,
         train_subjects,
     )
 
-    validation_mask_s1 = np.isin(
-        y_s1,
+    validation_mask = np.isin(
+        y_train,
         validation_subjects,
     )
 
-    enrollment_mask_s1 = np.isin(
-        y_s1,
+    enrollment_mask = np.isin(
+        y_enrollment,
         test_subjects,
     )
 
-    probe_mask_s2 = np.isin(
-        y_s2,
+    probe_mask = np.isin(
+        y_probe,
         test_subjects,
     )
 
     train_partition = (
-        x_s1[train_mask_s1],
-        y_s1[train_mask_s1],
+        x_train[train_mask],
+        y_train[train_mask],
     )
 
     if len(validation_subjects) > 0:
         validation_partition = (
-            x_s1[validation_mask_s1],
-            y_s1[validation_mask_s1],
+            x_train[validation_mask],
+            y_train[validation_mask],
         )
     else:
         validation_partition = (
@@ -2916,13 +3096,13 @@ def _partition_subject_disjoint_cross_session_samples(
         )
 
     enrollment_partition = (
-        x_s1[enrollment_mask_s1],
-        y_s1[enrollment_mask_s1],
+        x_enrollment[enrollment_mask],
+        y_enrollment[enrollment_mask],
     )
 
     probe_partition = (
-        x_s2[probe_mask_s2],
-        y_s2[probe_mask_s2],
+        x_probe[probe_mask],
+        y_probe[probe_mask],
     )
 
     return {
@@ -2931,14 +3111,27 @@ def _partition_subject_disjoint_cross_session_samples(
         "enrollment": enrollment_partition,
         "probe": probe_partition,
         "indices": {
-            "train": np.flatnonzero(train_mask_s1),
-            "validation": (
-                np.flatnonzero(validation_mask_s1)
-                if len(validation_subjects) > 0
-                else np.empty((0,), dtype=int)
+            "train": np.flatnonzero(
+                train_mask
             ),
-            "enrollment": np.flatnonzero(enrollment_mask_s1),
-            "probe": np.flatnonzero(probe_mask_s2),
+            "validation": (
+                np.flatnonzero(
+                    validation_mask
+                )
+                if len(
+                    validation_subjects
+                ) > 0
+                else np.empty(
+                    (0,),
+                    dtype=int,
+                )
+            ),
+            "enrollment": np.flatnonzero(
+                enrollment_mask
+            ),
+            "probe": np.flatnonzero(
+                probe_mask
+            ),
         },
     }
 
@@ -3600,9 +3793,13 @@ def _build_weight_cache_config(
     training_samples=None,
     training_labels=None,
     validation_arrays=None,
+    training_role_only_loader_identity=False,
 ):
     """
     Build the complete identity for reusable trained model weights.
+
+    A training-role-only loader identity may be requested when enrollment and
+    probe source selectors affect evaluation but cannot affect fitted weights.
 
     When training arrays are supplied, their complete post-partition and
     post-augmentation contents are fingerprinted so equal shapes cannot cause
@@ -3646,11 +3843,46 @@ def _build_weight_cache_config(
             complete_config[
                 "validation_partition"
             ] = _fingerprint_array_collection(fingerprintable)
-    complete_config[
-        "loader_identity"
-    ] = _build_loader_cache_identity(
+    loader_identity = _build_loader_cache_identity(
         loader
     )
+
+    if (
+        training_role_only_loader_identity
+        and isinstance(loader_identity, dict)
+    ):
+        loader_identity = copy.deepcopy(
+            loader_identity
+        )
+
+        settings = loader_identity.get(
+            "settings"
+        )
+
+        if isinstance(settings, dict):
+            evaluation_only_settings = {
+                "enroll_sessions",
+                "enrol_sessions",
+                "probe_sessions",
+                "required_cross_sessions",
+                "enrol_parts",
+                "enroll_parts",
+                "test_parts",
+                "enroll_record_indices",
+                "probe_record_indices",
+            }
+
+            for setting_name in (
+                evaluation_only_settings
+            ):
+                settings.pop(
+                    setting_name,
+                    None,
+                )
+
+    complete_config[
+        "loader_identity"
+    ] = loader_identity
 
     return complete_config
 
@@ -6528,6 +6760,241 @@ def run_subject_disjoint_verification(x, y, model_class, epochs=150, batch_size=
 # =============================================================================
 # TASK 5: CROSS-SESSION IDENTIFICATION
 # =============================================================================
+
+def _prepare_cross_session_enrollment_role(
+    x_enroll,
+    y_enroll,
+    provenance_enroll,
+    use_enrollment,
+    outlier_filtering_on_enroll,
+    sqi_enroll,
+    sqi_threshold,
+    sqi_keep_pct,
+):
+    """
+    Prepare an optional enrollment role independently of training.
+
+    Enrollment data is unused when ``use_enrollment`` is false. When enrollment
+    is required but no separate arrays are supplied, callers retain the shared
+    training/enrollment behavior through the partition helper.
+
+    A physically separate enrollment role has an independent SQI policy.
+    Training-role filtering never implicitly filters separate enrollment data.
+    """
+    if not use_enrollment:
+        return (
+            None,
+            None,
+            None,
+            False,
+            False,
+        )
+
+    if (
+        (x_enroll is None)
+        != (y_enroll is None)
+    ):
+        raise ValueError(
+            "x_enroll and y_enroll must either both "
+            "be provided or both be omitted."
+        )
+
+    if x_enroll is None:
+        if provenance_enroll is not None:
+            raise ValueError(
+                "provenance_enroll requires explicit "
+                "x_enroll and y_enroll arrays."
+            )
+
+        if outlier_filtering_on_enroll is not None:
+            if not isinstance(
+                outlier_filtering_on_enroll,
+                (
+                    bool,
+                    np.bool_,
+                ),
+            ):
+                raise ValueError(
+                    "outlier_filtering_on_enroll must be "
+                    "Boolean or None."
+                )
+
+            if bool(
+                outlier_filtering_on_enroll
+            ):
+                raise ValueError(
+                    "Enrollment-specific filtering requires "
+                    "explicit x_enroll and y_enroll arrays."
+                )
+
+        if sqi_enroll is not None:
+            raise ValueError(
+                "sqi_enroll requires explicit "
+                "x_enroll and y_enroll arrays."
+            )
+
+        return (
+            None,
+            None,
+            None,
+            False,
+            False,
+        )
+
+    x_enroll = np.asarray(
+        x_enroll
+    )
+    y_enroll = np.asarray(
+        y_enroll
+    )
+
+    if x_enroll.ndim < 1:
+        raise ValueError(
+            "Enrollment samples must contain a sample dimension."
+        )
+
+    if y_enroll.ndim != 1:
+        raise ValueError(
+            "Enrollment labels must be one-dimensional."
+        )
+
+    if len(x_enroll) != len(y_enroll):
+        raise ValueError(
+            "Enrollment samples and labels are misaligned."
+        )
+
+    if (
+        provenance_enroll is not None
+        and len(provenance_enroll)
+        != len(y_enroll)
+    ):
+        raise ValueError(
+            "Enrollment provenance is misaligned with "
+            "enrollment samples and labels."
+        )
+
+    if outlier_filtering_on_enroll is None:
+        filter_enrollment = False
+    else:
+        filter_enrollment = (
+            outlier_filtering_on_enroll
+        )
+
+    if not isinstance(
+        filter_enrollment,
+        (
+            bool,
+            np.bool_,
+        ),
+    ):
+        raise ValueError(
+            "outlier_filtering_on_enroll must be Boolean "
+            "or None."
+        )
+
+    filter_enrollment = bool(
+        filter_enrollment
+    )
+
+    if not filter_enrollment:
+        return (
+            x_enroll,
+            y_enroll,
+            provenance_enroll,
+            True,
+            False,
+        )
+
+    enrollment_sqi_input = sqi_enroll
+
+    if enrollment_sqi_input is None:
+        print(
+            "[WARN] Enrollment filtering requested but "
+            "enrollment SQI scores are unavailable. "
+            "Skipping enrollment filtering."
+        )
+
+        return (
+            x_enroll,
+            y_enroll,
+            provenance_enroll,
+            True,
+            True,
+        )
+
+    if isinstance(
+        enrollment_sqi_input,
+        str,
+    ):
+        print(
+            "[INFO] Calculating SQI for enrollment data "
+            f"using method: '{enrollment_sqi_input}'"
+        )
+
+        enrollment_sqi = np.asarray(
+            _compute_sqi(
+                x_enroll,
+                method=enrollment_sqi_input,
+            )
+        )
+    elif isinstance(
+        enrollment_sqi_input,
+        (
+            list,
+            np.ndarray,
+        ),
+    ):
+        enrollment_sqi = np.asarray(
+            enrollment_sqi_input
+        )
+    else:
+        raise TypeError(
+            "sqi_enroll must be a string, array, or None."
+        )
+
+    print(
+        "\n[INFO] Filtering enrollment data..."
+    )
+
+    if provenance_enroll is not None:
+        (
+            x_enroll,
+            y_enroll,
+            retained_indices,
+        ) = _apply_outlier_filter(
+            x_enroll,
+            y_enroll,
+            enrollment_sqi,
+            sqi_threshold,
+            sqi_keep_pct,
+            return_indices=True,
+        )
+
+        provenance_enroll = (
+            provenance_enroll.subset(
+                retained_indices
+            )
+        )
+    else:
+        (
+            x_enroll,
+            y_enroll,
+        ) = _apply_outlier_filter(
+            x_enroll,
+            y_enroll,
+            enrollment_sqi,
+            sqi_threshold,
+            sqi_keep_pct,
+        )
+
+    return (
+        x_enroll,
+        y_enroll,
+        provenance_enroll,
+        True,
+        True,
+    )
+
 def run_cross_session_identification(x_train, y_train, x_test, y_test, model_class, epochs=150, 
                                      batch_size=256, lr=1e-3, val_split=0.0, seed=42, device=None, 
                                      visualize=False, use_template=False, template_fusion_method='mean',
@@ -6537,17 +7004,21 @@ def run_cross_session_identification(x_train, y_train, x_test, y_test, model_cla
                                      sqi_keep_pct=0.8, probe_fusion_size=3, save_results_and_settings=False, 
                                      loader=None, n_runs=1, _return_stats=False,
                                      intelligent_weight_loading=True,
-                                     augmentation_config=None, split_seed=None, provenance_s1=None, provenance_s2=None):
+                                     augmentation_config=None, split_seed=None, provenance_s1=None, provenance_s2=None,
+                                     x_enroll=None, y_enroll=None, provenance_enroll=None,
+                                     outlier_filtering_on_enroll=None, sqi_enroll=None):
     """
-    Cross-Session Identification Pipeline (Temporal Robustness).
-    Evaluates system robustness against physiological aging and sensor variations over time.
-    Trains the model on Session 1 (Enrollment) and identifies subjects using Session 2 (Probes).
+    Cross-session identification with protocol-defined data roles.
+
+    Training data fits the representation or classifier. Probe data is used for
+    identification. When template matching is enabled, enrollment data forms
+    the gallery and defaults to the training source when omitted.
 
     Args:
-        x_train (np.ndarray): Input ECG signals from Session 1.
-        y_train (np.ndarray): Labels for Session 1.
-        x_test (np.ndarray): Input ECG signals from Session 2.
-        y_test (np.ndarray): Labels for Session 2.
+        x_train (np.ndarray): ECG samples assigned to the training role.
+        y_train (np.ndarray): Labels for the training samples.
+        x_test (np.ndarray): ECG samples assigned to the probe role.
+        y_test (np.ndarray): Labels for the probe samples.
         model_class (nn.Module): The PyTorch model architecture class to instantiate.
         epochs (int): Maximum number of training epochs.
         batch_size (int): Number of samples per training batch.
@@ -6557,13 +7028,13 @@ def run_cross_session_identification(x_train, y_train, x_test, y_test, model_cla
         split_seed (int or None): Optional seed for randomized data-role allocation such as train/test beat splits, subject-cohort splits, and validation allocation. None follows the current per-run training seed; an explicit integer holds the randomized partition fixed across training seeds where such a partition exists. For cross-session tasks the evaluation partition is protocol-defined and fixed; split_seed affects only a randomized validation allocation when validation is active.
         device (str): Computation device ('cuda', 'cpu', or 'auto').
         visualize (bool): If True, generates t-SNE scatter plots of the cross-session embeddings.
-        use_template (bool): 
-            - False: Uses the Session 1 Softmax classification weights to classify Session 2 data.
-            - True: Uses Session 1 features to form a gallery, and metric-matches Session 2 probes.
-        template_fusion_method (str): Logic used to create the Session 1 gallery template.
+        use_template (bool):
+            - False: Uses the classifier fitted on training data to classify probes.
+            - True: Builds an enrollment gallery and metric-matches probe embeddings.
+        template_fusion_method (str): Logic used to create enrollment templates.
             Options: ['mean', 'median', 'trimmed_mean', 'representative',
             'soft_centrality', 'geometric_median', 'none']
-        template_size (int, optional): Number of Session 1 beats used for enrollment. None uses all available.
+        template_size (int, optional): Number of enrollment beats used per template. None uses all available.
         matching_method (str): Distance/Similarity metric for template matching.
             Options: ['cosine', 'euclidean', 'manhattan', 'correlation']
         outlier_filtering_on_train (bool): Apply SQI filtering independently to Session 1.
@@ -6718,7 +7189,7 @@ def run_cross_session_identification(x_train, y_train, x_test, y_test, model_cla
     # 2. APPLY SQI FILTERS
     # ====================================================
     if sqi_train is not None:
-        print("\n[INFO] Filtering Session 1 (Enrollment)...")
+        print("\n[INFO] Filtering training data...")
         if provenance_s1 is not None:
             x_train, y_train, retained_indices = _apply_outlier_filter(
                 x_train, y_train, sqi_train, sqi_threshold, sqi_keep_pct, return_indices=True
@@ -6728,7 +7199,7 @@ def run_cross_session_identification(x_train, y_train, x_test, y_test, model_cla
             x_train, y_train = _apply_outlier_filter(x_train, y_train, sqi_train, sqi_threshold, sqi_keep_pct)
 
     if sqi_test is not None:
-        print("\n[INFO] Filtering Session 2 (Probes)...")
+        print("\n[INFO] Filtering probe data...")
         if provenance_s2 is not None:
             x_test, y_test, retained_indices = _apply_outlier_filter(
                 x_test, y_test, sqi_test, absolute_threshold=sqi_threshold,
@@ -6746,6 +7217,31 @@ def run_cross_session_identification(x_train, y_train, x_test, y_test, model_cla
                 apply_subject_ranking=False,
             )
 
+    (
+        x_enroll_prepared,
+        y_enroll_prepared,
+        provenance_enroll_prepared,
+        enrollment_is_explicit,
+        enrollment_filter_requested,
+    ) = _prepare_cross_session_enrollment_role(
+        x_enroll=x_enroll,
+        y_enroll=y_enroll,
+        provenance_enroll=provenance_enroll,
+        use_enrollment=use_template,
+        outlier_filtering_on_enroll=outlier_filtering_on_enroll,
+        sqi_enroll=sqi_enroll,
+        sqi_threshold=sqi_threshold,
+        sqi_keep_pct=sqi_keep_pct,
+    )
+
+    hyperparams[
+        "outlier_filter_enroll"
+    ] = (
+        enrollment_filter_requested
+        if enrollment_is_explicit
+        else None
+    )
+
     # ====================================================
     # 3. SYNCHRONISE KNOWN SUBJECTS ACROSS SESSIONS
     # ====================================================
@@ -6757,6 +7253,8 @@ def run_cross_session_identification(x_train, y_train, x_test, y_test, model_cla
             y_test,
             minimum_session_1_samples=2,
             minimum_session_2_samples=1,
+            x_enrollment=x_enroll_prepared,
+            y_enrollment=y_enroll_prepared,
         )
     )
 
@@ -6768,21 +7266,54 @@ def run_cross_session_identification(x_train, y_train, x_test, y_test, model_cla
     ]
 
     (
+        x_enroll_filtered,
+        y_enroll_filtered,
+    ) = cross_session_partitions[
+        "enrollment"
+    ]
+
+    (
         x_test_filtered,
         y_test_filtered,
     ) = cross_session_partitions[
-        "session_2"
+        "probe"
     ]
 
-    provenance_enroll = None
+    template_provenance = None
     provenance_probe = None
-    if provenance_s1 is not None:
-        provenance_enroll = provenance_s1.subset(
-            cross_session_partitions["indices"]["session_1"]
+
+    if (
+        enrollment_is_explicit
+        and provenance_enroll_prepared is not None
+    ):
+        template_provenance = (
+            provenance_enroll_prepared.subset(
+                cross_session_partitions[
+                    "indices"
+                ][
+                    "enrollment"
+                ]
+            )
         )
+    elif (
+        not enrollment_is_explicit
+        and provenance_s1 is not None
+    ):
+        template_provenance = provenance_s1.subset(
+            cross_session_partitions[
+                "indices"
+            ][
+                "enrollment"
+            ]
+        )
+
     if provenance_s2 is not None:
         provenance_probe = provenance_s2.subset(
-            cross_session_partitions["indices"]["session_2"]
+            cross_session_partitions[
+                "indices"
+            ][
+                "probe"
+            ]
         )
 
     dropped_subjects = (
@@ -6810,21 +7341,31 @@ def run_cross_session_identification(x_train, y_train, x_test, y_test, model_cla
     y_train_enc, classes = _encode_labels(y_train_full)
     label_map = {c: i for i, c in enumerate(classes)}
     y_test_enc = np.array([label_map[l] for l in y_test_filtered])
+    y_enroll_enc = (
+        np.array(
+            [
+                label_map[label]
+                for label in y_enroll_filtered
+            ]
+        )
+        if use_template
+        else None
+    )
     
     # ====================================================
     # 5. RESUME STANDARD PIPELINE
     # ====================================================
-    # Validation Split (from Session 1)
+    # Validation split from the training role
     if val_split > 0.0:
         X_tr, X_val, y_tr, y_val = train_test_split(
             x_train_full, y_train_enc, test_size=val_split, stratify=y_train_enc, random_state=resolved_split_seed
         )
         val_loader = _make_loader(X_val, y_val, batch_size, shuffle=False)
-        print(f"Session 1 Split: Train={len(X_tr)}, Val={len(X_val)} | Session 2 Probes={len(x_test_filtered)}")
+        print(f"Training Split: Train={len(X_tr)}, Val={len(X_val)} | Probes={len(x_test_filtered)}")
     else:
         X_tr, y_tr = x_train_full, y_train_enc
         X_val, val_loader = None, None
-        print(f"Session 1 Split: Train={len(X_tr)}, Val=0 | Session 2 Probes={len(x_test_filtered)}")
+        print(f"Training Split: Train={len(X_tr)}, Val=0 | Probes={len(x_test_filtered)}")
 
     X_tr, y_tr = (
         _augment_training_partition(
@@ -6881,6 +7422,7 @@ def run_cross_session_identification(x_train, y_train, x_test, y_test, model_cla
             training_samples=X_tr,
             training_labels=y_tr,
             validation_arrays=validation_arrays,
+            training_role_only_loader_identity=True,
         )
         
         cached_model, uid = _timed_runtime_call(
@@ -6913,7 +7455,7 @@ def run_cross_session_identification(x_train, y_train, x_test, y_test, model_cla
     # ====================================================
     if not use_template:
         # STRATEGY A: Standard Softmax Classification
-        print("[INFO] Bypassing Templates. Using standard Softmax Classifier trained on Session 1...")
+        print("[INFO] Bypassing templates. Using the classifier fitted on training data...")
         model.eval()
         all_probs, all_trues = [], []
         with torch.no_grad():
@@ -6927,14 +7469,19 @@ def run_cross_session_identification(x_train, y_train, x_test, y_test, model_cla
         
     else:
         # STRATEGY B: Template Matching
-        print(f"[INFO] Building Enrollment Templates from Session 1...")
+        print("[INFO] Building enrollment templates...")
         model.include_top = False # Switch to Feature Extractor
         
-        enroll_loader = _make_loader(x_train_full, y_train_enc, batch_size, shuffle=False)
+        enroll_loader = _make_loader(
+            x_enroll_filtered,
+            y_enroll_enc,
+            batch_size,
+            shuffle=False,
+        )
         emb_enroll, lab_enroll = _get_embeddings(model, enroll_loader, device)
         
         gallery_emb, gallery_lab = _create_templates(
-            emb_enroll, lab_enroll, method=template_fusion_method, max_beats=template_size, provenance=provenance_enroll
+            emb_enroll, lab_enroll, method=template_fusion_method, max_beats=template_size, provenance=template_provenance
         )
         
         emb_probe, lab_probe = _get_embeddings(model, probe_loader, device)
@@ -6995,8 +7542,13 @@ def run_cross_session_identification(x_train, y_train, x_test, y_test, model_cla
 
     data_stats = {
         "Total Cross-Session Subjects": len(classes),
-        "Enrollment (S1) Samples": len(x_train_full),
-        "Probe (S2) Samples": len(x_test_filtered),
+        "Training Samples": len(x_train_full),
+        "Enrollment Samples": (
+            len(x_enroll_filtered)
+            if use_template
+            else 0
+        ),
+        "Probe Samples": len(x_test_filtered),
         "Probe Fusion": fusion_diagnostics,
     }
 
@@ -7033,16 +7585,20 @@ def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class
                                    save_results_and_settings=False, loader=None, 
                                    n_runs=1, _return_stats=False,
                                    intelligent_weight_loading=True,
-                                   augmentation_config=None, split_seed=None, provenance_s1=None, provenance_s2=None):
+                                   augmentation_config=None, split_seed=None, provenance_s1=None, provenance_s2=None,
+                                   x_enroll=None, y_enroll=None, provenance_enroll=None,
+                                   outlier_filtering_on_enroll=None, sqi_enroll=None):
     """
-    Cross-Session Verification Pipeline (Temporal Robustness 1:1).
-    Attempts to verify if a subject is who they claim to be across different time-separated recording sessions.
+    Cross-session verification with protocol-defined data roles.
+
+    Training data fits the representation. Probe data supplies biometric
+    comparisons, and template-based evaluation uses enrollment templates.
 
     Args:
-        x_train (np.ndarray): Input ECG signals from Session 1.
-        y_train (np.ndarray): Labels for Session 1.
-        x_test (np.ndarray): Input ECG signals from Session 2.
-        y_test (np.ndarray): Labels for Session 2.
+        x_train (np.ndarray): ECG samples assigned to the training role.
+        y_train (np.ndarray): Labels for the training samples.
+        x_test (np.ndarray): ECG samples assigned to the probe role.
+        y_test (np.ndarray): Labels for the probe samples.
         model_class (nn.Module): The PyTorch model architecture class to instantiate.
         epochs (int): Maximum number of training epochs.
         batch_size (int): Number of samples per training batch.
@@ -7056,12 +7612,12 @@ def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class
         device (str): Computation device ('cuda', 'cpu', or 'auto').
         visualize (bool): If True, generates t-SNE scatter plots of the cross-session embeddings.
         use_template (bool):
-            - False: Evaluates raw temporal space (Session 2 beats paired vs other Session 2 beats).
-            - True: Simulates Authentication (Session 2 probes paired against Session 1 enrollment templates).
-        template_fusion_method (str): Logic used to create the Session 1 templates.
+            - False: Generates verification pairs entirely from probe data.
+            - True: Compares probe embeddings against enrollment templates.
+        template_fusion_method (str): Logic used to create enrollment templates.
             Options: ['mean', 'median', 'trimmed_mean', 'representative',
             'soft_centrality', 'geometric_median', 'none']
-        template_size (int, optional): Number of Session 1 beats used for enrollment. None uses all available.
+        template_size (int, optional): Number of enrollment beats used per template. None uses all available.
         matching_method (str): Distance/Similarity metric used to score the pairs.
             Options: ['cosine', 'euclidean', 'manhattan', 'correlation']
         outlier_filtering_on_train (bool): Apply SQI filtering independently to Session 1.
@@ -7196,7 +7752,7 @@ def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class
     resolved_split_seed = seed if split_seed is None else split_seed
     partition_stage_started = _start_runtime_stage()
     task_title = "Cross-Session Verification"
-    mode_str = f"Template ({template_fusion_method}, size={template_size or 'All'})" if use_template else "Cloud Pairs (Session 2 Only)"
+    mode_str = f"Template ({template_fusion_method}, size={template_size or 'All'})" if use_template else "Probe-only pairs"
     print(f"\n[TASK] {task_title} | Mode: {mode_str} | Match: {matching_method}")
 
     # ====================================================
@@ -7221,7 +7777,7 @@ def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class
     # 2. APPLY SQI FILTERS
     # ====================================================
     if sqi_train is not None:
-        print("\n[INFO] Filtering Session 1 (Enrollment)...")
+        print("\n[INFO] Filtering training data...")
         if provenance_s1 is not None:
             x_train, y_train, retained_indices = _apply_outlier_filter(
                 x_train,
@@ -7242,7 +7798,7 @@ def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class
             )
 
     if sqi_test is not None:
-        print("\n[INFO] Filtering Session 2 (Probes)...")
+        print("\n[INFO] Filtering probe data...")
         if provenance_s2 is not None:
             x_test, y_test, retained_indices = _apply_outlier_filter(
                 x_test,
@@ -7264,6 +7820,31 @@ def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class
                 apply_subject_ranking=False,
             )
 
+    (
+        x_enroll_prepared,
+        y_enroll_prepared,
+        provenance_enroll_prepared,
+        enrollment_is_explicit,
+        enrollment_filter_requested,
+    ) = _prepare_cross_session_enrollment_role(
+        x_enroll=x_enroll,
+        y_enroll=y_enroll,
+        provenance_enroll=provenance_enroll,
+        use_enrollment=use_template,
+        outlier_filtering_on_enroll=outlier_filtering_on_enroll,
+        sqi_enroll=sqi_enroll,
+        sqi_threshold=sqi_threshold,
+        sqi_keep_pct=sqi_keep_pct,
+    )
+
+    hyperparams[
+        "outlier_filter_enroll"
+    ] = (
+        enrollment_filter_requested
+        if enrollment_is_explicit
+        else None
+    )
+
     # ====================================================
     # 3. SYNCHRONISE KNOWN SUBJECTS ACROSS SESSIONS
     # ====================================================
@@ -7283,6 +7864,8 @@ def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class
             minimum_session_2_samples=(
                 minimum_probe_samples
             ),
+            x_enrollment=x_enroll_prepared,
+            y_enrollment=y_enroll_prepared,
         )
     )
 
@@ -7294,23 +7877,54 @@ def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class
     ]
 
     (
+        x_enroll_filtered,
+        y_enroll_filtered,
+    ) = cross_session_partitions[
+        "enrollment"
+    ]
+
+    (
         x_test_filtered,
         y_test_filtered,
     ) = cross_session_partitions[
-        "session_2"
+        "probe"
     ]
 
-    provenance_enroll = None
+    template_provenance = None
     provenance_probe = None
 
-    if provenance_s1 is not None:
-        provenance_enroll = provenance_s1.subset(
-            cross_session_partitions["indices"]["session_1"]
+    if (
+        enrollment_is_explicit
+        and provenance_enroll_prepared is not None
+    ):
+        template_provenance = (
+            provenance_enroll_prepared.subset(
+                cross_session_partitions[
+                    "indices"
+                ][
+                    "enrollment"
+                ]
+            )
+        )
+    elif (
+        not enrollment_is_explicit
+        and provenance_s1 is not None
+    ):
+        template_provenance = provenance_s1.subset(
+            cross_session_partitions[
+                "indices"
+            ][
+                "enrollment"
+            ]
         )
 
     if provenance_s2 is not None:
         provenance_probe = provenance_s2.subset(
-            cross_session_partitions["indices"]["session_2"]
+            cross_session_partitions[
+                "indices"
+            ][
+                "probe"
+            ]
         )
 
     dropped_subjects = (
@@ -7350,6 +7964,16 @@ def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class
     y_train_enc, classes = _encode_labels(y_train_full)
     label_map = {c: i for i, c in enumerate(classes)}
     y_test_enc = np.array([label_map[l] for l in y_test_filtered])
+    y_enroll_enc = (
+        np.array(
+            [
+                label_map[label]
+                for label in y_enroll_filtered
+            ]
+        )
+        if use_template
+        else None
+    )
     
     # ====================================================
     # 5. RESUME STANDARD PIPELINE
@@ -7420,6 +8044,7 @@ def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class
             training_samples=X_tr,
             training_labels=y_tr,
             validation_arrays=validation_arrays,
+            training_role_only_loader_identity=True,
         )
         
         cached_model, uid = _timed_runtime_call(
@@ -7475,8 +8100,8 @@ def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class
     emb_probe, lab_probe = _get_embeddings(model, probe_loader, device)
 
     if not use_template:
-        # STRATEGY A: Session 2 vs Session 2 (Intra-session unseen evaluation)
-        print(f"[INFO] Bypassing Templates. Generating pairs exclusively from Session 2...")
+        # STRATEGY A: probe-only verification
+        print("[INFO] Bypassing templates. Generating verification pairs from probe data...")
         scores, labels_pair = _generate_pairs(
             embeddings1=emb_probe, 
             labels1=lab_probe, 
@@ -7487,9 +8112,14 @@ def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class
             matching_method=matching_method
         )
     else:
-        # STRATEGY B: Session 2 Probes vs Session 1 Templates (Authentication Simulation)
-        print(f"[INFO] Building Enrollment Templates from Session 1...")
-        enroll_loader = _make_loader(x_train_full, y_train_enc, batch_size, shuffle=False)
+        # STRATEGY B: enrollment-template verification
+        print("[INFO] Building enrollment templates...")
+        enroll_loader = _make_loader(
+            x_enroll_filtered,
+            y_enroll_enc,
+            batch_size,
+            shuffle=False,
+        )
         emb_enroll, lab_enroll = _get_embeddings(model, enroll_loader, device)
         
         templates, temp_labels = _create_templates(
@@ -7497,13 +8127,13 @@ def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class
             lab_enroll,
             method=template_fusion_method,
             max_beats=template_size,
-            provenance=provenance_enroll,
+            provenance=template_provenance,
         )
         
         scores, labels_pair = _generate_pairs(
-            embeddings1=emb_probe, # Session 2 Probes
+            embeddings1=emb_probe,
             labels1=lab_probe, 
-            embeddings2=templates, # Session 1 Templates
+            embeddings2=templates,
             labels2=temp_labels, 
             num_pairs=num_pairs, 
             sampling_mode=sampling_mode, 
@@ -7537,16 +8167,18 @@ def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class
 
     data_stats = {
         "Total Cross-Session Subjects": len(classes),
-        "Training (S1) Samples": len(X_tr),
-        "Validation (S1) Samples": (
+        "Training Samples": len(X_tr),
+        "Validation Samples": (
             len(X_val)
             if X_val is not None
             else 0
         ),
-        "Enrollment (S1) Samples": len(
-            x_train_full
+        "Enrollment Samples": (
+            len(x_enroll_filtered)
+            if use_template
+            else 0
         ),
-        "Probe (S2) Samples": len(
+        "Probe Samples": len(
             x_test_filtered
         ),
     }
@@ -7594,18 +8226,20 @@ def run_subject_disjoint_cross_session_identification(
         sqi_s2=None, sqi_threshold=0.05, sqi_keep_pct=0.8, probe_fusion_size=3, save_results_and_settings=False, 
         loader=None, n_runs=1, _return_stats=False,
         intelligent_weight_loading=True,
-        augmentation_config=None, split_seed=None, provenance_s1=None, provenance_s2=None):
+        augmentation_config=None, split_seed=None, provenance_s1=None, provenance_s2=None,
+        x_enroll=None, y_enroll=None, provenance_enroll=None,
+        outlier_filtering_on_enroll=None, sqi_enroll=None):
     """
-    The Ultimate Biometric Test: Subject-Disjoint + Temporal Robustness Identification.
-    1. Trains a feature extractor on Session 1 of Subject Group A.
-    2. Enrolls Unseen Subject Group B using their Session 1 recordings to build a gallery.
-    3. Identifies Subject Group B using their Session 2 recordings as probes.
+    Subject-disjoint cross-session identification.
+    1. Fits a feature extractor using the training role for Subject Group A.
+    2. Builds a gallery for unseen Subject Group B from the enrollment role.
+    3. Identifies Subject Group B using the probe role.
 
     Args:
-        x_s1 (np.ndarray): Input ECG signals from Session 1.
-        y_s1 (np.ndarray): Labels for Session 1.
-        x_s2 (np.ndarray): Input ECG signals from Session 2.
-        y_s2 (np.ndarray): Labels for Session 2.
+        x_s1 (np.ndarray): ECG samples assigned to the training role.
+        y_s1 (np.ndarray): Labels for the training samples.
+        x_s2 (np.ndarray): ECG samples assigned to the probe role.
+        y_s2 (np.ndarray): Labels for the probe samples.
         model_class (nn.Module): The PyTorch model architecture class to instantiate.
         epochs (int): Maximum number of training epochs.
         batch_size (int): Number of samples per training batch.
@@ -7753,7 +8387,7 @@ def run_subject_disjoint_cross_session_identification(
     resolved_split_seed = seed if split_seed is None else split_seed
     partition_stage_started = _start_runtime_stage()
     task_title = "Subject-Disjoint Cross-Session ID"
-    mode_str = f"Gallery: Session 1 ({template_fusion_method}, size={template_size or 'All'})"
+    mode_str = f"Gallery: Enrollment ({template_fusion_method}, size={template_size or 'All'})"
     print(f"\n[TASK] {task_title} | Mode: {mode_str} | Match: {matching_method}")
 
     # ====================================================
@@ -7765,11 +8399,11 @@ def run_subject_disjoint_cross_session_identification(
         if isinstance(sqi_input, str): return np.array(_compute_sqi(x_data, method=sqi_input))
         return np.array(sqi_input)
 
-    sqi_s1 = _prepare_sqi(sqi_s1, x_s1, outlier_filtering_on_train, "Session 1")
+    sqi_s1 = _prepare_sqi(sqi_s1, x_s1, outlier_filtering_on_train, "Training")
     sqi_s2 = _prepare_sqi(sqi_s2, x_s2, outlier_filtering_on_test, "Session 2")
 
     if sqi_s1 is not None:
-        print("\n[INFO] Filtering Session 1 (Representation & Enrollment)...")
+        print("\n[INFO] Filtering training data...")
         if provenance_s1 is not None:
             x_s1, y_s1, retained_indices = _apply_outlier_filter(
                 x_s1, y_s1, sqi_s1, sqi_threshold, sqi_keep_pct, return_indices=True
@@ -7779,7 +8413,7 @@ def run_subject_disjoint_cross_session_identification(
             x_s1, y_s1 = _apply_outlier_filter(x_s1, y_s1, sqi_s1, sqi_threshold, sqi_keep_pct)
 
     if sqi_s2 is not None:
-        print("\n[INFO] Filtering Session 2 (Probes)...")
+        print("\n[INFO] Filtering probe data...")
         if provenance_s2 is not None:
             x_s2, y_s2, retained_indices = _apply_outlier_filter(
                 x_s2, y_s2, sqi_s2, absolute_threshold=sqi_threshold,
@@ -7797,14 +8431,52 @@ def run_subject_disjoint_cross_session_identification(
                 apply_subject_ranking=False,
             )
 
+    (
+        x_enroll_prepared,
+        y_enroll_prepared,
+        provenance_enroll_prepared,
+        enrollment_is_explicit,
+        enrollment_filter_requested,
+    ) = _prepare_cross_session_enrollment_role(
+        x_enroll=x_enroll,
+        y_enroll=y_enroll,
+        provenance_enroll=provenance_enroll,
+        use_enrollment=True,
+        outlier_filtering_on_enroll=outlier_filtering_on_enroll,
+        sqi_enroll=sqi_enroll,
+        sqi_threshold=sqi_threshold,
+        sqi_keep_pct=sqi_keep_pct,
+    )
+
+    hyperparams[
+        "outlier_filter_enroll"
+    ] = (
+        enrollment_filter_requested
+        if enrollment_is_explicit
+        else None
+    )
+
     # ====================================================
     # 2. INTERSECT AND SPLIT SUBJECTS (STRICTLY DISJOINT)
     # ====================================================
-    # We must only evaluate subjects that successfully completed both sessions.
-    common_subs = sorted(list(set(y_s1).intersection(set(y_s2))))
+    # Subject cohorts contain only identities available in every required role.
+    eligible_subjects = set(
+        y_s1
+    ).intersection(
+        set(y_s2)
+    )
+
+    if enrollment_is_explicit:
+        eligible_subjects &= set(
+            y_enroll_prepared
+        )
+
+    common_subs = sorted(
+        eligible_subjects
+    )
     
     if len(common_subs) < 2: 
-        raise ValueError("[ERROR] Not enough common subjects across sessions after filtering.")
+        raise ValueError("[ERROR] Not enough common subjects across required roles after filtering.")
         
     # Split the distinct subjects into Train, Val, and Test cohorts
     (
@@ -7834,6 +8506,8 @@ def run_subject_disjoint_cross_session_identification(
             train_subjects=train_subs,
             validation_subjects=val_subs,
             test_subjects=test_subs,
+            x_enrollment=x_enroll_prepared,
+            y_enrollment=y_enroll_prepared,
         )
     )
 
@@ -7857,19 +8531,41 @@ def run_subject_disjoint_cross_session_identification(
         Y_probe,
     ) = partitions["probe"]
 
-    provenance_enroll = None
+    template_provenance = None
     provenance_probe = None
-    if provenance_s1 is not None:
-        provenance_enroll = provenance_s1.subset(
-            partitions["indices"]["enrollment"]
+
+    if (
+        enrollment_is_explicit
+        and provenance_enroll_prepared is not None
+    ):
+        template_provenance = (
+            provenance_enroll_prepared.subset(
+                partitions[
+                    "indices"
+                ][
+                    "enrollment"
+                ]
+            )
         )
+    elif (
+        not enrollment_is_explicit
+        and provenance_s1 is not None
+    ):
+        template_provenance = provenance_s1.subset(
+            partitions[
+                "indices"
+            ][
+                "enrollment"
+            ]
+        )
+
     if provenance_s2 is not None:
         provenance_probe = provenance_s2.subset(
             partitions["indices"]["probe"]
         )
 
     # ====================================================
-    # 3. ENCODE LABELS (CRITICAL FIX FOR PYTORCH TENSORS)
+    # 3. ENCODE LABELS
     # ====================================================
     # PyTorch Datasets cannot handle raw strings (like "MLS" or "HPS").
     # We must explicitly map these strings to integers (0 to N-1).
@@ -7921,7 +8617,7 @@ def run_subject_disjoint_cross_session_identification(
     )
     val_loader_s1 = _make_loader(X_val_s1, y_val_s1_enc, batch_size, shuffle=False) if X_val_s1 is not None else None
     
-    # UNSEEN Validation now strictly passes the Session 1 loader only (Intra-Session check)
+    # Unseen-subject validation uses only training-role samples.
     val_loader_unseen = val_loader_s1
     
     _record_runtime_stage(
@@ -7962,6 +8658,7 @@ def run_subject_disjoint_cross_session_identification(
             training_samples=X_tr,
             training_labels=y_tr,
             validation_arrays=validation_arrays,
+            training_role_only_loader_identity=True,
         )
         
         cached_model, uid = _timed_runtime_call(
@@ -7993,7 +8690,7 @@ def run_subject_disjoint_cross_session_identification(
         optimizer = torch.optim.Adam(model.parameters(), lr=lr)
         criterion = nn.CrossEntropyLoss()
         
-        # Single line execution using the Composite Metric loop!
+        # Train with the subject-disjoint validation objective.
         model = _run_train_loop_unseen_subjects(
             model=model, 
             train_loader=train_loader, 
@@ -8013,15 +8710,15 @@ def run_subject_disjoint_cross_session_identification(
     # ====================================================
     model.include_top = False # Final metric extraction
     
-    print(f"[INFO] Building Enrollment Templates for Unseen Subjects from Session 1...")
+    print("[INFO] Building enrollment templates for unseen subjects...")
     enroll_loader = _make_loader(X_enroll, y_enroll_enc, batch_size, shuffle=False)
     emb_enroll, lab_enroll = _get_embeddings(model, enroll_loader, device)
     
     gallery_emb, gallery_lab = _create_templates(
-        emb_enroll, lab_enroll, method=template_fusion_method, max_beats=template_size, provenance=provenance_enroll
+        emb_enroll, lab_enroll, method=template_fusion_method, max_beats=template_size, provenance=template_provenance
     )
 
-    print(f"[INFO] Probing with Unseen Subjects from Session 2...")
+    print("[INFO] Evaluating unseen subjects with probe data...")
     probe_loader = _make_loader(X_probe, y_probe_enc, batch_size, shuffle=False)
     emb_probe, lab_probe = _get_embeddings(model, probe_loader, device)
 
@@ -8077,9 +8774,9 @@ def run_subject_disjoint_cross_session_identification(
     data_stats = {
         "Train Subjects": len(train_subs),
         "Test Subjects": len(test_subs),
-        "Train (S1) Samples": len(X_train),
-        "Enrollment (S1) Samples": len(X_enroll),
-        "Probe (S2) Samples": len(X_probe),
+        "Training Samples": len(X_train),
+        "Enrollment Samples": len(X_enroll),
+        "Probe Samples": len(X_probe),
         "Probe Fusion": fusion_diagnostics,
     }
 
@@ -8113,17 +8810,21 @@ def run_subject_disjoint_cross_session_verification(
         use_deployment_evaluation=False, target_fars=None,
         save_results_and_settings=False, loader=None, n_runs=1, _return_stats=False,
         intelligent_weight_loading=True,
-        augmentation_config=None, split_seed=None, provenance_s1=None, provenance_s2=None):
+        augmentation_config=None, split_seed=None, provenance_s1=None, provenance_s2=None,
+        x_enroll=None, y_enroll=None, provenance_enroll=None,
+        outlier_filtering_on_enroll=None, sqi_enroll=None):
     """
-    The Ultimate Biometric Test: Subject-Disjoint + Temporal Robustness 1:1 Verification.
-    Verifies the identity of subjects completely excluded from representation learning, across different recording days.
-    The model learns generalized features on Session 1 of Subject Group A, and evaluates verification on Subject Group B.
+    Subject-disjoint cross-session verification.
+
+    Representation learning uses Subject Group A from the training role.
+    Evaluation uses held-out Subject Group B from the probe role and, when
+    templates are enabled, from the enrollment role.
 
     Args:
-        x_s1 (np.ndarray): Input ECG signals from Session 1.
-        y_s1 (np.ndarray): Labels for Session 1.
-        x_s2 (np.ndarray): Input ECG signals from Session 2.
-        y_s2 (np.ndarray): Labels for Session 2.
+        x_s1 (np.ndarray): ECG samples assigned to the training role.
+        y_s1 (np.ndarray): Labels for the training samples.
+        x_s2 (np.ndarray): ECG samples assigned to the probe role.
+        y_s2 (np.ndarray): Labels for the probe samples.
         model_class (nn.Module): The PyTorch model architecture class to instantiate.
         epochs (int): Maximum number of training epochs.
         batch_size (int): Number of samples per training batch.
@@ -8281,7 +8982,7 @@ def run_subject_disjoint_cross_session_verification(
     resolved_split_seed = seed if split_seed is None else split_seed
     partition_stage_started = _start_runtime_stage()
     task_title = "Subject-Disjoint Cross-Session Verification"
-    mode_str = f"Template ({template_fusion_method}, S1 Enroll -> S2 Probe)" if use_template else "Cloud Pairs (S2 vs S2)"
+    mode_str = f"Template ({template_fusion_method}, Enrollment -> Probe)" if use_template else "Probe-only pairs"
     print(f"\n[TASK] {task_title} | Mode: {mode_str} | Match: {matching_method}")
 
     # ====================================================
@@ -8293,11 +8994,11 @@ def run_subject_disjoint_cross_session_verification(
         if isinstance(sqi_input, str): return np.array(_compute_sqi(x_data, method=sqi_input))
         return np.array(sqi_input)
 
-    sqi_s1 = _prepare_sqi(sqi_s1, x_s1, outlier_filtering_on_train, "Session 1")
+    sqi_s1 = _prepare_sqi(sqi_s1, x_s1, outlier_filtering_on_train, "Training")
     sqi_s2 = _prepare_sqi(sqi_s2, x_s2, outlier_filtering_on_test, "Session 2")
 
     if sqi_s1 is not None:
-        print("\n[INFO] Filtering Session 1 (Representation & Enrollment)...")
+        print("\n[INFO] Filtering training data...")
         if provenance_s1 is not None:
             x_s1, y_s1, retained_indices = _apply_outlier_filter(
                 x_s1,
@@ -8318,7 +9019,7 @@ def run_subject_disjoint_cross_session_verification(
             )
 
     if sqi_s2 is not None:
-        print("\n[INFO] Filtering Session 2 (Probes)...")
+        print("\n[INFO] Filtering probe data...")
         if provenance_s2 is not None:
             x_s2, y_s2, retained_indices = _apply_outlier_filter(
                 x_s2,
@@ -8340,13 +9041,51 @@ def run_subject_disjoint_cross_session_verification(
                 apply_subject_ranking=False,
             )
 
+    (
+        x_enroll_prepared,
+        y_enroll_prepared,
+        provenance_enroll_prepared,
+        enrollment_is_explicit,
+        enrollment_filter_requested,
+    ) = _prepare_cross_session_enrollment_role(
+        x_enroll=x_enroll,
+        y_enroll=y_enroll,
+        provenance_enroll=provenance_enroll,
+        use_enrollment=use_template,
+        outlier_filtering_on_enroll=outlier_filtering_on_enroll,
+        sqi_enroll=sqi_enroll,
+        sqi_threshold=sqi_threshold,
+        sqi_keep_pct=sqi_keep_pct,
+    )
+
+    hyperparams[
+        "outlier_filter_enroll"
+    ] = (
+        enrollment_filter_requested
+        if enrollment_is_explicit
+        else None
+    )
+
     # ====================================================
     # 2. INTERSECT AND SPLIT SUBJECTS
     # ====================================================
-    common_subs = sorted(list(set(y_s1).intersection(set(y_s2))))
+    eligible_subjects = set(
+        y_s1
+    ).intersection(
+        set(y_s2)
+    )
+
+    if enrollment_is_explicit:
+        eligible_subjects &= set(
+            y_enroll_prepared
+        )
+
+    common_subs = sorted(
+        eligible_subjects
+    )
     
     if len(common_subs) < 2: 
-        raise ValueError("[ERROR] Not enough common subjects across sessions after filtering.")
+        raise ValueError("[ERROR] Not enough common subjects across required roles after filtering.")
         
     (
         train_subs,
@@ -8375,6 +9114,8 @@ def run_subject_disjoint_cross_session_verification(
             train_subjects=train_subs,
             validation_subjects=val_subs,
             test_subjects=test_subs,
+            x_enrollment=x_enroll_prepared,
+            y_enrollment=y_enroll_prepared,
         )
     )
 
@@ -8398,12 +9139,32 @@ def run_subject_disjoint_cross_session_verification(
         Y_probe,
     ) = partitions["probe"]
 
-    provenance_enroll = None
+    template_provenance = None
     provenance_probe = None
 
-    if provenance_s1 is not None:
-        provenance_enroll = provenance_s1.subset(
-            partitions["indices"]["enrollment"]
+    if (
+        enrollment_is_explicit
+        and provenance_enroll_prepared is not None
+    ):
+        template_provenance = (
+            provenance_enroll_prepared.subset(
+                partitions[
+                    "indices"
+                ][
+                    "enrollment"
+                ]
+            )
+        )
+    elif (
+        not enrollment_is_explicit
+        and provenance_s1 is not None
+    ):
+        template_provenance = provenance_s1.subset(
+            partitions[
+                "indices"
+            ][
+                "enrollment"
+            ]
         )
 
     if provenance_s2 is not None:
@@ -8412,7 +9173,7 @@ def run_subject_disjoint_cross_session_verification(
         )
 
     # ====================================================
-    # 3. ENCODE LABELS (CRITICAL FIX FOR PYTORCH TENSORS)
+    # 3. ENCODE LABELS
     # ====================================================
     y_train_enc, train_classes = _encode_labels(Y_train)
     num_train_classes = len(train_classes)
@@ -8458,7 +9219,7 @@ def run_subject_disjoint_cross_session_verification(
     )
     val_loader_s1 = _make_loader(X_val_s1, y_val_s1_enc, batch_size, shuffle=False) if X_val_s1 is not None else None
     
-    # UNSEEN Validation now strictly passes the Session 1 loader only (Intra-Session check)
+    # Unseen-subject validation uses only training-role samples.
     val_loader_unseen = val_loader_s1
     
     _record_runtime_stage(
@@ -8499,6 +9260,7 @@ def run_subject_disjoint_cross_session_verification(
             training_samples=X_tr,
             training_labels=y_tr,
             validation_arrays=validation_arrays,
+            training_role_only_loader_identity=True,
         )
 
         cached_model, uid = _timed_runtime_call(
@@ -8530,7 +9292,7 @@ def run_subject_disjoint_cross_session_verification(
         optimizer = torch.optim.Adam(model.parameters(), lr=lr)
         criterion = nn.CrossEntropyLoss()
         
-        # Single line execution using the Composite Metric loop!
+        # Train with the subject-disjoint validation objective.
         model = _run_train_loop_unseen_subjects(
             model=model, 
             train_loader=train_loader, 
@@ -8553,12 +9315,12 @@ def run_subject_disjoint_cross_session_verification(
     if use_deployment_evaluation:
         print("\n[INFO] --- DEPLOYMENT THRESHOLD CALIBRATION ---")
         calib_loader = val_loader_s1
-        calib_name = "Unseen Validation (Session 1)"
+        calib_name = "Unseen validation (training role)"
             
         print(f"[INFO] Extracting features for Calibration ({calib_name})...")
         calib_emb_s1, calib_lab_s1 = _get_embeddings(model, calib_loader, device)
         
-        # Calibration relies entirely on Session 1 features
+        # Calibration relies entirely on training-role validation features.
         print(f"[INFO] Generating Calibration Pairs to find Global Threshold...")
         calib_scores, calib_pair_labels = _generate_pairs(
             embeddings1=calib_emb_s1, labels1=calib_lab_s1, 
@@ -8575,14 +9337,14 @@ def run_subject_disjoint_cross_session_verification(
     emb_probe, lab_probe = _get_embeddings(model, probe_loader, device)
 
     if not use_template:
-        print(f"[INFO] Bypassing Templates. Generating pairs entirely from Session 2 for Unseen Subjects...")
+        print("[INFO] Bypassing templates. Generating verification pairs from probe data for unseen subjects...")
         scores, labels_pair = _generate_pairs(
             embeddings1=emb_probe, labels1=lab_probe, 
             embeddings2=None, labels2=None, 
             num_pairs=num_pairs, sampling_mode=sampling_mode, matching_method=matching_method
         )
     else:
-        print(f"[INFO] Building Enrollment Templates for Unseen Subjects from Session 1...")
+        print("[INFO] Building enrollment templates for unseen subjects...")
         enroll_loader = _make_loader(X_enroll, y_enroll_enc, batch_size, shuffle=False)
         emb_enroll, lab_enroll = _get_embeddings(model, enroll_loader, device)
         
@@ -8591,13 +9353,13 @@ def run_subject_disjoint_cross_session_verification(
             lab_enroll,
             method=template_fusion_method,
             max_beats=template_size,
-            provenance=provenance_enroll,
+            provenance=template_provenance,
         )
         
         scores, labels_pair = _generate_pairs(
-            embeddings1=emb_probe, # Session 2 Probes
+            embeddings1=emb_probe,
             labels1=lab_probe, 
-            embeddings2=templates, # Session 1 Templates
+            embeddings2=templates,
             labels2=temp_labels, 
             num_pairs=num_pairs, 
             sampling_mode=sampling_mode, 
@@ -8631,20 +9393,22 @@ def run_subject_disjoint_cross_session_verification(
 
     data_stats = {
         "Train Subjects": len(train_subs),
-        "Train Samples": len(X_train),
+        "Training Samples": len(X_train),
         "Validation Subjects": len(
             val_subs
         ),
-        "Validation (S1) Samples": (
+        "Validation Samples": (
             len(X_val_s1)
             if X_val_s1 is not None
             else 0
         ),
         "Test Subjects": len(test_subs),
-        "Enrollment (S1) Samples": len(
-            X_enroll
+        "Enrollment Samples": (
+            len(X_enroll)
+            if use_template
+            else 0
         ),
-        "Probe (S2) Samples": len(
+        "Probe Samples": len(
             X_probe
         ),
     }
