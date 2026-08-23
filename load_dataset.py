@@ -838,12 +838,11 @@ def audit_continuous_temporal_partitions(
     """
     Audit the enrollment and probe windows of a continuous-recording split.
 
-    ``train_parts`` and ``enrol_parts`` together form the enrollment side of
-    the protocol. The framework uses the training partition as the gallery
-    partition, so the two are frequently identical by design and overlap
-    between them is reported but never treated as leakage. Overlap between
-    either of them and ``test_parts`` places identical physical samples on
-    both sides of the comparison and is rejected.
+    ``train_parts`` supplies representation-learning samples and
+    ``enrol_parts`` supplies gallery/template samples. The two roles may share
+    source windows or be identical by design. Overlap between either role and
+    ``test_parts`` places identical physical samples on the source and probe
+    sides of the comparison and is rejected.
 
     Args:
         train_parts: Minute ranges used for representation learning.
@@ -1001,6 +1000,17 @@ RECORD_ORDER_SPLIT_MODES = (
 # built under a different policy describes a different partition.
 TEMPORAL_DATE_POLICY = "known_dates_only"
 
+# The predefined record-order regimes retain their historical two-sided
+# Train/Enroll versus Probe semantics. This separate mode exposes explicit
+# recording positions for protocols that need independent training,
+# enrollment, and probe sources.
+CUSTOM_RECORD_SPLIT_MODE = "custom-record-split"
+RECORD_BASED_SPLIT_MODES = (
+    ("all-available", "single-session")
+    + RECORD_ORDER_SPLIT_MODES
+    + (CUSTOM_RECORD_SPLIT_MODE,)
+)
+
 
 def verify_sampling_rate(declared_fs, dataset_name, record_name, measured_fs):
     """
@@ -1034,6 +1044,251 @@ def verify_sampling_rate(declared_fs, dataset_name, record_name, measured_fs):
             "uses the rate stored in the file, so correct the configuration or "
             "re-download the database before relying on the result."
         )
+
+
+
+def _canonical_record_role(role):
+    """
+    Normalize a record-based data role.
+
+    Boolean values remain accepted for compatibility with the historical
+    enrollment/probe logging helper.
+    """
+    if isinstance(role, (bool, np.bool_)):
+        return "enrollment" if bool(role) else "probe"
+
+    if not isinstance(role, str):
+        raise ValueError(
+            "Record role must be 'train', 'enrollment', or 'probe'."
+        )
+
+    normalized = role.strip().lower()
+
+    aliases = {
+        "train": "train",
+        "enrol": "enrollment",
+        "enroll": "enrollment",
+        "enrollment": "enrollment",
+        "probe": "probe",
+        "test": "probe",
+    }
+
+    if normalized not in aliases:
+        raise ValueError(
+            "Record role must be 'train', 'enrollment', or 'probe'."
+        )
+
+    return aliases[normalized]
+
+
+def _normalize_record_indices(indices, argument_name):
+    """
+    Validate one explicit recording-index selector.
+
+    Indices are zero-based positions in the loader's deterministic per-subject
+    recording order. The normalized result is sorted so YAML ordering cannot
+    change source ordering.
+    """
+    if indices is None:
+        return None
+
+    if isinstance(indices, (str, bytes)) or not isinstance(
+        indices,
+        (list, tuple, np.ndarray),
+    ):
+        raise ValueError(
+            f"{argument_name} must be a non-empty sequence of "
+            "zero-based integer recording indices."
+        )
+
+    normalized = []
+
+    for value in indices:
+        if isinstance(value, (bool, np.bool_)) or not isinstance(
+            value,
+            (int, np.integer),
+        ):
+            raise ValueError(
+                f"{argument_name} must contain only integer "
+                "recording indices."
+            )
+
+        value = int(value)
+
+        if value < 0:
+            raise ValueError(
+                f"{argument_name} cannot contain negative indices."
+            )
+
+        normalized.append(value)
+
+    if not normalized:
+        raise ValueError(
+            f"{argument_name} cannot be empty."
+        )
+
+    if len(set(normalized)) != len(normalized):
+        raise ValueError(
+            f"{argument_name} cannot contain duplicate indices."
+        )
+
+    return tuple(sorted(normalized))
+
+
+def _resolve_custom_record_indices(
+    train_record_indices,
+    enroll_record_indices,
+    probe_record_indices,
+):
+    """
+    Resolve an explicit Train/Enroll/Probe recording assignment.
+
+    Enrollment defaults to training when omitted. Training and enrollment may
+    share recordings, while the probe role must remain physically disjoint from
+    both.
+    """
+    train = _normalize_record_indices(
+        train_record_indices,
+        "train_record_indices",
+    )
+    probe = _normalize_record_indices(
+        probe_record_indices,
+        "probe_record_indices",
+    )
+
+    if train is None:
+        raise ValueError(
+            "custom-record-split requires train_record_indices."
+        )
+
+    if probe is None:
+        raise ValueError(
+            "custom-record-split requires probe_record_indices."
+        )
+
+    if enroll_record_indices is None:
+        enrollment = tuple(train)
+    else:
+        enrollment = _normalize_record_indices(
+            enroll_record_indices,
+            "enroll_record_indices",
+        )
+
+    source_side = set(train) | set(enrollment)
+    shared_probe_indices = source_side & set(probe)
+
+    if shared_probe_indices:
+        raise ValueError(
+            "Probe recordings must be disjoint from training and "
+            "enrollment recordings. Shared record index/indices: "
+            f"{sorted(shared_probe_indices)}."
+        )
+
+    return train, enrollment, probe
+
+
+def _configure_record_role_indices(
+    loader,
+    data_split_mode,
+    train_record_indices,
+    enroll_record_indices,
+    probe_record_indices,
+):
+    """
+    Attach explicit record-role selectors only to custom-record-split loaders.
+    """
+    supplied = any(
+        value is not None
+        for value in (
+            train_record_indices,
+            enroll_record_indices,
+            probe_record_indices,
+        )
+    )
+
+    if data_split_mode != CUSTOM_RECORD_SPLIT_MODE:
+        if supplied:
+            raise ValueError(
+                "Explicit record-role selectors require "
+                "data_split_mode='custom-record-split'."
+            )
+        return
+
+    (
+        train,
+        enrollment,
+        probe,
+    ) = _resolve_custom_record_indices(
+        train_record_indices,
+        enroll_record_indices,
+        probe_record_indices,
+    )
+
+    loader.train_record_indices = train
+    loader.enroll_record_indices = enrollment
+    loader.probe_record_indices = probe
+
+
+def select_record_role_partition(
+    records,
+    data_split_mode,
+    role,
+    train_record_indices=None,
+    enroll_record_indices=None,
+    probe_record_indices=None,
+):
+    """
+    Select one semantic role from a record-based dataset.
+
+    Existing record-order modes delegate unchanged to
+    ``select_record_order_partition``. ``custom-record-split`` instead uses
+    explicit zero-based recording positions. A subject is eligible only when
+    every recording required by all three roles exists, so an incomplete
+    subject is omitted consistently from Train, Enroll, and Probe.
+    """
+    role = _canonical_record_role(role)
+
+    if data_split_mode != CUSTOM_RECORD_SPLIT_MODE:
+        return select_record_order_partition(
+            records,
+            data_split_mode,
+            is_enrollment=(role != "probe"),
+        )
+
+    (
+        train,
+        enrollment,
+        probe,
+    ) = _resolve_custom_record_indices(
+        train_record_indices,
+        enroll_record_indices,
+        probe_record_indices,
+    )
+
+    selectors = {
+        "train": train,
+        "enrollment": enrollment,
+        "probe": probe,
+    }
+
+    required_indices = (
+        set(train)
+        | set(enrollment)
+        | set(probe)
+    )
+
+    if not records:
+        return [], False
+
+    if max(required_indices) >= len(records):
+        return [], False
+
+    selected = [
+        records[index]
+        for index in selectors[role]
+    ]
+
+    return selected, True
 
 
 def select_record_order_partition(records, data_split_mode, is_enrollment):
@@ -1159,15 +1414,17 @@ def _record_sort_key(record, records):
     )
 
 
-def _record_partition_assignment(loader, is_enrollment, subject_id, records):
-    """
-    Log which recordings a live run assigned to enrollment or to probes.
 
-    ``load_session`` is called once per partition, so the two sides of the
-    protocol accumulate into a single log that ``summarize_partition_log``
-    can check afterwards. The log holds only identifiers and dates, never
-    signal data.
+def _record_partition_assignment(loader, role, subject_id, records):
     """
+    Log the recordings assigned to one semantic data role.
+
+    Boolean role values remain supported for existing callers: True maps to
+    enrollment and False maps to probe. Explicit three-role protocols use the
+    ``train``, ``enrollment``, and ``probe`` keys independently.
+    """
+    role = _canonical_record_role(role)
+
     partition_log = getattr(
         loader,
         "partition_assignment_log",
@@ -1175,13 +1432,18 @@ def _record_partition_assignment(loader, is_enrollment, subject_id, records):
     )
 
     if partition_log is None:
-        partition_log = {
-            "enrollment": {},
-            "probe": {},
-        }
+        partition_log = {}
         loader.partition_assignment_log = partition_log
 
-    role = "enrollment" if is_enrollment else "probe"
+    for role_name in (
+        "train",
+        "enrollment",
+        "probe",
+    ):
+        partition_log.setdefault(
+            role_name,
+            {},
+        )
 
     partition_log[role][str(subject_id)] = [
         {
@@ -1196,13 +1458,14 @@ def _record_partition_assignment(loader, is_enrollment, subject_id, records):
     ]
 
 
+
 def summarize_partition_log(loader):
     """
-    Summarize the enrollment/probe assignment recorded during a live run.
+    Summarize record assignments and check source-side separation from probes.
 
-    Returns ``None`` when no record-order partitions were built, which is the
-    case for single-session regimes and for runs served entirely from the
-    dataset cache.
+    Training and enrollment are allowed to share recordings. Probe recordings
+    are checked against the union of both roles. Historical two-role logs that
+    contain only enrollment and probe entries remain valid.
     """
     partition_log = getattr(
         loader,
@@ -1213,6 +1476,10 @@ def summarize_partition_log(loader):
     if not partition_log:
         return None
 
+    training_by_subject = partition_log.get(
+        "train",
+        {},
+    )
     enrollment_by_subject = partition_log.get(
         "enrollment",
         {},
@@ -1222,60 +1489,97 @@ def summarize_partition_log(loader):
         {},
     )
 
+    source_subjects = (
+        set(training_by_subject)
+        | set(enrollment_by_subject)
+    )
+
     shared_subjects = sorted(
-        set(enrollment_by_subject)
+        source_subjects
         & set(probe_by_subject)
     )
 
     violations = []
 
     for subject_id in shared_subjects:
-        enrollment_entries = enrollment_by_subject[
+        source_entries = (
+            list(
+                training_by_subject.get(
+                    subject_id,
+                    [],
+                )
+            )
+            + list(
+                enrollment_by_subject.get(
+                    subject_id,
+                    [],
+                )
+            )
+        )
+
+        probe_entries = probe_by_subject[
             subject_id
         ]
-        probe_entries = probe_by_subject[subject_id]
 
-        enrollment_files = {
+        source_files = {
             entry["filename"]
-            for entry in enrollment_entries
+            for entry in source_entries
         }
+
         probe_files = {
             entry["filename"]
             for entry in probe_entries
         }
 
-        shared_files = enrollment_files & probe_files
+        shared_files = (
+            source_files
+            & probe_files
+        )
 
         if shared_files:
             violations.append(
                 {
                     "subject": subject_id,
                     "reasons": [
-                        "enrollment and probe partitions share "
-                        f"recording(s): {sorted(shared_files)}"
+                        "training/enrollment and probe partitions "
+                        "share recording(s): "
+                        f"{sorted(shared_files)}"
                     ],
                 }
             )
             continue
 
-        enrollment_dates = [
+        source_dates = [
             entry["date"]
-            for entry in enrollment_entries
-        ]
-        probe_dates = [
-            entry["date"] for entry in probe_entries
+            for entry in source_entries
+            if entry.get("date") not in {
+                "",
+                "None",
+            }
         ]
 
-        if not (enrollment_dates and probe_dates):
+        probe_dates = [
+            entry["date"]
+            for entry in probe_entries
+            if entry.get("date") not in {
+                "",
+                "None",
+            }
+        ]
+
+        if not (
+            source_dates
+            and probe_dates
+        ):
             continue
 
-        if max(enrollment_dates) > min(probe_dates):
+        if max(source_dates) > min(probe_dates):
             violations.append(
                 {
                     "subject": subject_id,
                     "reasons": [
-                        "an enrollment recording is dated after the "
-                        "first probe recording"
+                        "a training/enrollment recording is dated "
+                        "after the first probe recording"
                     ],
                 }
             )
@@ -1286,11 +1590,22 @@ def summarize_partition_log(loader):
             "data_split_mode",
             None,
         ),
-        "subjects_enrolled": len(enrollment_by_subject),
-        "subjects_probed": len(probe_by_subject),
-        "subjects_audited": len(shared_subjects),
+        "subjects_trained": len(
+            training_by_subject
+        ),
+        "subjects_enrolled": len(
+            enrollment_by_subject
+        ),
+        "subjects_probed": len(
+            probe_by_subject
+        ),
+        "subjects_audited": len(
+            shared_subjects
+        ),
         "violations": violations,
-        "enrollment_precedes_probe": not violations,
+        "enrollment_precedes_probe": (
+            not violations
+        ),
     }
 
 
@@ -1714,6 +2029,8 @@ class load_ecgid_dataset():
     def __init__(self, num_beats_to_merge=1, beat_merge_method="average",
                  beat_merge_stride=1,
                  data_split_mode="all-available", signal_type=None,
+                 train_record_indices=None, enroll_record_indices=None,
+                 probe_record_indices=None,
                  cleanup_zip=False, preprocessing_config=None,
                  **preprocessing_params):
         
@@ -1751,14 +2068,17 @@ class load_ecgid_dataset():
         )
         self.cleanup_zip = cleanup_zip
         
-        valid_modes = [
-            "all-available", "single-session", "single-cross-session", 
-            "single-shot-short-term", "leave-last-out-short-term", 
-            "single-shot-long-term", "leave-last-out-long-term"
-        ]
+        valid_modes = list(RECORD_BASED_SPLIT_MODES)
         if data_split_mode not in valid_modes:
             raise ValueError(f"Invalid mode: {data_split_mode}. Use {valid_modes}")
         self.data_split_mode = data_split_mode
+        _configure_record_role_indices(
+            self,
+            data_split_mode,
+            train_record_indices,
+            enroll_record_indices,
+            probe_record_indices,
+        )
         # Recorded so that the temporal-date policy reaches the cache
         # identity: a cache built under a different policy describes a
         # different partition and must not be reused.
@@ -1956,16 +2276,19 @@ class load_ecgid_dataset():
         Loads the partitioned data strictly based on temporal/record boundaries.
         Applies to cross-session and short/long-term tasks.
         """
-        session_name = session_name.lower()
-        if session_name in ["enrol", "train"]:
-            is_enrollment = True
-            log_name = "Train/Enrollment"
-        elif session_name in ["probe", "test"]:
-            is_enrollment = False
-            log_name = "Test/Probe"
-        else:
-            raise ValueError("session_name must be 'enrol', 'train', 'probe', or 'test'.")
-            
+        role = _canonical_record_role(session_name)
+        is_enrollment = role != "probe"
+        log_role = (
+            role
+            if self.data_split_mode == CUSTOM_RECORD_SPLIT_MODE
+            else is_enrollment
+        )
+        log_name = {
+            "train": "Training",
+            "enrollment": "Enrollment",
+            "probe": "Test/Probe",
+        }[role]
+
         data = self.load_raw_data()
         x_list, y_list = [], []
         provenance_builder = _ProvenanceBuilder() if return_provenance else None
@@ -1978,10 +2301,25 @@ class load_ecgid_dataset():
             (
                 target_recs,
                 subject_is_eligible,
-            ) = select_record_order_partition(
+            ) = select_record_role_partition(
                 recs,
                 self.data_split_mode,
-                is_enrollment,
+                role,
+                train_record_indices=getattr(
+                    self,
+                    "train_record_indices",
+                    None,
+                ),
+                enroll_record_indices=getattr(
+                    self,
+                    "enroll_record_indices",
+                    None,
+                ),
+                probe_record_indices=getattr(
+                    self,
+                    "probe_record_indices",
+                    None,
+                ),
             )
 
             if not subject_is_eligible:
@@ -1992,7 +2330,7 @@ class load_ecgid_dataset():
 
             _record_partition_assignment(
                 self,
-                is_enrollment,
+                log_role,
                 sid,
                 target_recs,
             )
@@ -2093,7 +2431,7 @@ class load_heartprint_dataset():
     def __init__(self, data_split_mode="cross-session",
                  session_for_single_session_evaluation=["session1"],
                  train_sessions=["session1"],
-                 enroll_sessions=["session1"],
+                 enroll_sessions=None,
                  probe_sessions=["session2"],
                  num_beats_to_merge=1, beat_merge_method="average",
                  beat_merge_stride=1,
@@ -2133,7 +2471,11 @@ class load_heartprint_dataset():
         
         self.session_for_single_session_evaluation = to_list(session_for_single_session_evaluation)
         self.train_sessions = to_list(train_sessions)
-        self.enroll_sessions = to_list(enroll_sessions)
+        self.enroll_sessions = (
+            list(self.train_sessions)
+            if enroll_sessions is None
+            else to_list(enroll_sessions)
+        )
         self.probe_sessions = to_list(probe_sessions)
         
         # Enforce exact naming to match folder architectures
@@ -2466,6 +2808,8 @@ class load_ptb_dataset():
     def __init__(self, leads=['i'], data_split_mode="all-available",
                  only_healthy=False, num_beats_to_merge=1, beat_merge_method="average",
                  beat_merge_stride=1,
+                 train_record_indices=None, enroll_record_indices=None,
+                 probe_record_indices=None,
                  cleanup_zip=False, preprocessing_config=None,
                  **preprocessing_params):
        
@@ -2492,14 +2836,17 @@ class load_ptb_dataset():
         )
         self.cleanup_zip = cleanup_zip
         
-        valid_modes = [
-            "all-available", "single-session", "single-cross-session", 
-            "single-shot-short-term", "leave-last-out-short-term", 
-            "single-shot-long-term", "leave-last-out-long-term"
-        ]
+        valid_modes = list(RECORD_BASED_SPLIT_MODES)
         if data_split_mode not in valid_modes:
             raise ValueError(f"Invalid mode: {data_split_mode}. Use {valid_modes}")
         self.data_split_mode = data_split_mode
+        _configure_record_role_indices(
+            self,
+            data_split_mode,
+            train_record_indices,
+            enroll_record_indices,
+            probe_record_indices,
+        )
         # Recorded so that the temporal-date policy reaches the cache
         # identity: a cache built under a different policy describes a
         # different partition and must not be reused.
@@ -2746,16 +3093,19 @@ class load_ptb_dataset():
         Loads the partitioned data strictly based on temporal/record boundaries.
         Applies to cross-session and short/long-term tasks.
         """
-        session_name = session_name.lower()
-        if session_name in ["enrol", "train"]:
-            is_enrollment = True
-            log_name = "Train/Enrollment"
-        elif session_name in ["probe", "test"]:
-            is_enrollment = False
-            log_name = "Test/Probe"
-        else:
-            raise ValueError("session_name must be 'enrol', 'train', 'probe', or 'test'.")
-            
+        role = _canonical_record_role(session_name)
+        is_enrollment = role != "probe"
+        log_role = (
+            role
+            if self.data_split_mode == CUSTOM_RECORD_SPLIT_MODE
+            else is_enrollment
+        )
+        log_name = {
+            "train": "Training",
+            "enrollment": "Enrollment",
+            "probe": "Test/Probe",
+        }[role]
+
         data = self.load_raw_data()
         x_list, y_list = [], []
         provenance_builder = _ProvenanceBuilder() if return_provenance else None
@@ -2768,10 +3118,25 @@ class load_ptb_dataset():
             (
                 target_recs,
                 subject_is_eligible,
-            ) = select_record_order_partition(
+            ) = select_record_role_partition(
                 recs,
                 self.data_split_mode,
-                is_enrollment,
+                role,
+                train_record_indices=getattr(
+                    self,
+                    "train_record_indices",
+                    None,
+                ),
+                enroll_record_indices=getattr(
+                    self,
+                    "enroll_record_indices",
+                    None,
+                ),
+                probe_record_indices=getattr(
+                    self,
+                    "probe_record_indices",
+                    None,
+                ),
             )
 
             if not subject_is_eligible:
@@ -2782,7 +3147,7 @@ class load_ptb_dataset():
 
             _record_partition_assignment(
                 self,
-                is_enrollment,
+                log_role,
                 sid,
                 target_recs,
             )
@@ -2893,7 +3258,7 @@ class load_cybhi_dataset():
     def __init__(self, data_split_mode="cross-session",
                  session_for_single_session_evaluation=["long-term_S1"],
                  train_sessions=["long-term_S1"],
-                 enroll_sessions=["long-term_S1"],
+                 enroll_sessions=None,
                  probe_sessions=["long-term_S2"],
                  electrode_unit=None,
                  num_beats_to_merge=1, beat_merge_method="average",
@@ -2948,7 +3313,11 @@ class load_cybhi_dataset():
         
         self.session_for_single_session_evaluation = to_list(session_for_single_session_evaluation)
         self.train_sessions = to_list(train_sessions)
-        self.enroll_sessions = to_list(enroll_sessions)
+        self.enroll_sessions = (
+            list(self.train_sessions)
+            if enroll_sessions is None
+            else to_list(enroll_sessions)
+        )
         self.probe_sessions = to_list(probe_sessions)
         
         self.required_cross_sessions = list(set(self.train_sessions + self.enroll_sessions + self.probe_sessions))
@@ -3322,7 +3691,12 @@ class load_mitbih_dataset():
         # Segment mappings (in minutes)
         self.single_segment_range = single_segment_range
         self.train_parts = train_parts
-        self.enrol_parts = enrol_parts
+        self.enrol_parts = (
+            list(train_parts)
+            if enrol_parts is None
+            and train_parts is not None
+            else enrol_parts
+        )
         self.test_parts = test_parts
         self.temporal_partition_audit = None
 
@@ -3742,7 +4116,12 @@ class load_nsrdb_dataset():
         # Segment mappings (in minutes)
         self.single_segment_range = single_segment_range
         self.train_parts = train_parts
-        self.enrol_parts = enrol_parts
+        self.enrol_parts = (
+            list(train_parts)
+            if enrol_parts is None
+            and train_parts is not None
+            else enrol_parts
+        )
         self.test_parts = test_parts
         self.temporal_partition_audit = None
 
@@ -4053,6 +4432,8 @@ class load_ptbxl_dataset():
                  data_split_mode="all-available", num_beats_to_merge=1,
                  beat_merge_method="average", beat_merge_stride=1,
                  limit_records=None,
+                 train_record_indices=None, enroll_record_indices=None,
+                 probe_record_indices=None,
                  cleanup_zip=False, preprocessing_config=None,
                  **preprocessing_params):
 
@@ -4088,14 +4469,17 @@ class load_ptbxl_dataset():
         self.limit_records = limit_records
         self.cleanup_zip = cleanup_zip
         
-        valid_modes = [
-            "all-available", "single-session", "single-cross-session", 
-            "single-shot-short-term", "leave-last-out-short-term", 
-            "single-shot-long-term", "leave-last-out-long-term"
-        ]
+        valid_modes = list(RECORD_BASED_SPLIT_MODES)
         if data_split_mode not in valid_modes:
             raise ValueError(f"Invalid mode: {data_split_mode}. Use {valid_modes}")
         self.data_split_mode = data_split_mode
+        _configure_record_role_indices(
+            self,
+            data_split_mode,
+            train_record_indices,
+            enroll_record_indices,
+            probe_record_indices,
+        )
         # Recorded so that the temporal-date policy reaches the cache
         # identity: a cache built under a different policy describes a
         # different partition and must not be reused.
@@ -4297,16 +4681,19 @@ class load_ptbxl_dataset():
         Loads the partitioned data strictly based on temporal/record boundaries.
         No intra-record splitting is permitted to preserve complete 10s windows.
         """
-        session_name = session_name.lower()
-        if session_name in ["enrol", "train"]:
-            is_enrollment = True
-            log_name = "Train/Enrollment"
-        elif session_name in ["probe", "test"]:
-            is_enrollment = False
-            log_name = "Test/Probe"
-        else:
-            raise ValueError("session_name must be 'enrol', 'train', 'probe', or 'test'.")
-            
+        role = _canonical_record_role(session_name)
+        is_enrollment = role != "probe"
+        log_role = (
+            role
+            if self.data_split_mode == CUSTOM_RECORD_SPLIT_MODE
+            else is_enrollment
+        )
+        log_name = {
+            "train": "Training",
+            "enrollment": "Enrollment",
+            "probe": "Test/Probe",
+        }[role]
+
         data = self.load_raw_data()
         x_list, y_list = [], []
         provenance_builder = _ProvenanceBuilder() if return_provenance else None
@@ -4319,10 +4706,25 @@ class load_ptbxl_dataset():
             (
                 target_recs,
                 subject_is_eligible,
-            ) = select_record_order_partition(
+            ) = select_record_role_partition(
                 recs,
                 self.data_split_mode,
-                is_enrollment,
+                role,
+                train_record_indices=getattr(
+                    self,
+                    "train_record_indices",
+                    None,
+                ),
+                enroll_record_indices=getattr(
+                    self,
+                    "enroll_record_indices",
+                    None,
+                ),
+                probe_record_indices=getattr(
+                    self,
+                    "probe_record_indices",
+                    None,
+                ),
             )
 
             if not subject_is_eligible:
@@ -4333,7 +4735,7 @@ class load_ptbxl_dataset():
 
             _record_partition_assignment(
                 self,
-                is_enrollment,
+                log_role,
                 sid,
                 target_recs,
             )
