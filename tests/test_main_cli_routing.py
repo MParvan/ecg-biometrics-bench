@@ -600,14 +600,16 @@ class MainCLIRoutingTests(unittest.TestCase):
                         loader.session_2_y,
                     )
 
-                # Identification runners receive the exact provenance objects the
-                # loader returned; verification runners receive none.
-                if task in (1, 3):
+                # Every runner receives the exact provenance objects the loader
+                # returned. Intra-session tasks (1/2/3/4) get ``provenance``;
+                # cross-session tasks (5/6/7/8) get ``provenance_s1``/
+                # ``provenance_s2``.
+                if task in (1, 2, 3, 4):
                     self.assertIs(
                         keyword_arguments["provenance"],
                         loader.intra_provenance,
                     )
-                elif task in (5, 7):
+                else:
                     self.assertIs(
                         keyword_arguments["provenance_s1"],
                         loader.s1_provenance,
@@ -616,11 +618,6 @@ class MainCLIRoutingTests(unittest.TestCase):
                         keyword_arguments["provenance_s2"],
                         loader.s2_provenance,
                     )
-                elif task in (2, 4):
-                    self.assertNotIn("provenance", keyword_arguments)
-                else:
-                    self.assertNotIn("provenance_s1", keyword_arguments)
-                    self.assertNotIn("provenance_s2", keyword_arguments)
 
                 self.assert_common_arguments(
                     keyword_arguments,

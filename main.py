@@ -1824,6 +1824,7 @@ def main():
                 use_deployment_evaluation=args.use_deployment_evaluation,
                 target_fars=args.target_fars,
                 sqi_scores=args.sqi_method,
+                provenance=provenance,
                 **common_args
             )
 
@@ -1848,6 +1849,7 @@ def main():
                 use_deployment_evaluation=args.use_deployment_evaluation,
                 target_fars=args.target_fars,
                 sqi_scores=args.sqi_method,
+                provenance=provenance,
                 **common_args
             )
 
@@ -1873,6 +1875,8 @@ def main():
                 target_fars=args.target_fars,
                 sqi_train=args.sqi_method,
                 sqi_test=args.sqi_method,
+                provenance_s1=provenance_s1,
+                provenance_s2=provenance_s2,
                 **common_args
             )
 
@@ -1900,6 +1904,8 @@ def main():
                 target_fars=args.target_fars,
                 sqi_s1=args.sqi_method,
                 sqi_s2=args.sqi_method,
+                provenance_s1=provenance_s1,
+                provenance_s2=provenance_s2,
                 **common_args
             )
 

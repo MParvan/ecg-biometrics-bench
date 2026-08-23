@@ -4775,7 +4775,7 @@ def run_closed_set_verification(x, y, model_class, epochs=150, batch_size=256, l
                                 save_results_and_settings=False, 
                                 loader=None, n_runs=1, _return_stats=False,
                                 intelligent_weight_loading=True,
-                                augmentation_config=None, split_seed=None):
+                                augmentation_config=None, split_seed=None, provenance=None):
     """
     Standard Closed-Set Verification Pipeline (Intra-session).
     Determines "Is this person who they claim to be?" (1:1 matching) for subjects known to the model.
@@ -4975,6 +4975,8 @@ def run_closed_set_verification(x, y, model_class, epochs=150, batch_size=256, l
     x, y = x[valid_mask], y[valid_mask]
     if sqi_scores is not None: 
         sqi_scores = sqi_scores[valid_mask]
+    if provenance is not None:
+        provenance = provenance.subset(valid_mask)
 
     # ====================================================
     # 3. SPLIT DATA & SQI SCORES
@@ -5005,14 +5007,28 @@ def run_closed_set_verification(x, y, model_class, epochs=150, batch_size=256, l
         "holdout"
     ]
 
+    provenance_train = None
+    if provenance is not None:
+        provenance_train = provenance.subset(
+            train_test_partitions["indices"]["retained"]
+        )
+
     # ====================================================
     # 4. APPLY FILTERS INDEPENDENTLY
     # ====================================================
     if outlier_filtering_on_train and sqi_train is not None:
         print("\n[INFO] Filtering Train Set (Enrollment)...")
-        X_train, y_train = _apply_outlier_filter(
-            X_train, y_train, sqi_train, absolute_threshold=sqi_threshold, keep_percentage=sqi_keep_pct
-        )
+        if provenance_train is not None:
+            X_train, y_train, retained_indices = _apply_outlier_filter(
+                X_train, y_train, sqi_train, absolute_threshold=sqi_threshold,
+                keep_percentage=sqi_keep_pct, return_indices=True
+            )
+            provenance_train = provenance_train.subset(retained_indices)
+        else:
+            X_train, y_train = _apply_outlier_filter(
+                X_train, y_train, sqi_train, absolute_threshold=sqi_threshold,
+                keep_percentage=sqi_keep_pct
+            )
 
     if outlier_filtering_on_test and sqi_test is not None:
         print("\n[INFO] Filtering Test Set (Probes)...")
@@ -5220,7 +5236,8 @@ def run_closed_set_verification(x, y, model_class, epochs=150, batch_size=256, l
         train_emb, train_lab = _get_embeddings(model, train_extract_loader, device)
         
         templates, temp_labels = _create_templates(
-            train_emb, train_lab, method=template_fusion_method, max_beats=template_size
+            train_emb, train_lab, method=template_fusion_method,
+            max_beats=template_size, provenance=provenance_train
         )
         
         scores, labels_pair = _generate_pairs(
@@ -5908,7 +5925,7 @@ def run_subject_disjoint_verification(x, y, model_class, epochs=150, batch_size=
                                       save_results_and_settings=False, 
                                       loader=None, n_runs=1, _return_stats=False,
                                       intelligent_weight_loading=True,
-                                      augmentation_config=None, split_seed=None):
+                                      augmentation_config=None, split_seed=None, provenance=None):
     """
     Subject-Disjoint Verification Pipeline (Subject-Disjoint 1:1 Matching).
     Tests the system's ability to verify the identity of completely new users.
@@ -6116,6 +6133,8 @@ def run_subject_disjoint_verification(x, y, model_class, epochs=150, batch_size=
     x, y = x[valid_mask], y[valid_mask]
     if sqi_scores is not None: 
         sqi_scores = sqi_scores[valid_mask]
+    if provenance is not None:
+        provenance = provenance.subset(valid_mask)
 
     # ====================================================
     # 3. SPLIT SUBJECTS (Strictly Disjoint)
@@ -6168,6 +6187,12 @@ def run_subject_disjoint_verification(x, y, model_class, epochs=150, batch_size=
         sqi_test,
     ) = partitions["test"]
 
+    provenance_test = None
+    if provenance is not None:
+        provenance_test = provenance.subset(
+            partitions["indices"]["test"]
+        )
+
     print(
         "Subject Split: "
         f"Train={len(train_subs)}, "
@@ -6184,14 +6209,26 @@ def run_subject_disjoint_verification(x, y, model_class, epochs=150, batch_size=
 
     if outlier_filtering_on_test and sqi_scores is not None:
         print("\n[INFO] Filtering Test Set (Probes)...")
-        X_test, y_test = _apply_outlier_filter(
-            X_test,
-            y_test,
-            sqi_test,
-            absolute_threshold=sqi_threshold,
-            keep_percentage=sqi_keep_pct,
-            apply_subject_ranking=False,
-        )
+        if provenance_test is not None:
+            X_test, y_test, retained_indices = _apply_outlier_filter(
+                X_test,
+                y_test,
+                sqi_test,
+                absolute_threshold=sqi_threshold,
+                keep_percentage=sqi_keep_pct,
+                apply_subject_ranking=False,
+                return_indices=True,
+            )
+            provenance_test = provenance_test.subset(retained_indices)
+        else:
+            X_test, y_test = _apply_outlier_filter(
+                X_test,
+                y_test,
+                sqi_test,
+                absolute_threshold=sqi_threshold,
+                keep_percentage=sqi_keep_pct,
+                apply_subject_ranking=False,
+            )
 
     # ====================================================
     # 5. POST-FILTER SYNCHRONIZATION
@@ -6205,6 +6242,8 @@ def run_subject_disjoint_verification(x, y, model_class, epochs=150, batch_size=
         
     test_survivor_mask = np.isin(y_test, valid_test_subs)
     X_test, y_test = X_test[test_survivor_mask], y_test[test_survivor_mask]
+    if provenance_test is not None:
+        provenance_test = provenance_test.subset(test_survivor_mask)
     test_subs_final = valid_test_subs
     
     if len(test_subs_final) < 2:
@@ -6385,6 +6424,7 @@ def run_subject_disjoint_verification(x, y, model_class, epochs=150, batch_size=
                 test_lab,
                 subjects=test_subs_final,
                 template_size=template_size,
+                provenance=provenance_test,
             )
         )
 
@@ -6993,7 +7033,7 @@ def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class
                                    save_results_and_settings=False, loader=None, 
                                    n_runs=1, _return_stats=False,
                                    intelligent_weight_loading=True,
-                                   augmentation_config=None, split_seed=None):
+                                   augmentation_config=None, split_seed=None, provenance_s1=None, provenance_s2=None):
     """
     Cross-Session Verification Pipeline (Temporal Robustness 1:1).
     Attempts to verify if a subject is who they claim to be across different time-separated recording sessions.
@@ -7182,18 +7222,47 @@ def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class
     # ====================================================
     if sqi_train is not None:
         print("\n[INFO] Filtering Session 1 (Enrollment)...")
-        x_train, y_train = _apply_outlier_filter(x_train, y_train, sqi_train, sqi_threshold, sqi_keep_pct)
+        if provenance_s1 is not None:
+            x_train, y_train, retained_indices = _apply_outlier_filter(
+                x_train,
+                y_train,
+                sqi_train,
+                sqi_threshold,
+                sqi_keep_pct,
+                return_indices=True,
+            )
+            provenance_s1 = provenance_s1.subset(retained_indices)
+        else:
+            x_train, y_train = _apply_outlier_filter(
+                x_train,
+                y_train,
+                sqi_train,
+                sqi_threshold,
+                sqi_keep_pct,
+            )
 
     if sqi_test is not None:
         print("\n[INFO] Filtering Session 2 (Probes)...")
-        x_test, y_test = _apply_outlier_filter(
-            x_test,
-            y_test,
-            sqi_test,
-            absolute_threshold=sqi_threshold,
-            keep_percentage=sqi_keep_pct,
-            apply_subject_ranking=False,
-        )
+        if provenance_s2 is not None:
+            x_test, y_test, retained_indices = _apply_outlier_filter(
+                x_test,
+                y_test,
+                sqi_test,
+                absolute_threshold=sqi_threshold,
+                keep_percentage=sqi_keep_pct,
+                apply_subject_ranking=False,
+                return_indices=True,
+            )
+            provenance_s2 = provenance_s2.subset(retained_indices)
+        else:
+            x_test, y_test = _apply_outlier_filter(
+                x_test,
+                y_test,
+                sqi_test,
+                absolute_threshold=sqi_threshold,
+                keep_percentage=sqi_keep_pct,
+                apply_subject_ranking=False,
+            )
 
     # ====================================================
     # 3. SYNCHRONISE KNOWN SUBJECTS ACROSS SESSIONS
@@ -7230,6 +7299,19 @@ def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class
     ) = cross_session_partitions[
         "session_2"
     ]
+
+    provenance_enroll = None
+    provenance_probe = None
+
+    if provenance_s1 is not None:
+        provenance_enroll = provenance_s1.subset(
+            cross_session_partitions["indices"]["session_1"]
+        )
+
+    if provenance_s2 is not None:
+        provenance_probe = provenance_s2.subset(
+            cross_session_partitions["indices"]["session_2"]
+        )
 
     dropped_subjects = (
         cross_session_partitions[
@@ -7411,7 +7493,11 @@ def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class
         emb_enroll, lab_enroll = _get_embeddings(model, enroll_loader, device)
         
         templates, temp_labels = _create_templates(
-            emb_enroll, lab_enroll, method=template_fusion_method, max_beats=template_size
+            emb_enroll,
+            lab_enroll,
+            method=template_fusion_method,
+            max_beats=template_size,
+            provenance=provenance_enroll,
         )
         
         scores, labels_pair = _generate_pairs(
@@ -8027,7 +8113,7 @@ def run_subject_disjoint_cross_session_verification(
         use_deployment_evaluation=False, target_fars=None,
         save_results_and_settings=False, loader=None, n_runs=1, _return_stats=False,
         intelligent_weight_loading=True,
-        augmentation_config=None, split_seed=None):
+        augmentation_config=None, split_seed=None, provenance_s1=None, provenance_s2=None):
     """
     The Ultimate Biometric Test: Subject-Disjoint + Temporal Robustness 1:1 Verification.
     Verifies the identity of subjects completely excluded from representation learning, across different recording days.
@@ -8212,18 +8298,47 @@ def run_subject_disjoint_cross_session_verification(
 
     if sqi_s1 is not None:
         print("\n[INFO] Filtering Session 1 (Representation & Enrollment)...")
-        x_s1, y_s1 = _apply_outlier_filter(x_s1, y_s1, sqi_s1, sqi_threshold, sqi_keep_pct)
+        if provenance_s1 is not None:
+            x_s1, y_s1, retained_indices = _apply_outlier_filter(
+                x_s1,
+                y_s1,
+                sqi_s1,
+                sqi_threshold,
+                sqi_keep_pct,
+                return_indices=True,
+            )
+            provenance_s1 = provenance_s1.subset(retained_indices)
+        else:
+            x_s1, y_s1 = _apply_outlier_filter(
+                x_s1,
+                y_s1,
+                sqi_s1,
+                sqi_threshold,
+                sqi_keep_pct,
+            )
 
     if sqi_s2 is not None:
         print("\n[INFO] Filtering Session 2 (Probes)...")
-        x_s2, y_s2 = _apply_outlier_filter(
-            x_s2,
-            y_s2,
-            sqi_s2,
-            absolute_threshold=sqi_threshold,
-            keep_percentage=sqi_keep_pct,
-            apply_subject_ranking=False,
-        )
+        if provenance_s2 is not None:
+            x_s2, y_s2, retained_indices = _apply_outlier_filter(
+                x_s2,
+                y_s2,
+                sqi_s2,
+                absolute_threshold=sqi_threshold,
+                keep_percentage=sqi_keep_pct,
+                apply_subject_ranking=False,
+                return_indices=True,
+            )
+            provenance_s2 = provenance_s2.subset(retained_indices)
+        else:
+            x_s2, y_s2 = _apply_outlier_filter(
+                x_s2,
+                y_s2,
+                sqi_s2,
+                absolute_threshold=sqi_threshold,
+                keep_percentage=sqi_keep_pct,
+                apply_subject_ranking=False,
+            )
 
     # ====================================================
     # 2. INTERSECT AND SPLIT SUBJECTS
@@ -8282,6 +8397,19 @@ def run_subject_disjoint_cross_session_verification(
         X_probe,
         Y_probe,
     ) = partitions["probe"]
+
+    provenance_enroll = None
+    provenance_probe = None
+
+    if provenance_s1 is not None:
+        provenance_enroll = provenance_s1.subset(
+            partitions["indices"]["enrollment"]
+        )
+
+    if provenance_s2 is not None:
+        provenance_probe = provenance_s2.subset(
+            partitions["indices"]["probe"]
+        )
 
     # ====================================================
     # 3. ENCODE LABELS (CRITICAL FIX FOR PYTORCH TENSORS)
@@ -8459,7 +8587,11 @@ def run_subject_disjoint_cross_session_verification(
         emb_enroll, lab_enroll = _get_embeddings(model, enroll_loader, device)
         
         templates, temp_labels = _create_templates(
-            emb_enroll, lab_enroll, method=template_fusion_method, max_beats=template_size
+            emb_enroll,
+            lab_enroll,
+            method=template_fusion_method,
+            max_beats=template_size,
+            provenance=provenance_enroll,
         )
         
         scores, labels_pair = _generate_pairs(
