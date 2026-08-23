@@ -82,7 +82,7 @@ class SyntheticContinuousLoader:
     def _load_session(self, session_name, return_provenance=False):
         if session_name == "train":
             x, y = self.train_x, self.train_y
-        elif session_name == "test":
+        elif session_name in {"test", "probe"}:
             x, y = self.test_x, self.test_y
         else:
             raise ValueError(
@@ -98,7 +98,7 @@ class SyntheticContinuousLoader:
 class ContinuousDatasetCLITests(
     unittest.TestCase
 ):
-    def test_mitbih_custom_ranges_reach_loader(self):
+    def test_mitbih_unused_enrollment_range_is_not_routed(self):
         loader = SyntheticContinuousLoader()
 
         cli_arguments = [
@@ -155,9 +155,6 @@ class ContinuousDatasetCLITests(
                 (0.0, 5.0),
                 (10.0, 15.0),
             ],
-            enrol_parts=[
-                (15.0, 20.0),
-            ],
             test_parts=[
                 (25.0, 30.0),
             ],
@@ -168,7 +165,7 @@ class ContinuousDatasetCLITests(
             loader.load_session.call_args_list,
             [
                 call("train", return_provenance=True),
-                call("test", return_provenance=True),
+                call("probe", return_provenance=True),
             ],
         )
 

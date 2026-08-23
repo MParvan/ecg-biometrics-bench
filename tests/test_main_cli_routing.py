@@ -114,7 +114,7 @@ class SyntheticLoader:
     def _load_session(self, session_name, return_provenance=False):
         if session_name == "train":
             x, y, attribute = self.session_1_x, self.session_1_y, "s1_provenance"
-        elif session_name == "test":
+        elif session_name in {"test", "probe"}:
             x, y, attribute = self.session_2_x, self.session_2_y, "s2_provenance"
         else:
             raise ValueError(
@@ -573,7 +573,7 @@ class MainCLIRoutingTests(unittest.TestCase):
                                 return_provenance=True,
                             ),
                             call(
-                                "test",
+                                "probe",
                                 return_provenance=True,
                             ),
                         ],

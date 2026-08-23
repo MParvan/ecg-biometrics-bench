@@ -735,34 +735,218 @@ def validate_experiment_arguments(args, parser):
                 f"'{argument_name}' must contain only non-empty strings."
             )
 
-    # Cross-session regimes must not draw probes from a session that also
-    # supplied training or enrollment data. Ordering is deliberately not
-    # checked here: reverse protocols that enrol on a later session and probe
-    # an earlier one are a legitimate way to measure directional drift.
-    if args.task in [5, 6, 7, 8] and args.probe_sessions:
-        enrollment_sessions = set(
-            args.train_sessions or []
-        ) | set(
-            args.enroll_sessions or []
+    session_selector_names = (
+        "train_sessions",
+        "enroll_sessions",
+        "probe_sessions",
+        "session_for_single_session_evaluation",
+    )
+
+    if (
+        args.dataset
+        not in SESSION_ROUTED_DATASETS
+        and any(
+            getattr(
+                args,
+                selector_name,
+            )
+            is not None
+            for selector_name
+            in session_selector_names
+        )
+    ):
+        parser.error(
+            "Session-name selectors are supported only "
+            "for HeartPrint and CYBHi."
         )
 
-        shared_sessions = enrollment_sessions & set(
-            args.probe_sessions
+    # Probe sources must be disjoint from representation-learning sources and,
+    # when a gallery is constructed, from active enrollment sources.
+    if (
+        args.task in [
+            5,
+            6,
+            7,
+            8,
+        ]
+        and args.probe_sessions
+    ):
+        source_sessions = set(
+            args.train_sessions
+            or []
+        )
+
+        if _cross_session_uses_enrollment(
+            args
+        ):
+            source_sessions.update(
+                args.enroll_sessions
+                or []
+            )
+
+        shared_sessions = (
+            source_sessions
+            & set(
+                args.probe_sessions
+            )
         )
 
         if shared_sessions:
             parser.error(
                 "Cross-session Task "
                 f"{args.task} would probe session(s) "
-                f"{sorted(shared_sessions)}, which also supply "
-                "training or enrollment data. Enrollment and probe "
-                "sessions must be disjoint so that reported "
-                "performance is not inflated by evaluating on a "
-                "session the template was built from."
+                f"{sorted(shared_sessions)}, which also "
+                "supply training or active enrollment data. "
+                "Training/probe and enrollment/probe "
+                "sessions must be disjoint."
             )
 
     # ---------------------------------------------------------
-    # 9. Continuous-recording minute ranges
+    # 9. Explicit record-role selectors
+    # ---------------------------------------------------------
+    record_selector_names = (
+        "train_record_indices",
+        "enroll_record_indices",
+        "probe_record_indices",
+    )
+
+    record_selector_values = {
+        selector_name: getattr(
+            args,
+            selector_name,
+        )
+        for selector_name
+        in record_selector_names
+    }
+
+    supplied_record_selectors = [
+        selector_name
+        for (
+            selector_name,
+            selector_value,
+        )
+        in record_selector_values.items()
+        if selector_value is not None
+    ]
+
+    if (
+        supplied_record_selectors
+        and args.dataset
+        not in RECORD_ROUTED_DATASETS
+    ):
+        parser.error(
+            "Record-index selectors are supported only "
+            "for ECG-ID, PTB, and PTB-XL."
+        )
+
+    for (
+        selector_name,
+        selector_value,
+    ) in record_selector_values.items():
+        if selector_value is None:
+            continue
+
+        if (
+            not isinstance(
+                selector_value,
+                (list, tuple),
+            )
+            or not selector_value
+        ):
+            parser.error(
+                f"'{selector_name}' must contain at least "
+                "one zero-based record index."
+            )
+
+        normalized_indices = []
+
+        for index in selector_value:
+            if (
+                isinstance(
+                    index,
+                    bool,
+                )
+                or not isinstance(
+                    index,
+                    Integral,
+                )
+                or index < 0
+            ):
+                parser.error(
+                    f"'{selector_name}' must contain only "
+                    "non-negative integers."
+                )
+
+            normalized_indices.append(
+                int(index)
+            )
+
+        if (
+            len(
+                set(
+                    normalized_indices
+                )
+            )
+            != len(
+                normalized_indices
+            )
+        ):
+            parser.error(
+                f"'{selector_name}' cannot contain "
+                "duplicate record indices."
+            )
+
+        setattr(
+            args,
+            selector_name,
+            normalized_indices,
+        )
+
+    if (
+        args.data_split_mode
+        == "custom-record-split"
+    ):
+        if (
+            args.dataset
+            not in RECORD_ROUTED_DATASETS
+        ):
+            parser.error(
+                "data_split_mode='custom-record-split' "
+                "is supported only for ECG-ID, PTB, "
+                "and PTB-XL."
+            )
+
+        if args.task not in [
+            5,
+            6,
+            7,
+            8,
+        ]:
+            parser.error(
+                "data_split_mode='custom-record-split' "
+                "requires Task 5, 6, 7, or 8."
+            )
+
+        if not args.train_record_indices:
+            parser.error(
+                "custom-record-split requires "
+                "'train_record_indices'."
+            )
+
+        if not args.probe_record_indices:
+            parser.error(
+                "custom-record-split requires "
+                "'probe_record_indices'."
+            )
+
+    elif supplied_record_selectors:
+        parser.error(
+            "Explicit record-role selectors require "
+            "data_split_mode='custom-record-split'."
+        )
+
+    # ---------------------------------------------------------
+    # 10. Continuous-recording minute ranges
     # ---------------------------------------------------------
     continuous_datasets = {
         "mitbih",
@@ -940,7 +1124,7 @@ def validate_experiment_arguments(args, parser):
             )
 
     # ---------------------------------------------------------
-    # 10. General string validation
+    # 11. General string validation
     # ---------------------------------------------------------
     for argument_name in [
         "data_split_mode",
@@ -955,7 +1139,7 @@ def validate_experiment_arguments(args, parser):
             )
 
     # ---------------------------------------------------------
-    # 11. Task-specific consistency
+    # 12. Task-specific consistency
     # ---------------------------------------------------------
     if args.task in [3, 7] and not args.use_template:
         parser.error(
@@ -1005,54 +1189,577 @@ def build_effective_configuration(args):
     )
 
 
-def build_data_cache_config(args, loader, task_type):
-    """
-    Build a complete, deterministic identity for cached dataset arrays.
 
-    The cache key includes public routing arguments and the effective loader
-    configuration that determines which records and processed arrays are
-    returned.
+SESSION_ROUTED_DATASETS = frozenset(
+    {
+        "heartprint",
+        "cybhi",
+    }
+)
+
+CONTINUOUS_ROUTED_DATASETS = frozenset(
+    {
+        "mitbih",
+        "nsrdb",
+    }
+)
+
+RECORD_ROUTED_DATASETS = frozenset(
+    {
+        "ecgid",
+        "ptb",
+        "ptbxl",
+    }
+)
+
+
+def _cross_session_uses_enrollment(args):
     """
-    loader_identity = utils._build_loader_cache_identity(
-        loader
+    Return whether the selected task consumes a gallery/enrollment role.
+    """
+    if args.task not in {
+        5,
+        6,
+        7,
+        8,
+    }:
+        return False
+
+    if args.task == 7:
+        return True
+
+    return bool(
+        args.use_template
     )
+
+
+def _build_dataset_loader_kwargs(args):
+    """
+    Build loader arguments for the physical roles consumed by the experiment.
+
+    Enrollment selectors are omitted when the selected evaluation branch does
+    not construct a gallery. The supplied configuration is still retained in
+    the effective experiment configuration.
+    """
+    use_enrollment = (
+        _cross_session_uses_enrollment(
+            args
+        )
+    )
+
+    loader_kwargs = {
+        "data_split_mode": (
+            args.data_split_mode
+        ),
+        "num_beats_to_merge": (
+            args.num_beats_to_merge
+        ),
+        "beat_merge_stride": (
+            args.beat_merge_stride
+        ),
+        "preprocessing_config": (
+            args.preprocessing_parameters
+        ),
+    }
+
+    if args.dataset in SESSION_ROUTED_DATASETS:
+        if args.train_sessions:
+            loader_kwargs[
+                "train_sessions"
+            ] = args.train_sessions
+
+        if (
+            use_enrollment
+            and args.enroll_sessions
+        ):
+            loader_kwargs[
+                "enroll_sessions"
+            ] = args.enroll_sessions
+
+        if args.probe_sessions:
+            loader_kwargs[
+                "probe_sessions"
+            ] = args.probe_sessions
+
+        if (
+            args.session_for_single_session_evaluation
+        ):
+            loader_kwargs[
+                "session_for_single_session_evaluation"
+            ] = (
+                args.session_for_single_session_evaluation
+            )
+
+    if args.dataset in RECORD_ROUTED_DATASETS:
+        if (
+            args.train_record_indices
+            is not None
+        ):
+            loader_kwargs[
+                "train_record_indices"
+            ] = args.train_record_indices
+
+        if (
+            use_enrollment
+            and args.enroll_record_indices
+            is not None
+        ):
+            loader_kwargs[
+                "enroll_record_indices"
+            ] = args.enroll_record_indices
+
+        if (
+            args.probe_record_indices
+            is not None
+        ):
+            loader_kwargs[
+                "probe_record_indices"
+            ] = args.probe_record_indices
+
+    if args.dataset == "ecgid":
+        loader_kwargs[
+            "signal_type"
+        ] = args.signal_type
+
+    if args.dataset == "cybhi":
+        loader_kwargs[
+            "electrode_unit"
+        ] = args.electrode_unit
+
+    if args.dataset in CONTINUOUS_ROUTED_DATASETS:
+        if (
+            args.single_segment_range
+            is not None
+        ):
+            loader_kwargs[
+                "single_segment_range"
+            ] = (
+                args.single_segment_range
+            )
+
+        if args.train_parts is not None:
+            loader_kwargs[
+                "train_parts"
+            ] = args.train_parts
+
+        if (
+            use_enrollment
+            and args.enrol_parts
+            is not None
+        ):
+            loader_kwargs[
+                "enrol_parts"
+            ] = args.enrol_parts
+
+        if args.test_parts is not None:
+            loader_kwargs[
+                "test_parts"
+            ] = args.test_parts
+
+        loader_kwargs[
+            "temporal_guard_minutes"
+        ] = args.temporal_guard_minutes
+
+    return loader_kwargs
+
+
+def _resolved_enrollment_reuses_training(
+    loader,
+    dataset,
+):
+    """
+    Return whether TRAIN and ENROLL resolve to the same physical selector.
+
+    Selector order is retained because it also determines deterministic sample
+    and provenance order.
+    """
+    if dataset in SESSION_ROUTED_DATASETS:
+        return tuple(
+            getattr(
+                loader,
+                "train_sessions",
+                None,
+            )
+            or ()
+        ) == tuple(
+            getattr(
+                loader,
+                "enroll_sessions",
+                None,
+            )
+            or ()
+        )
+
+    if dataset in CONTINUOUS_ROUTED_DATASETS:
+        return tuple(
+            tuple(part)
+            for part in (
+                getattr(
+                    loader,
+                    "train_parts",
+                    None,
+                )
+                or ()
+            )
+        ) == tuple(
+            tuple(part)
+            for part in (
+                getattr(
+                    loader,
+                    "enrol_parts",
+                    None,
+                )
+                or ()
+            )
+        )
+
+    if dataset in RECORD_ROUTED_DATASETS:
+        if (
+            getattr(
+                loader,
+                "data_split_mode",
+                None,
+            )
+            != "custom-record-split"
+        ):
+            return True
+
+        return tuple(
+            getattr(
+                loader,
+                "train_record_indices",
+                None,
+            )
+            or ()
+        ) == tuple(
+            getattr(
+                loader,
+                "enroll_record_indices",
+                None,
+            )
+            or ()
+        )
+
+    raise ValueError(
+        "Cross-session enrollment routing is not "
+        f"defined for dataset {dataset!r}."
+    )
+
+
+def _load_cross_session_roles(
+    loader,
+    use_enrollment,
+    enrollment_reuses_training,
+):
+    """
+    Load required TRAIN, ENROLL, and PROBE sources exactly once.
+
+    When TRAIN and ENROLL resolve to the same source, enrollment is returned as
+    omitted so that the runner reuses the post-training-SQI TRAIN role.
+    """
+    (
+        x_train,
+        y_train,
+        provenance_train,
+    ) = loader.load_session(
+        "train",
+        return_provenance=True,
+    )
+
+    x_enroll = None
+    y_enroll = None
+    provenance_enroll = None
+
+    if (
+        use_enrollment
+        and not enrollment_reuses_training
+    ):
+        (
+            x_enroll,
+            y_enroll,
+            provenance_enroll,
+        ) = loader.load_session(
+            "enrollment",
+            return_provenance=True,
+        )
+
+    (
+        x_probe,
+        y_probe,
+        provenance_probe,
+    ) = loader.load_session(
+        "probe",
+        return_provenance=True,
+    )
+
+    return (
+        x_train,
+        y_train,
+        provenance_train,
+        x_enroll,
+        y_enroll,
+        provenance_enroll,
+        x_probe,
+        y_probe,
+        provenance_probe,
+    )
+
+
+def _build_cross_session_cache_arrays(
+    x_train,
+    y_train,
+    provenance_train,
+    x_enroll,
+    y_enroll,
+    provenance_enroll,
+    x_probe,
+    y_probe,
+    provenance_probe,
+):
+    """
+    Build a semantic cross-session data-cache payload.
+    """
+    cache_arrays = {
+        "x_train": x_train,
+        "y_train": y_train,
+        "x_probe": x_probe,
+        "y_probe": y_probe,
+    }
+
+    cache_arrays.update(
+        provenance_train.to_cache_dict(
+            prefix="provenance_train__"
+        )
+    )
+
+    cache_arrays.update(
+        provenance_probe.to_cache_dict(
+            prefix="provenance_probe__"
+        )
+    )
+
+    if x_enroll is not None:
+        cache_arrays[
+            "x_enroll"
+        ] = x_enroll
+
+        cache_arrays[
+            "y_enroll"
+        ] = y_enroll
+
+        cache_arrays.update(
+            provenance_enroll.to_cache_dict(
+                prefix="provenance_enroll__"
+            )
+        )
+
+    return cache_arrays
+
+
+def _restore_cross_session_cache(
+    cached_data,
+    require_distinct_enrollment,
+):
+    """
+    Restore a semantic TRAIN/ENROLL/PROBE data-cache payload.
+
+    Legacy two-role payloads do not contain these keys and therefore miss
+    cleanly so that the cache is rebuilt.
+    """
+    if not cached_data:
+        return None
+
+    required_keys = {
+        "x_train",
+        "y_train",
+        "x_probe",
+        "y_probe",
+    }
+
+    if require_distinct_enrollment:
+        required_keys.update(
+            {
+                "x_enroll",
+                "y_enroll",
+            }
+        )
+
+    if not required_keys.issubset(
+        cached_data
+    ):
+        return None
+
+    provenance_train = (
+        BeatProvenance.from_cache_dict(
+            cached_data,
+            prefix="provenance_train__",
+            expected_length=len(
+                cached_data[
+                    "y_train"
+                ]
+            ),
+        )
+    )
+
+    provenance_probe = (
+        BeatProvenance.from_cache_dict(
+            cached_data,
+            prefix="provenance_probe__",
+            expected_length=len(
+                cached_data[
+                    "y_probe"
+                ]
+            ),
+        )
+    )
+
+    if (
+        provenance_train is None
+        or provenance_probe is None
+    ):
+        return None
+
+    x_enroll = None
+    y_enroll = None
+    provenance_enroll = None
+
+    if require_distinct_enrollment:
+        provenance_enroll = (
+            BeatProvenance.from_cache_dict(
+                cached_data,
+                prefix="provenance_enroll__",
+                expected_length=len(
+                    cached_data[
+                        "y_enroll"
+                    ]
+                ),
+            )
+        )
+
+        if provenance_enroll is None:
+            return None
+
+        x_enroll = (
+            cached_data[
+                "x_enroll"
+            ]
+        )
+
+        y_enroll = (
+            cached_data[
+                "y_enroll"
+            ]
+        )
+
+    return (
+        cached_data[
+            "x_train"
+        ],
+        cached_data[
+            "y_train"
+        ],
+        provenance_train,
+        x_enroll,
+        y_enroll,
+        provenance_enroll,
+        cached_data[
+            "x_probe"
+        ],
+        cached_data[
+            "y_probe"
+        ],
+        provenance_probe,
+    )
+
+def build_data_cache_config(
+    args,
+    loader,
+    task_type,
+    enrollment_consumed=None,
+):
+    """
+    Build the deterministic identity for cached dataset arrays.
+
+    Cross-session enrollment selectors that are not consumed by the selected
+    evaluation branch do not alter the cached physical data identity.
+    """
+    loader_identity = (
+        utils._build_loader_cache_identity(
+            loader
+        )
+    )
+
+    enroll_sessions = getattr(
+        args,
+        "enroll_sessions",
+        None,
+    )
+
+    if (
+        task_type == "cross_session"
+        and enrollment_consumed is False
+    ):
+        enroll_sessions = None
 
     return {
         "dataset": args.dataset,
-        "loader_class": loader_identity["loader_class"],
+        "loader_class": (
+            loader_identity[
+                "loader_class"
+            ]
+        ),
         "task_type": task_type,
-        "split_mode": args.data_split_mode,
-        "num_beats_to_merge": args.num_beats_to_merge,
-        # Read back from the loader rather than from the arguments, because the
-        # channel may have been left unset on the command line and resolved
-        # from config.yaml. The cache key must name the channel actually read.
+        "split_mode": (
+            args.data_split_mode
+        ),
+        "num_beats_to_merge": (
+            args.num_beats_to_merge
+        ),
         "signal_type": getattr(
             loader,
             "signal_type",
             None,
         ),
-        # Read back for the same reason: the acquiring unit may have been left
-        # unset on the command line and resolved from config.yaml.
         "electrode_unit": getattr(
             loader,
             "electrode_unit",
             None,
         ),
-        "train_sessions": args.train_sessions,
-        "enroll_sessions": args.enroll_sessions,
-        "probe_sessions": args.probe_sessions,
-        "session_for_single_session_evaluation": (
-            args.session_for_single_session_evaluation
+        "train_sessions": getattr(
+            args,
+            "train_sessions",
+            None,
         ),
-        "dataset_config": loader_identity[
-            "dataset_config"
-        ],
-        "preprocessing": loader_identity[
-            "preprocessing"
-        ],
-        "loader_settings": loader_identity[
-            "settings"
-        ],
+        "enroll_sessions": (
+            enroll_sessions
+        ),
+        "probe_sessions": getattr(
+            args,
+            "probe_sessions",
+            None,
+        ),
+        "session_for_single_session_evaluation": (
+            getattr(
+                args,
+                "session_for_single_session_evaluation",
+                None,
+            )
+        ),
+        "dataset_config": (
+            loader_identity[
+                "dataset_config"
+            ]
+        ),
+        "preprocessing": (
+            loader_identity[
+                "preprocessing"
+            ]
+        ),
+        "loader_settings": (
+            loader_identity[
+                "settings"
+            ]
+        ),
     }
 
 def _terminate_pipeline_with_error(error):
@@ -1151,6 +1858,44 @@ def get_parser():
                             help="Session tags for Enrollment (CYBHi/HeartPrint).")
     data_group.add_argument('--probe_sessions', type=str, nargs='+',
                             help="Session tags for Testing/Probes (CYBHi/HeartPrint). E.g., session2")
+    data_group.add_argument(
+        "--train_record_indices",
+        type=int,
+        nargs="+",
+        default=None,
+        metavar="INDEX",
+        help=(
+            "Zero-based per-subject recording positions "
+            "used for representation learning when "
+            "data_split_mode='custom-record-split' "
+            "(ECG-ID/PTB/PTB-XL)."
+        ),
+    )
+    data_group.add_argument(
+        "--enroll_record_indices",
+        type=int,
+        nargs="+",
+        default=None,
+        metavar="INDEX",
+        help=(
+            "Optional zero-based per-subject recording "
+            "positions used for gallery enrollment when "
+            "data_split_mode='custom-record-split'. "
+            "Omitting this selector reuses TRAIN."
+        ),
+    )
+    data_group.add_argument(
+        "--probe_record_indices",
+        type=int,
+        nargs="+",
+        default=None,
+        metavar="INDEX",
+        help=(
+            "Zero-based per-subject recording positions "
+            "used for cross-session probes when "
+            "data_split_mode='custom-record-split'."
+        ),
+    )
     data_group.add_argument('--session_for_single_session_evaluation', type=str, nargs='+',
                             help="Target session if running intra-session tasks (1-4) on multi-session datasets.")
     data_group.add_argument('--num_beats_to_merge', type=int, default=1,
@@ -1413,7 +2158,7 @@ def get_parser():
     # ----------------------------------------------------
     sqi_group = parser.add_argument_group('Signal Quality & Filtering')
     sqi_group.add_argument('--outlier_filtering_on_train', action='store_true',
-                           help="Apply SQI filter to Enrollment/Train data.")
+                           help="Apply SQI filtering to representation-learning data.")
     sqi_group.add_argument('--outlier_filtering_on_test', action='store_true',
                            help="Apply SQI filter to Probe/Test data.")
     sqi_group.add_argument('--sqi_method', type=str, default='kurtosis',
@@ -1500,59 +2245,12 @@ def main():
     # ==========================================
     # 2. DATASET INSTANTIATION
     # ==========================================
-    # Build a kwargs dictionary dynamically, omitting None values
-    loader_kwargs = {
-        'data_split_mode': args.data_split_mode,
-        'num_beats_to_merge': args.num_beats_to_merge,
-        'beat_merge_stride': args.beat_merge_stride,
-        'preprocessing_config': (
-            args.preprocessing_parameters
-        ),
-    }
-
-    if args.train_sessions: loader_kwargs['train_sessions'] = args.train_sessions
-    if args.enroll_sessions: loader_kwargs['enroll_sessions'] = args.enroll_sessions
-    if args.probe_sessions: loader_kwargs['probe_sessions'] = args.probe_sessions
-    if args.session_for_single_session_evaluation: 
-        loader_kwargs['session_for_single_session_evaluation'] = args.session_for_single_session_evaluation
-        
-    if args.dataset == "ecgid":
-        loader_kwargs[
-            "signal_type"
-        ] = args.signal_type
-
-    if args.dataset == "cybhi":
-        loader_kwargs[
-            "electrode_unit"
-        ] = args.electrode_unit
-
-    if args.dataset in {
-        "mitbih",
-        "nsrdb",
-    }:
-        if args.single_segment_range is not None:
-            loader_kwargs[
-                "single_segment_range"
-            ] = args.single_segment_range
-
-        if args.train_parts is not None:
-            loader_kwargs[
-                "train_parts"
-            ] = args.train_parts
-
-        if args.enrol_parts is not None:
-            loader_kwargs[
-                "enrol_parts"
-            ] = args.enrol_parts
-
-        if args.test_parts is not None:
-            loader_kwargs[
-                "test_parts"
-            ] = args.test_parts
-
-        loader_kwargs[
-            "temporal_guard_minutes"
-        ] = args.temporal_guard_minutes
+    # Route only the physical roles consumed by this experiment.
+    loader_kwargs = (
+        _build_dataset_loader_kwargs(
+            args
+        )
+    )
 
     print(f"\n[INFO] Initializing {args.dataset.upper()} Dataset...")
     
@@ -1573,6 +2271,29 @@ def main():
     loader.effective_experiment_configuration = (
         effective_configuration
     )
+
+    cross_session_uses_enrollment = False
+    cross_session_enrollment_reuses_training = False
+
+    if args.task in [
+        5,
+        6,
+        7,
+        8,
+    ]:
+        cross_session_uses_enrollment = (
+            _cross_session_uses_enrollment(
+                args
+            )
+        )
+
+        if cross_session_uses_enrollment:
+            cross_session_enrollment_reuses_training = (
+                _resolved_enrollment_reuses_training(
+                    loader,
+                    args.dataset,
+                )
+            )
 
     # ==========================================
     # 3. DATA EXTRACTION LOGIC
@@ -1649,55 +2370,88 @@ def main():
                 args,
                 loader,
                 task_type="cross_session",
+                enrollment_consumed=(
+                    cross_session_uses_enrollment
+                ),
             )
-            cached_data, uid = run._timed_runtime_call(
-                "Data Cache Read",
-                cache.get_data_cache,
-                data_config,
-            )
-            
-            cached_provenance_s1 = None
-            cached_provenance_s2 = None
-            if cached_data and "y_s1" in cached_data and "y_s2" in cached_data:
-                cached_provenance_s1 = BeatProvenance.from_cache_dict(
-                    cached_data,
-                    prefix="provenance_s1__",
-                    expected_length=len(cached_data["y_s1"]),
+
+            cached_data, uid = (
+                run._timed_runtime_call(
+                    "Data Cache Read",
+                    cache.get_data_cache,
+                    data_config,
                 )
-                cached_provenance_s2 = BeatProvenance.from_cache_dict(
+            )
+
+            require_distinct_enrollment = (
+                cross_session_uses_enrollment
+                and not (
+                    cross_session_enrollment_reuses_training
+                )
+            )
+
+            restored_roles = (
+                _restore_cross_session_cache(
                     cached_data,
-                    prefix="provenance_s2__",
-                    expected_length=len(cached_data["y_s2"]),
+                    require_distinct_enrollment=(
+                        require_distinct_enrollment
+                    ),
+                )
+            )
+
+            if restored_roles is not None:
+                (
+                    x_train,
+                    y_train,
+                    provenance_train,
+                    x_enroll,
+                    y_enroll,
+                    provenance_enroll,
+                    x_probe,
+                    y_probe,
+                    provenance_probe,
+                ) = restored_roles
+
+                print(
+                    "[INFO] Loaded precomputed cross-session "
+                    f"data from cache (Hash: {uid})"
                 )
 
-            if (
-                cached_provenance_s1 is not None
-                and cached_provenance_s2 is not None
-            ):
-                print(f"[INFO] Loaded precomputed cross-session data from cache (Hash: {uid})")
-                x_s1, y_s1 = cached_data["x_s1"], cached_data["y_s1"]
-                x_s2, y_s2 = cached_data["x_s2"], cached_data["y_s2"]
-                provenance_s1 = cached_provenance_s1
-                provenance_s2 = cached_provenance_s2
             else:
-                x_s1, y_s1, provenance_s1 = loader.load_session(
-                    "train", return_provenance=True
+                (
+                    x_train,
+                    y_train,
+                    provenance_train,
+                    x_enroll,
+                    y_enroll,
+                    provenance_enroll,
+                    x_probe,
+                    y_probe,
+                    provenance_probe,
+                ) = _load_cross_session_roles(
+                    loader,
+                    use_enrollment=(
+                        cross_session_uses_enrollment
+                    ),
+                    enrollment_reuses_training=(
+                        cross_session_enrollment_reuses_training
+                    ),
                 )
-                x_s2, y_s2, provenance_s2 = loader.load_session(
-                    "test", return_provenance=True
+
+                cache_arrays = (
+                    _build_cross_session_cache_arrays(
+                        x_train,
+                        y_train,
+                        provenance_train,
+                        x_enroll,
+                        y_enroll,
+                        provenance_enroll,
+                        x_probe,
+                        y_probe,
+                        provenance_probe,
+                    )
                 )
-                cache_arrays = {
-                    "x_s1": x_s1,
-                    "y_s1": y_s1,
-                    "x_s2": x_s2,
-                    "y_s2": y_s2,
-                }
-                cache_arrays.update(
-                    provenance_s1.to_cache_dict(prefix="provenance_s1__")
-                )
-                cache_arrays.update(
-                    provenance_s2.to_cache_dict(prefix="provenance_s2__")
-                )
+
                 run._timed_runtime_call(
                     "Data Cache Write",
                     cache.save_data_cache,
@@ -1706,10 +2460,56 @@ def main():
                     uid,
                 )
 
-            print(f"\n[INFO] Session 1 (Enroll) Loaded: X={x_s1.shape}, Y={y_s1.shape}")
-            print(f"[INFO] Session 2 (Probe) Loaded:  X={x_s2.shape}, Y={y_s2.shape}")
-            if x_s1.shape[0] == 0 or x_s2.shape[0] == 0:
-                print("[ERROR] One or both cross-session arrays are empty. Check your parameters.")
+            print(
+                "\n[INFO] Training Loaded: "
+                f"X={x_train.shape}, Y={y_train.shape}"
+            )
+
+            if x_enroll is not None:
+                print(
+                    "[INFO] Enrollment Loaded: "
+                    f"X={x_enroll.shape}, "
+                    f"Y={y_enroll.shape}"
+                )
+
+            elif (
+                cross_session_uses_enrollment
+                and (
+                    cross_session_enrollment_reuses_training
+                )
+            ):
+                print(
+                    "[INFO] Enrollment reuses the Training "
+                    "source after training-only filtering."
+                )
+
+            else:
+                print(
+                    "[INFO] Enrollment is not consumed by "
+                    "the selected evaluation branch."
+                )
+
+            print(
+                "[INFO] Probe Loaded: "
+                f"X={x_probe.shape}, Y={y_probe.shape}"
+            )
+
+            if (
+                x_train.shape[0] == 0
+                or x_probe.shape[0] == 0
+                or (
+                    require_distinct_enrollment
+                    and (
+                        x_enroll is None
+                        or x_enroll.shape[0] == 0
+                    )
+                )
+            ):
+                print(
+                    "[ERROR] One or more required "
+                    "cross-session roles are empty. "
+                    "Check the configured selectors."
+                )
                 sys.exit(1)
 
     else:
@@ -1741,20 +2541,87 @@ def main():
                 print("[ERROR] No data returned from loader. Check your session configs.")
                 sys.exit(1)
                 
-        # Tasks 5 to 8: Cross-Session (Requires S1 and S2 arrays)
+        # Tasks 5 to 8: Cross-Session
         elif args.task in [5, 6, 7, 8]:
-            x_s1, y_s1, provenance_s1 = loader.load_session(
-                "train", return_provenance=True
+            (
+                x_train,
+                y_train,
+                provenance_train,
+                x_enroll,
+                y_enroll,
+                provenance_enroll,
+                x_probe,
+                y_probe,
+                provenance_probe,
+            ) = _load_cross_session_roles(
+                loader,
+                use_enrollment=(
+                    cross_session_uses_enrollment
+                ),
+                enrollment_reuses_training=(
+                    cross_session_enrollment_reuses_training
+                ),
             )
-            x_s2, y_s2, provenance_s2 = loader.load_session(
-                "test", return_provenance=True
+
+            require_distinct_enrollment = (
+                cross_session_uses_enrollment
+                and not (
+                    cross_session_enrollment_reuses_training
+                )
             )
-            
-            print(f"\n[INFO] Session 1 (Enroll) Loaded: X={x_s1.shape}, Y={y_s1.shape}")
-            print(f"[INFO] Session 2 (Probe) Loaded:  X={x_s2.shape}, Y={y_s2.shape}")
-            if x_s1.shape[0] == 0 or x_s2.shape[0] == 0:
-                print("[ERROR] One or both cross-session arrays are empty. Check your parameters.")
+
+            print(
+                "\n[INFO] Training Loaded: "
+                f"X={x_train.shape}, Y={y_train.shape}"
+            )
+
+            if x_enroll is not None:
+                print(
+                    "[INFO] Enrollment Loaded: "
+                    f"X={x_enroll.shape}, "
+                    f"Y={y_enroll.shape}"
+                )
+
+            elif (
+                cross_session_uses_enrollment
+                and (
+                    cross_session_enrollment_reuses_training
+                )
+            ):
+                print(
+                    "[INFO] Enrollment reuses the Training "
+                    "source after training-only filtering."
+                )
+
+            else:
+                print(
+                    "[INFO] Enrollment is not consumed by "
+                    "the selected evaluation branch."
+                )
+
+            print(
+                "[INFO] Probe Loaded: "
+                f"X={x_probe.shape}, Y={y_probe.shape}"
+            )
+
+            if (
+                x_train.shape[0] == 0
+                or x_probe.shape[0] == 0
+                or (
+                    require_distinct_enrollment
+                    and (
+                        x_enroll is None
+                        or x_enroll.shape[0] == 0
+                    )
+                )
+            ):
+                print(
+                    "[ERROR] One or more required "
+                    "cross-session roles are empty. "
+                    "Check the configured selectors."
+                )
                 sys.exit(1)
+
 
     run._record_runtime_stage(
         "Data Preparation (inclusive)",
@@ -1856,47 +2723,56 @@ def main():
         # TASK 5: Cross-Session Identification
         elif args.task == 5:
             run_cross_session_identification(
-                x_s1, y_s1, x_s2, y_s2, 
+                x_train, y_train, x_probe, y_probe,
                 probe_fusion_size=args.probe_fusion_size,
                 sqi_train=args.sqi_method,
                 sqi_test=args.sqi_method,
-                provenance_s1=provenance_s1,
-                provenance_s2=provenance_s2,
+                provenance_s1=provenance_train,
+                provenance_s2=provenance_probe,
+                x_enroll=x_enroll,
+                y_enroll=y_enroll,
+                provenance_enroll=provenance_enroll,
                 **common_args
             )
 
         # TASK 6: Cross-Session Verification
         elif args.task == 6:
             run_cross_session_verification(
-                x_s1, y_s1, x_s2, y_s2, 
+                x_train, y_train, x_probe, y_probe,
                 num_pairs=args.num_pairs,
                 sampling_mode=args.sampling_mode,
                 use_deployment_evaluation=args.use_deployment_evaluation,
                 target_fars=args.target_fars,
                 sqi_train=args.sqi_method,
                 sqi_test=args.sqi_method,
-                provenance_s1=provenance_s1,
-                provenance_s2=provenance_s2,
+                provenance_s1=provenance_train,
+                provenance_s2=provenance_probe,
+                x_enroll=x_enroll,
+                y_enroll=y_enroll,
+                provenance_enroll=provenance_enroll,
                 **common_args
             )
 
         # TASK 7: Subject-Disjoint Cross-Session ID
         elif args.task == 7:
             run_subject_disjoint_cross_session_identification(
-                x_s1, y_s1, x_s2, y_s2, 
+                x_train, y_train, x_probe, y_probe,
                 test_split=args.test_split,
                 probe_fusion_size=args.probe_fusion_size,
                 sqi_s1=args.sqi_method,
                 sqi_s2=args.sqi_method,
-                provenance_s1=provenance_s1,
-                provenance_s2=provenance_s2,
+                provenance_s1=provenance_train,
+                provenance_s2=provenance_probe,
+                x_enroll=x_enroll,
+                y_enroll=y_enroll,
+                provenance_enroll=provenance_enroll,
                 **common_args
             )
 
         # TASK 8: Subject-Disjoint Cross-Session Verification
         elif args.task == 8:
             run_subject_disjoint_cross_session_verification(
-                x_s1, y_s1, x_s2, y_s2, 
+                x_train, y_train, x_probe, y_probe,
                 test_split=args.test_split,
                 num_pairs=args.num_pairs,
                 sampling_mode=args.sampling_mode,
@@ -1904,8 +2780,11 @@ def main():
                 target_fars=args.target_fars,
                 sqi_s1=args.sqi_method,
                 sqi_s2=args.sqi_method,
-                provenance_s1=provenance_s1,
-                provenance_s2=provenance_s2,
+                provenance_s1=provenance_train,
+                provenance_s2=provenance_probe,
+                x_enroll=x_enroll,
+                y_enroll=y_enroll,
+                provenance_enroll=provenance_enroll,
                 **common_args
             )
 
