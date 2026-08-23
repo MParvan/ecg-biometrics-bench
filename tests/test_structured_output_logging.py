@@ -355,15 +355,13 @@ class StructuredOutputLoggingTests(
             )
         )
 
-        self.assertEqual(
-            converted["nan"],
-            "nan",
+        self.assertIsNone(
+            converted["nan"]
         )
-        self.assertEqual(
+        self.assertIsNone(
             converted[
                 "positive_infinity"
-            ],
-            "inf",
+            ]
         )
         self.assertEqual(
             converted["unknown"],

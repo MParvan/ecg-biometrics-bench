@@ -129,19 +129,52 @@ class CustomOperatingPointTests(unittest.TestCase):
             [0.001, 0.1],
         )
 
+
     def test_observed_far_never_exceeds_the_target(self):
         scores, labels = build_separable_scores()
 
-        artifacts = utils._build_verification_curve_artifacts(
-            scores,
-            labels,
-            target_fars=[0.2, 0.02, 0.002],
+        artifacts = (
+            utils._build_verification_curve_artifacts(
+                scores,
+                labels,
+                target_fars=[
+                    0.2,
+                    0.02,
+                    0.002,
+                ],
+            )
         )
 
-        for point in artifacts["operating_points"]:
+        for point in artifacts[
+            "operating_points"
+        ]:
+            if not point[
+                "empirically_resolvable"
+            ]:
+                self.assertIsNone(
+                    point["observed_far"]
+                )
+                self.assertIsNone(
+                    point["tar"]
+                )
+                self.assertIsNone(
+                    point["frr"]
+                )
+                self.assertIsNone(
+                    point["threshold"]
+                )
+                continue
+
             self.assertLessEqual(
-                point["observed_far"],
-                point["target_far"] + 1e-12,
+                point[
+                    "observed_far"
+                ],
+                (
+                    point[
+                        "target_far"
+                    ]
+                    + 1e-12
+                ),
             )
 
 

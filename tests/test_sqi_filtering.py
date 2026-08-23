@@ -468,10 +468,19 @@ class RunnerSQIIntegrationTests(
             result
         )
 
-        metric_values = np.asarray(
-            metrics,
-            dtype=np.float64,
-        )
+        if (
+            len(metrics) == 4
+            and metrics[3] is None
+        ):
+            metric_values = np.asarray(
+                metrics[:3],
+                dtype=np.float64,
+            )
+        else:
+            metric_values = np.asarray(
+                metrics,
+                dtype=np.float64,
+            )
 
         self.assertTrue(
             np.isfinite(

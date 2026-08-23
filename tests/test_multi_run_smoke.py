@@ -270,6 +270,7 @@ class MultiRunSmokeTests(unittest.TestCase):
             rank_1_mean,
         )
 
+
     def assert_verification_aggregate(
         self,
         result,
@@ -279,7 +280,9 @@ class MultiRunSmokeTests(unittest.TestCase):
             4,
         )
 
-        for metric_summary in result:
+        # EER, AUC, and d-prime are always defined for a valid
+        # verification evaluation.
+        for metric_summary in result[:3]:
             self.assertEqual(
                 len(metric_summary),
                 2,
@@ -294,7 +297,9 @@ class MultiRunSmokeTests(unittest.TestCase):
             )
 
             self.assertTrue(
-                np.isfinite(mean_value)
+                np.isfinite(
+                    mean_value
+                )
             )
 
             self.assertTrue(
@@ -320,14 +325,11 @@ class MultiRunSmokeTests(unittest.TestCase):
             result[2][0]
         )
 
-        tar_mean = float(
-            result[3][0]
-        )
-
         self.assertGreaterEqual(
             eer_mean,
             0.0,
         )
+
         self.assertLessEqual(
             eer_mean,
             1.0,
@@ -337,6 +339,7 @@ class MultiRunSmokeTests(unittest.TestCase):
             auc_mean,
             0.0,
         )
+
         self.assertLessEqual(
             auc_mean,
             1.0,
@@ -347,13 +350,54 @@ class MultiRunSmokeTests(unittest.TestCase):
             0.0,
         )
 
+        # TAR@0.1%FAR is unavailable when any run lacks enough
+        # impostor comparisons to resolve that empirical FAR.
+        tar_summary = result[3]
+
+        self.assertEqual(
+            len(tar_summary),
+            2,
+        )
+
+        if tar_summary == (
+            None,
+            None,
+        ):
+            return
+
+        tar_mean = float(
+            tar_summary[0]
+        )
+
+        tar_standard_deviation = float(
+            tar_summary[1]
+        )
+
+        self.assertTrue(
+            np.isfinite(
+                tar_mean
+            )
+        )
+
+        self.assertTrue(
+            np.isfinite(
+                tar_standard_deviation
+            )
+        )
+
         self.assertGreaterEqual(
             tar_mean,
             0.0,
         )
+
         self.assertLessEqual(
             tar_mean,
             1.0,
+        )
+
+        self.assertGreaterEqual(
+            tar_standard_deviation,
+            0.0,
         )
 
     def execute_multi_run(

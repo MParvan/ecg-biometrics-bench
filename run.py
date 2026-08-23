@@ -658,7 +658,7 @@ def _to_json_compatible(value):
 
     NumPy scalars and arrays, tensors, paths, tuples, sets, and uncommon
     metadata objects are converted without modifying the caller's objects.
-    Non-finite floating-point values are represented as strings because
+    Non-finite floating-point values are converted to None because
     strict JSON does not support NaN or infinity.
     """
     if value is None:
@@ -681,7 +681,7 @@ def _to_json_compatible(value):
         if np.isfinite(value):
             return value
 
-        return str(value)
+        return None
 
     if isinstance(
         value,
@@ -3925,6 +3925,125 @@ def _get_verification_pair_statistics(
 # RANDOM-SEED METADATA
 # =============================================================================
 
+
+def _aggregate_multi_run_metrics(
+    results,
+):
+    """
+    Aggregate seed-level metrics while preserving unavailable values.
+
+    A metric is unavailable at aggregate level when any contributing run is
+    unavailable or non-finite; only complete run sets are summarized.
+    """
+    rows = [
+        tuple(result)
+        for result in results
+    ]
+
+    if not rows:
+        return tuple()
+
+    metric_count = len(
+        rows[0]
+    )
+
+    if any(
+        len(row) != metric_count
+        for row in rows
+    ):
+        raise ValueError(
+            "Every multi-run result must contain "
+            "the same number of metrics."
+        )
+
+    aggregates = []
+
+    for metric_values in zip(
+        *rows
+    ):
+        numeric_values = []
+
+        for value in metric_values:
+            if value is None:
+                numeric_values = None
+                break
+
+            try:
+                numeric_value = float(
+                    value
+                )
+            except (
+                TypeError,
+                ValueError,
+            ):
+                numeric_values = None
+                break
+
+            if not np.isfinite(
+                numeric_value
+            ):
+                numeric_values = None
+                break
+
+            numeric_values.append(
+                numeric_value
+            )
+
+        if numeric_values is None:
+            aggregates.append(
+                (
+                    None,
+                    None,
+                )
+            )
+            continue
+
+        values = np.asarray(
+            numeric_values,
+            dtype=float,
+        )
+
+        aggregates.append(
+            (
+                float(
+                    np.mean(
+                        values
+                    )
+                ),
+                float(
+                    np.std(
+                        values
+                    )
+                ),
+            )
+        )
+
+    return tuple(
+        aggregates
+    )
+
+
+def _format_multi_run_metric(
+    aggregate,
+):
+    """
+    Format one multi-run metric without fabricating unavailable values.
+    """
+    mean_value, std_value = aggregate
+
+    if (
+        mean_value is None
+        or std_value is None
+    ):
+        return None
+
+    return (
+        f"{mean_value:.4f} "
+        "\u00b1 "
+        f"{std_value:.4f}"
+    )
+
+
 def _build_per_run_results(
     results,
     seeds,
@@ -4094,19 +4213,42 @@ def _summarize_metric_uncertainty(
     strings use the population form; the intervals use the sample form,
     which is the correct estimator for the standard error of a mean.
     """
-    values = np.asarray(
-        [
-            float(value)
-            for value in values
-        ],
-        dtype=float,
+    raw_values = list(
+        values
     )
 
-    if values.size == 0:
+    if not raw_values:
         return None
 
-    if not np.all(np.isfinite(values)):
-        return None
+    numeric_values = []
+
+    for value in raw_values:
+        if value is None:
+            return None
+
+        try:
+            numeric_value = float(
+                value
+            )
+        except (
+            TypeError,
+            ValueError,
+        ):
+            return None
+
+        if not np.isfinite(
+            numeric_value
+        ):
+            return None
+
+        numeric_values.append(
+            numeric_value
+        )
+
+    values = np.asarray(
+        numeric_values,
+        dtype=float,
+    )
 
     if not 0.0 < confidence_level < 1.0:
         raise ValueError(
@@ -5142,13 +5284,16 @@ def run_closed_set_verification(x, y, model_class, epochs=150, batch_size=256, l
             )
         )
                 
-        metrics_t = list(zip(*results))
-        means, stds = [np.mean(m) for m in metrics_t], [np.std(m) for m in metrics_t]
+        metric_aggregates = (
+            _aggregate_multi_run_metrics(
+                results
+            )
+        )
         
         if save_results_and_settings:
             metrics_dict = {
-                "EER": f"{means[0]:.4f} ± {stds[0]:.4f}", "AUC": f"{means[1]:.4f} ± {stds[1]:.4f}", 
-                "d-prime": f"{means[2]:.4f} ± {stds[2]:.4f}", "TAR@0.1%FAR": f"{means[3]:.4f} ± {stds[3]:.4f}"
+                "EER": _format_multi_run_metric(metric_aggregates[0]), "AUC": _format_multi_run_metric(metric_aggregates[1]),
+                "d-prime": _format_multi_run_metric(metric_aggregates[2]), "TAR@0.1%FAR": _format_multi_run_metric(metric_aggregates[3])
             }
             _log_experiment_results(
                 "Closed-Set Verification",
@@ -5159,7 +5304,7 @@ def run_closed_set_verification(x, y, model_class, epochs=150, batch_size=256, l
                 per_run_results=per_run_results,
                 per_run_evaluation_artifacts=per_run_evaluation_artifacts,
             )
-        return tuple(zip(means, stds))
+        return tuple(metric_aggregates)
     # ----------------------------
 
     augmentation_config = (
@@ -5551,6 +5696,7 @@ def run_closed_set_verification(x, y, model_class, epochs=150, batch_size=256, l
         )
 
     return eer, auc_val, dprime, tar
+
 
 # =============================================================================
 # TASK 3: SUBJECT-DISJOINT IDENTIFICATION (TEMPLATE MATCHING)
@@ -6286,13 +6432,16 @@ def run_subject_disjoint_verification(x, y, model_class, epochs=150, batch_size=
             )
         )
                 
-        metrics_t = list(zip(*results))
-        means, stds = [np.mean(m) for m in metrics_t], [np.std(m) for m in metrics_t]
+        metric_aggregates = (
+            _aggregate_multi_run_metrics(
+                results
+            )
+        )
         
         if save_results_and_settings:
             metrics_dict = {
-                "EER": f"{means[0]:.4f} ± {stds[0]:.4f}", "AUC": f"{means[1]:.4f} ± {stds[1]:.4f}", 
-                "d-prime": f"{means[2]:.4f} ± {stds[2]:.4f}", "TAR@0.1%FAR": f"{means[3]:.4f} ± {stds[3]:.4f}"
+                "EER": _format_multi_run_metric(metric_aggregates[0]), "AUC": _format_multi_run_metric(metric_aggregates[1]),
+                "d-prime": _format_multi_run_metric(metric_aggregates[2]), "TAR@0.1%FAR": _format_multi_run_metric(metric_aggregates[3])
             }
             _log_experiment_results(
                 "Subject-Disjoint Verification",
@@ -6303,7 +6452,7 @@ def run_subject_disjoint_verification(x, y, model_class, epochs=150, batch_size=
                 per_run_results=per_run_results,
                 per_run_evaluation_artifacts=per_run_evaluation_artifacts,
             )
-        return tuple(zip(means, stds))
+        return tuple(metric_aggregates)
     # ----------------------------
 
     if use_template and template_size is None:
@@ -6756,6 +6905,7 @@ def run_subject_disjoint_verification(x, y, model_class, epochs=150, batch_size=
         )
 
     return eer, auc_val, dprime, tar
+
 
 # =============================================================================
 # TASK 5: CROSS-SESSION IDENTIFICATION
@@ -7556,13 +7706,16 @@ def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class
             )
         )
                 
-        metrics_t = list(zip(*results))
-        means, stds = [np.mean(m) for m in metrics_t], [np.std(m) for m in metrics_t]
+        metric_aggregates = (
+            _aggregate_multi_run_metrics(
+                results
+            )
+        )
         
         if save_results_and_settings:
             metrics_dict = {
-                "EER": f"{means[0]:.4f} ± {stds[0]:.4f}", "AUC": f"{means[1]:.4f} ± {stds[1]:.4f}", 
-                "d-prime": f"{means[2]:.4f} ± {stds[2]:.4f}", "TAR@0.1%FAR": f"{means[3]:.4f} ± {stds[3]:.4f}"
+                "EER": _format_multi_run_metric(metric_aggregates[0]), "AUC": _format_multi_run_metric(metric_aggregates[1]),
+                "d-prime": _format_multi_run_metric(metric_aggregates[2]), "TAR@0.1%FAR": _format_multi_run_metric(metric_aggregates[3])
             }
             _log_experiment_results(
                 "Cross-Session Verification",
@@ -7573,7 +7726,7 @@ def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class
                 per_run_results=per_run_results,
                 per_run_evaluation_artifacts=per_run_evaluation_artifacts,
             )
-        return tuple(zip(means, stds))
+        return tuple(metric_aggregates)
     # ----------------------------
 
     augmentation_config = (
@@ -8040,6 +8193,7 @@ def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class
 
     # 9. Report Verification Metrics
     return eer, auc_val, dprime, tar
+
 
 # =============================================================================
 # TASK 7: SUBJECT-DISJOINT CROSS-SESSION IDENTIFICATION
@@ -8755,13 +8909,16 @@ def run_subject_disjoint_cross_session_verification(
             )
         )
                 
-        metrics_t = list(zip(*results))
-        means, stds = [np.mean(m) for m in metrics_t], [np.std(m) for m in metrics_t]
+        metric_aggregates = (
+            _aggregate_multi_run_metrics(
+                results
+            )
+        )
         
         if save_results_and_settings:
             metrics_dict = {
-                "EER": f"{means[0]:.4f} ± {stds[0]:.4f}", "AUC": f"{means[1]:.4f} ± {stds[1]:.4f}", 
-                "d-prime": f"{means[2]:.4f} ± {stds[2]:.4f}", "TAR@0.1%FAR": f"{means[3]:.4f} ± {stds[3]:.4f}"
+                "EER": _format_multi_run_metric(metric_aggregates[0]), "AUC": _format_multi_run_metric(metric_aggregates[1]),
+                "d-prime": _format_multi_run_metric(metric_aggregates[2]), "TAR@0.1%FAR": _format_multi_run_metric(metric_aggregates[3])
             }
             _log_experiment_results(
                 (
@@ -8775,7 +8932,7 @@ def run_subject_disjoint_cross_session_verification(
                 per_run_results=per_run_results,
                 per_run_evaluation_artifacts=per_run_evaluation_artifacts,
             )
-        return tuple(zip(means, stds))
+        return tuple(metric_aggregates)
     # ----------------------------
 
     augmentation_config = (
@@ -9241,4 +9398,5 @@ def run_subject_disjoint_cross_session_verification(
         )
 
     return eer, auc_val, dprime, tar
+
 # =============================================================================

@@ -7,10 +7,8 @@ import copy
 from typing import Optional, Tuple
 from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.preprocessing import normalize
-from scipy.optimize import brentq
 from scipy.stats import trim_mean, kurtosis
 from scipy.spatial.distance import cdist, correlation
-from scipy.interpolate import interp1d
 
 import pickle
 import tempfile
@@ -687,10 +685,39 @@ def _run_train_loop_unseen_subjects(model, train_loader, val_loader_seen, val_lo
                 val_scores, val_pairs = _generate_pairs(val_emb, val_lab, None, None, 
                                                         2000, "balanced", matching_method)
             
-            if len(val_pairs) > 0:
-                fpr, tpr, _ = roc_curve(val_pairs, val_scores)
-                try: val_eer_unseen = brentq(lambda x: 1. - x - interp1d(fpr, tpr)(x), 0., 1.)
-                except: pass
+            if len(val_pairs) == 0:
+                raise ValueError(
+                    "Unseen-subject validation produced no "
+                    "verification pairs."
+                )
+
+            (
+                validation_scores,
+                validation_labels,
+            ) = _validate_verification_curve_inputs(
+                val_scores,
+                val_pairs,
+            )
+
+            (
+                validation_false_accept_rates,
+                validation_true_accept_rates,
+                _,
+            ) = roc_curve(
+                validation_labels,
+                validation_scores,
+                drop_intermediate=False,
+            )
+
+            val_eer_unseen = (
+                _interpolate_equal_error_rate(
+                    validation_false_accept_rates,
+                    (
+                        1.0
+                        - validation_true_accept_rates
+                    ),
+                )
+            )
                 
         # --- 5. COMPOSITE SCORE CALCULATION ---
         combined_score = norm_val_loss + val_eer_unseen
@@ -1004,6 +1031,147 @@ def _validate_verification_curve_inputs(
     )
 
 
+
+def _interpolate_equal_error_rate(
+    false_accept_rates,
+    false_reject_rates,
+):
+    """
+    Linearly interpolate the empirical FAR/FRR crossing.
+    """
+    false_accept_rates = np.asarray(
+        false_accept_rates,
+        dtype=float,
+    )
+    false_reject_rates = np.asarray(
+        false_reject_rates,
+        dtype=float,
+    )
+
+    if (
+        false_accept_rates.ndim != 1
+        or false_reject_rates.ndim != 1
+        or false_accept_rates.shape
+        != false_reject_rates.shape
+        or len(false_accept_rates) < 2
+    ):
+        raise ValueError(
+            "EER requires aligned one-dimensional FAR and FRR "
+            "arrays with at least two operating points."
+        )
+
+    if not (
+        np.all(
+            np.isfinite(
+                false_accept_rates
+            )
+        )
+        and np.all(
+            np.isfinite(
+                false_reject_rates
+            )
+        )
+    ):
+        raise ValueError(
+            "EER requires finite FAR and FRR values."
+        )
+
+    difference = (
+        false_accept_rates
+        - false_reject_rates
+    )
+
+    exact = np.flatnonzero(
+        difference == 0.0
+    )
+
+    if len(exact) > 0:
+        eer = float(
+            false_accept_rates[
+                exact[0]
+            ]
+        )
+
+    else:
+        crossing_intervals = (
+            np.flatnonzero(
+                difference[:-1]
+                * difference[1:]
+                < 0.0
+            )
+        )
+
+        if len(crossing_intervals) == 0:
+            raise ValueError(
+                "The empirical FAR and FRR curves do not "
+                "contain an EER crossing."
+            )
+
+        lower = int(
+            crossing_intervals[0]
+        )
+        upper = lower + 1
+
+        lower_difference = float(
+            difference[lower]
+        )
+        upper_difference = float(
+            difference[upper]
+        )
+
+        denominator = (
+            upper_difference
+            - lower_difference
+        )
+
+        if denominator == 0.0:
+            raise ValueError(
+                "The EER crossing interval is degenerate."
+            )
+
+        fraction = (
+            -lower_difference
+            / denominator
+        )
+
+        interpolated_far = (
+            false_accept_rates[lower]
+            + fraction
+            * (
+                false_accept_rates[upper]
+                - false_accept_rates[lower]
+            )
+        )
+
+        interpolated_frr = (
+            false_reject_rates[lower]
+            + fraction
+            * (
+                false_reject_rates[upper]
+                - false_reject_rates[lower]
+            )
+        )
+
+        eer = float(
+            0.5
+            * (
+                interpolated_far
+                + interpolated_frr
+            )
+        )
+
+    if (
+        not np.isfinite(eer)
+        or not 0.0 <= eer <= 1.0
+    ):
+        raise ValueError(
+            "Interpolated EER is outside the valid "
+            "probability range."
+        )
+
+    return eer
+
+
 def _build_verification_curve_artifacts(
     scores,
     labels_pair,
@@ -1071,6 +1239,13 @@ def _build_verification_curve_artifacts(
         / impostor_count
     )
 
+    eer = (
+        _interpolate_equal_error_rate(
+            false_accept_rates,
+            false_reject_rates,
+        )
+    )
+
     tolerance = (
         np.finfo(float).eps
         * 32.0
@@ -1079,6 +1254,31 @@ def _build_verification_curve_artifacts(
     operating_points = []
 
     for target_far in target_fars:
+        far_percentage = (
+            target_far
+            * 100.0
+        )
+
+        if minimum_nonzero_far > target_far:
+            operating_points.append(
+                {
+                    "name": (
+                        "TAR@"
+                        f"{far_percentage:g}%FAR"
+                    ),
+                    "target_far": float(
+                        target_far
+                    ),
+                    "observed_far": None,
+                    "tar": None,
+                    "frr": None,
+                    "threshold": None,
+                    "empirically_resolvable": False,
+                }
+            )
+
+            continue
+
         eligible_indices = np.flatnonzero(
             false_accept_rates
             <= (
@@ -1106,11 +1306,6 @@ def _build_verification_curve_artifacts(
                     eligible_tars
                 )
             ]
-        )
-
-        far_percentage = (
-            target_far
-            * 100.0
         )
 
         operating_points.append(
@@ -1166,6 +1361,9 @@ def _build_verification_curve_artifacts(
                 minimum_nonzero_far
             ),
         },
+        "eer": float(
+            eer
+        ),
         "roc_auc": float(
             auc(
                 false_accept_rates,
@@ -1421,47 +1619,108 @@ def _build_identification_curve_artifacts(
     }
 
 
-def _compute_metrics_verification(scores, labels_pair):
+
+def _compute_metrics_verification(
+    scores,
+    labels_pair,
+):
     """
-    Calculates standard biometric verification metrics.
-    
-    Args:
-        scores: Similarity scores (Cosine Similarity, -1 to 1).
-        labels_pair: 1 for Genuine (Same ID), 0 for Imposter (Diff ID).
-        
-    Returns:
-        tuple: (EER, AUC, d_prime, TAR@0.1%FAR)
+    Calculate verification EER, AUC, d-prime, and TAR at 0.1% FAR.
+
+    EER is linearly interpolated across the empirical FAR/FRR crossing.
+    TAR uses an observed threshold with FAR no greater than 0.1% and is
+    unavailable when the impostor count cannot resolve that FAR.
     """
-    fpr, tpr, thresholds = roc_curve(labels_pair, scores)
-    roc_auc = auc(fpr, tpr)
-    
-    # 1. EER (Equal Error Rate): Where False Accept Rate = False Reject Rate
-    try:
-        eer = brentq(lambda x : 1. - x - interp1d(fpr, tpr)(x), 0., 1.)
-    except:
-        eer = 1.0 # Fail safe
+    (
+        scores,
+        labels_pair,
+    ) = _validate_verification_curve_inputs(
+        scores,
+        labels_pair,
+    )
 
-    # 2. d-prime (Decidability Index): Separation between Genuine/Imposter distributions
-    gen_scores = [s for s, l in zip(scores, labels_pair) if l == 1]
-    imp_scores = [s for s, l in zip(scores, labels_pair) if l == 0]
-    
-    if len(gen_scores) > 0 and len(imp_scores) > 0:
-        mu_gen, sigma_gen = np.mean(gen_scores), np.std(gen_scores)
-        mu_imp, sigma_imp = np.mean(imp_scores), np.std(imp_scores)
-        # Formula: |mu1 - mu2| / sqrt((var1 + var2)/2)
-        d_prime = abs(mu_gen - mu_imp) / np.sqrt(0.5 * (sigma_gen**2 + sigma_imp**2) + 1e-10)
-    else:
-        d_prime = 0.0
+    artifacts = (
+        _build_verification_curve_artifacts(
+            scores,
+            labels_pair,
+            target_fars=[
+                0.001,
+            ],
+        )
+    )
 
-    # 3. TAR @ FAR (Security Metric): Accuracy when False Accepts are locked at 0.1%
-    target_far = 0.001 # 0.1%
-    try:
-        tar_at_far = interp1d(fpr, tpr)(target_far)
-    except:
-        tar_at_far = 0.0
+    eer = float(
+        artifacts["eer"]
+    )
 
-    print(f"[RESULT] EER: {eer:.4f} | AUC: {roc_auc:.4f} | d': {d_prime:.4f} | TAR@0.1%FAR: {tar_at_far:.4f}")
-    return eer, roc_auc, d_prime, tar_at_far
+    roc_auc = float(
+        artifacts["roc_auc"]
+    )
+
+    tar_at_far = (
+        artifacts[
+            "operating_points"
+        ][0]["tar"]
+    )
+
+    genuine_scores = scores[
+        labels_pair == 1
+    ]
+
+    impostor_scores = scores[
+        labels_pair == 0
+    ]
+
+    mu_genuine = np.mean(
+        genuine_scores
+    )
+    sigma_genuine = np.std(
+        genuine_scores
+    )
+
+    mu_impostor = np.mean(
+        impostor_scores
+    )
+    sigma_impostor = np.std(
+        impostor_scores
+    )
+
+    d_prime = float(
+        abs(
+            mu_genuine
+            - mu_impostor
+        )
+        / np.sqrt(
+            0.5
+            * (
+                sigma_genuine ** 2
+                + sigma_impostor ** 2
+            )
+            + 1e-10
+        )
+    )
+
+    tar_text = (
+        "N/A"
+        if tar_at_far is None
+        else f"{tar_at_far:.4f}"
+    )
+
+    print(
+        "[RESULT] "
+        f"EER: {eer:.4f} | "
+        f"AUC: {roc_auc:.4f} | "
+        f"d': {d_prime:.4f} | "
+        f"TAR@0.1%FAR: {tar_text}"
+    )
+
+    return (
+        eer,
+        roc_auc,
+        d_prime,
+        tar_at_far,
+    )
+
 
 def _compute_metrics_identification(
     preds_probs,

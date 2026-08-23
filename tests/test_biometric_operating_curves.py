@@ -138,6 +138,7 @@ class VerificationCurveArtifactTests(
             ),
         )
 
+
     def test_operating_points_reproduce_threshold_rates(self):
         artifacts = (
             _build_verification_curve_artifacts(
@@ -149,6 +150,7 @@ class VerificationCurveArtifactTests(
         genuine_scores = self.scores[
             self.labels == 1
         ]
+
         impostor_scores = self.scores[
             self.labels == 0
         ]
@@ -156,6 +158,23 @@ class VerificationCurveArtifactTests(
         for point in artifacts[
             "operating_points"
         ]:
+            if not point[
+                "empirically_resolvable"
+            ]:
+                self.assertIsNone(
+                    point["observed_far"]
+                )
+                self.assertIsNone(
+                    point["tar"]
+                )
+                self.assertIsNone(
+                    point["frr"]
+                )
+                self.assertIsNone(
+                    point["threshold"]
+                )
+                continue
+
             threshold = point[
                 "threshold"
             ]
@@ -168,23 +187,32 @@ class VerificationCurveArtifactTests(
                 impostor_scores
                 >= threshold
             )
+
             observed_tar = np.mean(
                 genuine_scores
                 >= threshold
             )
 
             self.assertAlmostEqual(
-                point["observed_far"],
+                point[
+                    "observed_far"
+                ],
                 observed_far,
             )
+
             self.assertAlmostEqual(
                 point["tar"],
                 observed_tar,
             )
+
             self.assertLessEqual(
-                point["observed_far"],
+                point[
+                    "observed_far"
+                ],
                 (
-                    point["target_far"]
+                    point[
+                        "target_far"
+                    ]
                     + 1e-12
                 ),
             )

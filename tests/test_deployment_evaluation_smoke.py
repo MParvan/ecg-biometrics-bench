@@ -221,16 +221,27 @@ class DeploymentEvaluationSmokeTests(
         eer = float(metrics[0])
         auc_value = float(metrics[1])
         d_prime = float(metrics[2])
-        tar_at_far = float(metrics[3])
+
+        tar_at_far = (
+            None
+            if metrics[3] is None
+            else float(metrics[3])
+        )
 
         for metric in [
             eer,
             auc_value,
             d_prime,
-            tar_at_far,
         ]:
             self.assertTrue(
                 np.isfinite(metric)
+            )
+
+        if tar_at_far is not None:
+            self.assertTrue(
+                np.isfinite(
+                    tar_at_far
+                )
             )
 
         self.assertGreaterEqual(
@@ -256,14 +267,16 @@ class DeploymentEvaluationSmokeTests(
             0.0,
         )
 
-        self.assertGreaterEqual(
-            tar_at_far,
-            0.0,
-        )
-        self.assertLessEqual(
-            tar_at_far,
-            1.0,
-        )
+        if tar_at_far is not None:
+            self.assertGreaterEqual(
+                tar_at_far,
+                0.0,
+            )
+
+            self.assertLessEqual(
+                tar_at_far,
+                1.0,
+            )
 
         self.assertGreater(
             data_statistics[
