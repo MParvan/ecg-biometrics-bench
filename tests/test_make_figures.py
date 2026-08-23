@@ -145,13 +145,19 @@ class PairedSignificanceTests(unittest.TestCase):
         self.assertEqual(result["p_value"], 1.0)
         self.assertEqual(result["cohens_dz"], 0.0)
 
-    def test_unequal_lengths_are_truncated_to_pairs(self):
-        result = figures.paired_significance(
-            [0.05, 0.06, 0.055],
-            [0.09, 0.10, 0.095, 0.098, 0.092],
-        )
+    def test_unequal_lengths_are_rejected(self):
+        with self.assertRaisesRegex(ValueError, "same number"):
+            figures.paired_significance(
+                [0.05, 0.06, 0.055],
+                [0.09, 0.10, 0.095, 0.098, 0.092],
+            )
 
-        self.assertEqual(result["n_pairs"], 3)
+    def test_non_finite_values_are_rejected(self):
+        with self.assertRaisesRegex(ValueError, "finite"):
+            figures.paired_significance(
+                [0.05, float("nan"), 0.055, 0.058, 0.052],
+                [0.09, 0.10, 0.095, 0.098, 0.092],
+            )
 
     def test_too_few_pairs_returns_none(self):
         self.assertIsNone(
@@ -224,16 +230,23 @@ class RenderingTests(unittest.TestCase):
         ]
 
         self.protocols = protocols
+        self.seeds = [42, 43, 44, 45, 46]
         self.series = {
             "closed_set": {
-                protocol: list(
-                    rng.normal(0.06, 0.005, 5)
+                protocol: dict(
+                    zip(
+                        self.seeds,
+                        rng.normal(0.06, 0.005, len(self.seeds)),
+                    )
                 )
                 for protocol in protocols
             },
             "subject_disjoint": {
-                protocol: list(
-                    rng.normal(0.18, 0.02, 5)
+                protocol: dict(
+                    zip(
+                        self.seeds,
+                        rng.normal(0.18, 0.02, len(self.seeds)),
+                    )
                 )
                 for protocol in protocols
             },
@@ -372,6 +385,192 @@ class ProtocolOrderingTests(unittest.TestCase):
             figures.order_protocols("ecgid", series),
             ["all_available", "zzz_custom"],
         )
+
+
+class SeedMetricExtractionTests(unittest.TestCase):
+    """
+    Missing-strict per-seed metric collection.
+
+    Any missing, None, non-numeric, or non-finite metric value must mark the
+    whole configuration as unavailable so figure code cannot silently average
+    a subset of runs.
+    """
+
+    def _record(self, per_run):
+        return {"per_run_results": per_run}
+
+    def test_returns_seed_indexed_values(self):
+        record = self._record(
+            [
+                {"seed": 42, "metrics": {"EER": 0.05}},
+                {"seed": 43, "metrics": {"EER": 0.06}},
+                {"seed": 44, "metrics": {"EER": 0.055}},
+            ]
+        )
+
+        self.assertEqual(
+            figures._extract_seed_metric(record, "EER"),
+            {42: 0.05, 43: 0.06, 44: 0.055},
+        )
+
+    def test_missing_metric_omits_configuration(self):
+        record = self._record(
+            [
+                {"seed": 42, "metrics": {"EER": 0.05}},
+                {"seed": 43, "metrics": {"EER": None}},
+                {"seed": 44, "metrics": {"EER": 0.055}},
+            ]
+        )
+
+        self.assertIsNone(figures._extract_seed_metric(record, "EER"))
+
+    def test_absent_metric_key_omits_configuration(self):
+        record = self._record(
+            [
+                {"seed": 42, "metrics": {"EER": 0.05}},
+                {"seed": 43, "metrics": {"AUC": 0.99}},
+            ]
+        )
+
+        self.assertIsNone(figures._extract_seed_metric(record, "EER"))
+
+    def test_non_finite_value_omits_configuration(self):
+        record = self._record(
+            [
+                {"seed": 42, "metrics": {"EER": 0.05}},
+                {"seed": 43, "metrics": {"EER": float("nan")}},
+            ]
+        )
+
+        self.assertIsNone(figures._extract_seed_metric(record, "EER"))
+
+    def test_duplicate_seed_omits_configuration(self):
+        record = self._record(
+            [
+                {"seed": 42, "metrics": {"EER": 0.05}},
+                {"seed": 42, "metrics": {"EER": 0.06}},
+            ]
+        )
+
+        self.assertIsNone(figures._extract_seed_metric(record, "EER"))
+
+    def test_missing_seed_omits_configuration(self):
+        record = self._record(
+            [
+                {"metrics": {"EER": 0.05}},
+                {"seed": 43, "metrics": {"EER": 0.06}},
+            ]
+        )
+
+        self.assertIsNone(figures._extract_seed_metric(record, "EER"))
+
+    def test_non_integer_seed_types_are_rejected(self):
+        cases = [
+            ("float_with_fraction", 42.5),
+            ("float_integer_valued", 42.0),
+            ("numeric_string", "42"),
+            ("boolean_true", True),
+            ("boolean_false", False),
+        ]
+
+        for label, bad_seed in cases:
+            with self.subTest(label=label):
+                record = self._record(
+                    [
+                        {
+                            "seed": bad_seed,
+                            "metrics": {"EER": 0.05},
+                        },
+                    ]
+                )
+                self.assertIsNone(
+                    figures._extract_seed_metric(record, "EER")
+                )
+
+    def test_numpy_integer_seed_is_accepted(self):
+        record = self._record(
+            [
+                {"seed": np.int64(42), "metrics": {"EER": 0.05}},
+                {"seed": np.int32(43), "metrics": {"EER": 0.06}},
+            ]
+        )
+
+        self.assertEqual(
+            figures._extract_seed_metric(record, "EER"),
+            {42: 0.05, 43: 0.06},
+        )
+
+    def test_empty_record_returns_none(self):
+        self.assertIsNone(figures._extract_seed_metric({}, "EER"))
+        self.assertIsNone(figures._extract_seed_metric(None, "EER"))
+        self.assertIsNone(
+            figures._extract_seed_metric(
+                {"per_run_results": []}, "EER"
+            )
+        )
+
+
+class PairedSeedAlignmentTests(unittest.TestCase):
+    """
+    Seed-set alignment for paired conditions.
+    """
+
+    def test_shuffled_seeds_align_by_identity(self):
+        left = {43: 0.06, 42: 0.05, 44: 0.055}
+        right = {44: 0.07, 42: 0.09, 43: 0.10}
+
+        seeds, left_arr, right_arr = figures._align_paired_seed_values(
+            left, right
+        )
+
+        self.assertEqual(seeds, [42, 43, 44])
+        np.testing.assert_array_equal(left_arr, [0.05, 0.06, 0.055])
+        np.testing.assert_array_equal(right_arr, [0.09, 0.10, 0.07])
+
+    def test_mismatched_seed_sets_are_rejected(self):
+        with self.assertRaisesRegex(ValueError, "identical seed sets"):
+            figures._align_paired_seed_values(
+                {42: 0.05, 43: 0.06},
+                {42: 0.09, 44: 0.10},
+            )
+
+    def test_subset_is_rejected_not_silently_intersected(self):
+        with self.assertRaisesRegex(ValueError, "identical seed sets"):
+            figures._align_paired_seed_values(
+                {42: 0.05, 43: 0.06, 44: 0.055},
+                {42: 0.09, 43: 0.10},
+            )
+
+    def test_non_finite_values_are_rejected(self):
+        with self.assertRaisesRegex(ValueError, "finite"):
+            figures._align_paired_seed_values(
+                {42: 0.05, 43: float("inf")},
+                {42: 0.09, 43: 0.10},
+            )
+
+    def test_non_integer_seed_keys_are_rejected(self):
+        cases = [
+            ("float_key", {42.5: 0.05, 43: 0.06}),
+            ("string_key", {"42": 0.05, 43: 0.06}),
+            ("boolean_key", {True: 0.05, 43: 0.06}),
+        ]
+        good = {42: 0.09, 43: 0.10}
+
+        for label, bad_left in cases:
+            with self.subTest(label=label):
+                with self.assertRaisesRegex(
+                    ValueError, "non-integer seed"
+                ):
+                    figures._align_paired_seed_values(bad_left, good)
+
+    def test_positional_lists_are_rejected(self):
+        with self.assertRaisesRegex(
+            ValueError, "seed-indexed mappings"
+        ):
+            figures._align_paired_seed_values(
+                [0.05, 0.06],
+                [0.09, 0.10],
+            )
 
 
 if __name__ == "__main__":

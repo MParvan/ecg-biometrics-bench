@@ -41,6 +41,7 @@ Usage:
 
 import argparse
 import csv
+import math
 import sys
 from collections import OrderedDict
 from pathlib import Path
@@ -150,12 +151,90 @@ def apply_publication_style(base_font_size):
     )
 
 
+def _is_integer_seed(seed):
+    """
+    Return True only for genuine integer-like seed identifiers.
+
+    Booleans, floats (even integer-valued ones such as ``42.0``), strings, and
+    ``None`` are rejected so that seed identity used for paired statistics can
+    never be silently normalized away from a malformed record.
+    """
+    if isinstance(seed, bool):
+        return False
+
+    return isinstance(seed, (int, np.integer))
+
+
+def _extract_seed_metric(record, metric):
+    """
+    Return a seed-indexed mapping of one metric, or None if the record is
+    unfit for figure aggregation.
+
+    A configuration is considered unavailable and returned as ``None`` when
+    any per-run result is missing the metric, carries a non-numeric or
+    non-finite value, or lacks a unique integer seed. Refusing to average a
+    partial series here prevents figures from silently reproducing subset
+    aggregation that runtime metric handling now rejects.
+    """
+    if not record:
+        return None
+
+    per_run_results = record.get("per_run_results")
+
+    if not isinstance(per_run_results, list) or not per_run_results:
+        return None
+
+    seed_values = {}
+
+    for run_record in per_run_results:
+        if not isinstance(run_record, dict):
+            return None
+
+        seed = run_record.get("seed")
+
+        if not _is_integer_seed(seed):
+            return None
+
+        seed_int = int(seed)
+
+        if seed_int in seed_values:
+            return None
+
+        metrics = run_record.get("metrics")
+
+        if not isinstance(metrics, dict) or metric not in metrics:
+            return None
+
+        value = metrics[metric]
+
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+
+        value_float = float(value)
+
+        if not math.isfinite(value_float):
+            return None
+
+        seed_values[seed_int] = value_float
+
+    if not seed_values:
+        return None
+
+    return seed_values
+
+
 def collect_series(entries, metric):
     """
     Collect per-seed metric values for every (protocol, setting) combination.
 
-    Returns a mapping of setting to an ordered mapping of protocol to the list
-    of per-seed values, plus the dataset the values belong to.
+    Returns a mapping of setting to an ordered mapping of protocol to a
+    seed-indexed dictionary of per-run values, plus the list of configurations
+    whose metric was unavailable for plotting.
+
+    A configuration is retained only when the metric is present and finite for
+    every one of its recorded seeds. Otherwise it is reported as missing and
+    excluded, so the figure code cannot silently average or plot a partial
+    series behind runtime aggregation.
     """
     task_type = (
         "identification"
@@ -181,27 +260,97 @@ def collect_series(entries, metric):
             read_latest_record(log_path) if log_path else None
         )
 
-        if not record:
+        seed_values = _extract_seed_metric(record, metric)
+
+        if seed_values is None:
             missing.append(entry.path.name)
             continue
 
-        values = [
-            run_record.get("metrics", {}).get(metric)
-            for run_record in record.get("per_run_results", [])
-        ]
-        values = [
-            float(value)
-            for value in values
-            if isinstance(value, (int, float))
-        ]
-
-        if not values:
-            missing.append(entry.path.name)
-            continue
-
-        series[entry.setting][entry.protocol] = values
+        series[entry.setting][entry.protocol] = seed_values
 
     return series, missing
+
+
+def _values_from(seed_values):
+    """
+    Return ordered per-seed metric values as a list.
+
+    Accepts either a seed-indexed mapping produced by ``collect_series`` or an
+    already-flat sequence. Mapping order follows ascending seed so downstream
+    means and error bars are deterministic regardless of JSONL insertion order.
+    """
+    if seed_values is None:
+        return []
+
+    if isinstance(seed_values, dict):
+        return [seed_values[seed] for seed in sorted(seed_values)]
+
+    return list(seed_values)
+
+
+def _align_paired_seed_values(left_seed_values, right_seed_values):
+    """
+    Align two seed-indexed conditions into paired numpy arrays.
+
+    Both inputs must be seed-indexed mappings covering exactly the same seed
+    set, with unique integer seeds and finite numeric values. Positional
+    truncation and silent intersection are refused so that a paired comparison
+    always speaks about the same training seeds.
+    """
+    if not isinstance(left_seed_values, dict) or not isinstance(
+        right_seed_values, dict
+    ):
+        raise ValueError(
+            "Paired conditions must be provided as seed-indexed mappings."
+        )
+
+    for side, mapping in (
+        ("left", left_seed_values),
+        ("right", right_seed_values),
+    ):
+        for key in mapping:
+            if not _is_integer_seed(key):
+                raise ValueError(
+                    f"Paired {side} condition contains a non-integer "
+                    f"seed identifier: {key!r}."
+                )
+
+    left_seeds = {int(seed) for seed in left_seed_values}
+    right_seeds = {int(seed) for seed in right_seed_values}
+
+    if left_seeds != right_seeds:
+        missing_from_right = sorted(left_seeds - right_seeds)
+        missing_from_left = sorted(right_seeds - left_seeds)
+        raise ValueError(
+            "Paired conditions must contain identical seed sets. "
+            f"Missing from right: {missing_from_right}; "
+            f"missing from left: {missing_from_left}."
+        )
+
+    if not left_seeds:
+        raise ValueError(
+            "Paired conditions must contain at least one seed."
+        )
+
+    seeds = sorted(left_seeds)
+    left_array = np.asarray(
+        [left_seed_values[seed] for seed in seeds],
+        dtype=float,
+    )
+    right_array = np.asarray(
+        [right_seed_values[seed] for seed in seeds],
+        dtype=float,
+    )
+
+    if not (
+        np.all(np.isfinite(left_array))
+        and np.all(np.isfinite(right_array))
+    ):
+        raise ValueError(
+            "Paired observations must be finite."
+        )
+
+    return seeds, left_array, right_array
 
 
 def order_protocols(dataset, series):
@@ -260,13 +409,30 @@ def paired_significance(left_values, right_values):
     left_values = np.asarray(left_values, dtype=float)
     right_values = np.asarray(right_values, dtype=float)
 
-    paired_count = min(left_values.size, right_values.size)
+    if left_values.ndim != 1 or right_values.ndim != 1:
+        raise ValueError(
+            "Paired values must be one-dimensional."
+        )
+
+    if left_values.shape != right_values.shape:
+        raise ValueError(
+            "Paired conditions must contain the same number of "
+            "observations aligned by seed. "
+            f"Received {left_values.size} and {right_values.size}."
+        )
+
+    if not (
+        np.all(np.isfinite(left_values))
+        and np.all(np.isfinite(right_values))
+    ):
+        raise ValueError(
+            "Paired observations must be finite."
+        )
+
+    paired_count = left_values.size
 
     if paired_count < 2:
         return None
-
-    left_values = left_values[:paired_count]
-    right_values = right_values[:paired_count]
 
     differences = right_values - left_values
 
@@ -348,7 +514,7 @@ def _label_offset(series, protocols, fraction=0.02):
         value
         for protocol_values in series.values()
         for protocol in protocols
-        for value in protocol_values.get(protocol, [])
+        for value in _values_from(protocol_values.get(protocol))
     ]
 
     if not values:
@@ -396,7 +562,7 @@ def plot_degradation(dataset, metric, series, protocols, output_dir,
         present_positions = []
 
         for index, protocol in enumerate(protocols):
-            values = protocol_values.get(protocol)
+            values = _values_from(protocol_values.get(protocol))
 
             if not values:
                 continue
@@ -507,7 +673,7 @@ def plot_comparison(dataset, metric, series, protocols, output_dir,
         )
 
         for index, protocol in enumerate(protocols):
-            values = protocol_values.get(protocol)
+            values = _values_from(protocol_values.get(protocol))
 
             if not values:
                 continue
@@ -633,15 +799,10 @@ def plot_paired(dataset, metric, series, left_protocol, right_protocol,
     statistics = []
 
     for axis, setting in zip(axes[0], settings):
-        left_values = series[setting][left_protocol]
-        right_values = series[setting][right_protocol]
-
-        paired_count = min(
-            len(left_values),
-            len(right_values),
+        seeds, left_values, right_values = _align_paired_seed_values(
+            series[setting][left_protocol],
+            series[setting][right_protocol],
         )
-        left_values = left_values[:paired_count]
-        right_values = right_values[:paired_count]
 
         colour = SETTING_COLORS[setting]
 
@@ -695,13 +856,15 @@ def plot_paired(dataset, metric, series, left_protocol, right_protocol,
             )
             statistics.append(test_result)
 
+            combined_values = np.concatenate(
+                (left_values, right_values)
+            )
             span = max(
-                max(left_values + right_values)
-                - min(left_values + right_values),
+                float(combined_values.max() - combined_values.min()),
                 1e-9,
             )
             bracket_y = (
-                max(max(left_values), max(right_values))
+                float(max(left_values.max(), right_values.max()))
                 + span * 0.18
             )
             tick = span * 0.05
