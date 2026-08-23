@@ -6766,27 +6766,19 @@ def _prepare_cross_session_enrollment_role(
     y_enroll,
     provenance_enroll,
     use_enrollment,
-    outlier_filtering_on_enroll,
-    sqi_enroll,
-    sqi_threshold,
-    sqi_keep_pct,
 ):
     """
-    Prepare an optional enrollment role independently of training.
+    Validate an optional physically separate enrollment role.
 
     Enrollment data is unused when ``use_enrollment`` is false. When enrollment
-    is required but no separate arrays are supplied, callers retain the shared
-    training/enrollment behavior through the partition helper.
-
-    A physically separate enrollment role has an independent SQI policy.
-    Training-role filtering never implicitly filters separate enrollment data.
+    is required but no separate arrays are supplied, the partition helper
+    reuses the already processed training role.
     """
     if not use_enrollment:
         return (
             None,
             None,
             None,
-            False,
             False,
         )
 
@@ -6806,61 +6798,37 @@ def _prepare_cross_session_enrollment_role(
                 "x_enroll and y_enroll arrays."
             )
 
-        if outlier_filtering_on_enroll is not None:
-            if not isinstance(
-                outlier_filtering_on_enroll,
-                (
-                    bool,
-                    np.bool_,
-                ),
-            ):
-                raise ValueError(
-                    "outlier_filtering_on_enroll must be "
-                    "Boolean or None."
-                )
-
-            if bool(
-                outlier_filtering_on_enroll
-            ):
-                raise ValueError(
-                    "Enrollment-specific filtering requires "
-                    "explicit x_enroll and y_enroll arrays."
-                )
-
-        if sqi_enroll is not None:
-            raise ValueError(
-                "sqi_enroll requires explicit "
-                "x_enroll and y_enroll arrays."
-            )
-
         return (
             None,
             None,
             None,
-            False,
             False,
         )
 
     x_enroll = np.asarray(
         x_enroll
     )
+
     y_enroll = np.asarray(
         y_enroll
     )
 
     if x_enroll.ndim < 1:
         raise ValueError(
-            "Enrollment samples must contain a sample dimension."
+            "Enrollment samples must contain "
+            "a sample dimension."
         )
 
     if y_enroll.ndim != 1:
         raise ValueError(
-            "Enrollment labels must be one-dimensional."
+            "Enrollment labels must be "
+            "one-dimensional."
         )
 
     if len(x_enroll) != len(y_enroll):
         raise ValueError(
-            "Enrollment samples and labels are misaligned."
+            "Enrollment samples and labels "
+            "are misaligned."
         )
 
     if (
@@ -6869,129 +6837,14 @@ def _prepare_cross_session_enrollment_role(
         != len(y_enroll)
     ):
         raise ValueError(
-            "Enrollment provenance is misaligned with "
-            "enrollment samples and labels."
-        )
-
-    if outlier_filtering_on_enroll is None:
-        filter_enrollment = False
-    else:
-        filter_enrollment = (
-            outlier_filtering_on_enroll
-        )
-
-    if not isinstance(
-        filter_enrollment,
-        (
-            bool,
-            np.bool_,
-        ),
-    ):
-        raise ValueError(
-            "outlier_filtering_on_enroll must be Boolean "
-            "or None."
-        )
-
-    filter_enrollment = bool(
-        filter_enrollment
-    )
-
-    if not filter_enrollment:
-        return (
-            x_enroll,
-            y_enroll,
-            provenance_enroll,
-            True,
-            False,
-        )
-
-    enrollment_sqi_input = sqi_enroll
-
-    if enrollment_sqi_input is None:
-        print(
-            "[WARN] Enrollment filtering requested but "
-            "enrollment SQI scores are unavailable. "
-            "Skipping enrollment filtering."
-        )
-
-        return (
-            x_enroll,
-            y_enroll,
-            provenance_enroll,
-            True,
-            True,
-        )
-
-    if isinstance(
-        enrollment_sqi_input,
-        str,
-    ):
-        print(
-            "[INFO] Calculating SQI for enrollment data "
-            f"using method: '{enrollment_sqi_input}'"
-        )
-
-        enrollment_sqi = np.asarray(
-            _compute_sqi(
-                x_enroll,
-                method=enrollment_sqi_input,
-            )
-        )
-    elif isinstance(
-        enrollment_sqi_input,
-        (
-            list,
-            np.ndarray,
-        ),
-    ):
-        enrollment_sqi = np.asarray(
-            enrollment_sqi_input
-        )
-    else:
-        raise TypeError(
-            "sqi_enroll must be a string, array, or None."
-        )
-
-    print(
-        "\n[INFO] Filtering enrollment data..."
-    )
-
-    if provenance_enroll is not None:
-        (
-            x_enroll,
-            y_enroll,
-            retained_indices,
-        ) = _apply_outlier_filter(
-            x_enroll,
-            y_enroll,
-            enrollment_sqi,
-            sqi_threshold,
-            sqi_keep_pct,
-            return_indices=True,
-        )
-
-        provenance_enroll = (
-            provenance_enroll.subset(
-                retained_indices
-            )
-        )
-    else:
-        (
-            x_enroll,
-            y_enroll,
-        ) = _apply_outlier_filter(
-            x_enroll,
-            y_enroll,
-            enrollment_sqi,
-            sqi_threshold,
-            sqi_keep_pct,
+            "Enrollment provenance is misaligned "
+            "with enrollment samples and labels."
         )
 
     return (
         x_enroll,
         y_enroll,
         provenance_enroll,
-        True,
         True,
     )
 
@@ -7005,8 +6858,7 @@ def run_cross_session_identification(x_train, y_train, x_test, y_test, model_cla
                                      loader=None, n_runs=1, _return_stats=False,
                                      intelligent_weight_loading=True,
                                      augmentation_config=None, split_seed=None, provenance_s1=None, provenance_s2=None,
-                                     x_enroll=None, y_enroll=None, provenance_enroll=None,
-                                     outlier_filtering_on_enroll=None, sqi_enroll=None):
+                                     x_enroll=None, y_enroll=None, provenance_enroll=None):
     """
     Cross-session identification with protocol-defined data roles.
 
@@ -7222,24 +7074,11 @@ def run_cross_session_identification(x_train, y_train, x_test, y_test, model_cla
         y_enroll_prepared,
         provenance_enroll_prepared,
         enrollment_is_explicit,
-        enrollment_filter_requested,
     ) = _prepare_cross_session_enrollment_role(
         x_enroll=x_enroll,
         y_enroll=y_enroll,
         provenance_enroll=provenance_enroll,
         use_enrollment=use_template,
-        outlier_filtering_on_enroll=outlier_filtering_on_enroll,
-        sqi_enroll=sqi_enroll,
-        sqi_threshold=sqi_threshold,
-        sqi_keep_pct=sqi_keep_pct,
-    )
-
-    hyperparams[
-        "outlier_filter_enroll"
-    ] = (
-        enrollment_filter_requested
-        if enrollment_is_explicit
-        else None
     )
 
     # ====================================================
@@ -7586,8 +7425,7 @@ def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class
                                    n_runs=1, _return_stats=False,
                                    intelligent_weight_loading=True,
                                    augmentation_config=None, split_seed=None, provenance_s1=None, provenance_s2=None,
-                                   x_enroll=None, y_enroll=None, provenance_enroll=None,
-                                   outlier_filtering_on_enroll=None, sqi_enroll=None):
+                                   x_enroll=None, y_enroll=None, provenance_enroll=None):
     """
     Cross-session verification with protocol-defined data roles.
 
@@ -7825,24 +7663,11 @@ def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class
         y_enroll_prepared,
         provenance_enroll_prepared,
         enrollment_is_explicit,
-        enrollment_filter_requested,
     ) = _prepare_cross_session_enrollment_role(
         x_enroll=x_enroll,
         y_enroll=y_enroll,
         provenance_enroll=provenance_enroll,
         use_enrollment=use_template,
-        outlier_filtering_on_enroll=outlier_filtering_on_enroll,
-        sqi_enroll=sqi_enroll,
-        sqi_threshold=sqi_threshold,
-        sqi_keep_pct=sqi_keep_pct,
-    )
-
-    hyperparams[
-        "outlier_filter_enroll"
-    ] = (
-        enrollment_filter_requested
-        if enrollment_is_explicit
-        else None
     )
 
     # ====================================================
@@ -8227,8 +8052,7 @@ def run_subject_disjoint_cross_session_identification(
         loader=None, n_runs=1, _return_stats=False,
         intelligent_weight_loading=True,
         augmentation_config=None, split_seed=None, provenance_s1=None, provenance_s2=None,
-        x_enroll=None, y_enroll=None, provenance_enroll=None,
-        outlier_filtering_on_enroll=None, sqi_enroll=None):
+        x_enroll=None, y_enroll=None, provenance_enroll=None):
     """
     Subject-disjoint cross-session identification.
     1. Fits a feature extractor using the training role for Subject Group A.
@@ -8436,24 +8260,11 @@ def run_subject_disjoint_cross_session_identification(
         y_enroll_prepared,
         provenance_enroll_prepared,
         enrollment_is_explicit,
-        enrollment_filter_requested,
     ) = _prepare_cross_session_enrollment_role(
         x_enroll=x_enroll,
         y_enroll=y_enroll,
         provenance_enroll=provenance_enroll,
         use_enrollment=True,
-        outlier_filtering_on_enroll=outlier_filtering_on_enroll,
-        sqi_enroll=sqi_enroll,
-        sqi_threshold=sqi_threshold,
-        sqi_keep_pct=sqi_keep_pct,
-    )
-
-    hyperparams[
-        "outlier_filter_enroll"
-    ] = (
-        enrollment_filter_requested
-        if enrollment_is_explicit
-        else None
     )
 
     # ====================================================
@@ -8811,8 +8622,7 @@ def run_subject_disjoint_cross_session_verification(
         save_results_and_settings=False, loader=None, n_runs=1, _return_stats=False,
         intelligent_weight_loading=True,
         augmentation_config=None, split_seed=None, provenance_s1=None, provenance_s2=None,
-        x_enroll=None, y_enroll=None, provenance_enroll=None,
-        outlier_filtering_on_enroll=None, sqi_enroll=None):
+        x_enroll=None, y_enroll=None, provenance_enroll=None):
     """
     Subject-disjoint cross-session verification.
 
@@ -9046,24 +8856,11 @@ def run_subject_disjoint_cross_session_verification(
         y_enroll_prepared,
         provenance_enroll_prepared,
         enrollment_is_explicit,
-        enrollment_filter_requested,
     ) = _prepare_cross_session_enrollment_role(
         x_enroll=x_enroll,
         y_enroll=y_enroll,
         provenance_enroll=provenance_enroll,
         use_enrollment=use_template,
-        outlier_filtering_on_enroll=outlier_filtering_on_enroll,
-        sqi_enroll=sqi_enroll,
-        sqi_threshold=sqi_threshold,
-        sqi_keep_pct=sqi_keep_pct,
-    )
-
-    hyperparams[
-        "outlier_filter_enroll"
-    ] = (
-        enrollment_filter_requested
-        if enrollment_is_explicit
-        else None
     )
 
     # ====================================================

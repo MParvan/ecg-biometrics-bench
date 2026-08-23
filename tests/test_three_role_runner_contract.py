@@ -573,69 +573,6 @@ class ThreeRoleRunnerContractTests(
             )
         )
 
-    def test_enrollment_sqi_filtering_is_independent(
-        self,
-    ):
-        enrollment_sqi = np.linspace(
-            0.2,
-            1.0,
-            len(self.enroll_x),
-            dtype=np.float64,
-        )
-
-        with patch.object(
-            run,
-            "_apply_outlier_filter",
-            wraps=run._apply_outlier_filter,
-        ) as filter_spy:
-            run.run_cross_session_identification(
-                self.train_x,
-                self.train_y,
-                self.probe_x,
-                self.probe_y,
-                use_template=True,
-                template_fusion_method="mean",
-                template_size=None,
-                probe_fusion_size=1,
-                outlier_filtering_on_train=False,
-                outlier_filtering_on_test=False,
-                outlier_filtering_on_enroll=True,
-                sqi_enroll=enrollment_sqi,
-                sqi_threshold=0.0,
-                sqi_keep_pct=1.0,
-                x_enroll=self.enroll_x,
-                y_enroll=self.enroll_y,
-                **COMMON,
-            )
-
-        enrollment_filter_calls = []
-
-        for recorded_call in (
-            filter_spy.call_args_list
-        ):
-            if not recorded_call.args:
-                continue
-
-            samples = np.asarray(
-                recorded_call.args[0]
-            )
-
-            if (
-                samples.shape
-                == self.enroll_x.shape
-                and np.array_equal(
-                    samples,
-                    self.enroll_x,
-                )
-            ):
-                enrollment_filter_calls.append(
-                    recorded_call
-                )
-
-        self.assertEqual(
-            len(enrollment_filter_calls),
-            1,
-        )
 
     def test_multi_run_preserves_explicit_enrollment_arrays(
         self,
@@ -781,99 +718,61 @@ class ThreeRoleRunnerContractTests(
                 )
 
 
-class EnrollmentPreparationPolicyTests(
+class EnrollmentPreparationValidationTests(
     unittest.TestCase
 ):
     def setUp(self):
         self.x_enroll = np.arange(
             24,
             dtype=np.float32,
-        ).reshape(6, 4)
-
-        self.y_enroll = np.asarray(
-            [0, 0, 0, 1, 1, 1]
+        ).reshape(
+            6,
+            4,
         )
 
-    def test_explicit_enrollment_is_not_filtered_by_default(
+        self.y_enroll = np.asarray(
+            [
+                0,
+                0,
+                0,
+                1,
+                1,
+                1,
+            ]
+        )
+
+    def test_explicit_enrollment_is_returned_unchanged(
         self,
     ):
-        with patch.object(
-            run,
-            "_apply_outlier_filter",
-            wraps=run._apply_outlier_filter,
-        ) as filter_spy:
-            (
-                x_prepared,
-                y_prepared,
-                provenance_prepared,
-                is_explicit,
-                filtering_requested,
-            ) = run._prepare_cross_session_enrollment_role(
-                x_enroll=self.x_enroll,
-                y_enroll=self.y_enroll,
-                provenance_enroll=None,
-                use_enrollment=True,
-                outlier_filtering_on_enroll=None,
-                sqi_enroll=None,
-                sqi_threshold=0.0,
-                sqi_keep_pct=1.0,
-            )
-
-        filter_spy.assert_not_called()
+        (
+            x_prepared,
+            y_prepared,
+            provenance_prepared,
+            is_explicit,
+        ) = run._prepare_cross_session_enrollment_role(
+            x_enroll=self.x_enroll,
+            y_enroll=self.y_enroll,
+            provenance_enroll=None,
+            use_enrollment=True,
+        )
 
         self.assertIs(
             x_prepared,
             self.x_enroll,
         )
+
         self.assertIs(
             y_prepared,
             self.y_enroll,
         )
+
         self.assertIsNone(
             provenance_prepared
         )
+
         self.assertTrue(
             is_explicit
         )
-        self.assertFalse(
-            filtering_requested
-        )
-
-    def test_enrollment_specific_filtering_requires_explicit_arrays(
-        self,
-    ):
-        with self.assertRaisesRegex(
-            ValueError,
-            "requires explicit x_enroll and y_enroll",
-        ):
-            run._prepare_cross_session_enrollment_role(
-                x_enroll=None,
-                y_enroll=None,
-                provenance_enroll=None,
-                use_enrollment=True,
-                outlier_filtering_on_enroll=True,
-                sqi_enroll=None,
-                sqi_threshold=0.0,
-                sqi_keep_pct=1.0,
-            )
-
-        with self.assertRaisesRegex(
-            ValueError,
-            "requires explicit",
-        ):
-            run._prepare_cross_session_enrollment_role(
-                x_enroll=None,
-                y_enroll=None,
-                provenance_enroll=None,
-                use_enrollment=True,
-                outlier_filtering_on_enroll=None,
-                sqi_enroll=np.ones(
-                    6,
-                    dtype=np.float64,
-                ),
-                sqi_threshold=0.0,
-                sqi_keep_pct=1.0,
-            )
 
     def test_enrollment_provenance_requires_explicit_arrays(
         self,
@@ -892,10 +791,6 @@ class EnrollmentPreparationPolicyTests(
                 y_enroll=None,
                 provenance_enroll=provenance,
                 use_enrollment=True,
-                outlier_filtering_on_enroll=None,
-                sqi_enroll=None,
-                sqi_threshold=0.0,
-                sqi_keep_pct=1.0,
             )
 
     def test_enrollment_provenance_must_be_aligned(
@@ -919,11 +814,38 @@ class EnrollmentPreparationPolicyTests(
                 y_enroll=self.y_enroll,
                 provenance_enroll=provenance,
                 use_enrollment=True,
-                outlier_filtering_on_enroll=False,
-                sqi_enroll=None,
-                sqi_threshold=0.0,
-                sqi_keep_pct=1.0,
             )
+
+    def test_unused_enrollment_role_ignores_incomplete_arrays(
+        self,
+    ):
+        (
+            x_prepared,
+            y_prepared,
+            provenance_prepared,
+            is_explicit,
+        ) = run._prepare_cross_session_enrollment_role(
+            x_enroll=self.x_enroll,
+            y_enroll=None,
+            provenance_enroll=None,
+            use_enrollment=False,
+        )
+
+        self.assertIsNone(
+            x_prepared
+        )
+
+        self.assertIsNone(
+            y_prepared
+        )
+
+        self.assertIsNone(
+            provenance_prepared
+        )
+
+        self.assertFalse(
+            is_explicit
+        )
 
 
 if __name__ == "__main__":
