@@ -335,17 +335,10 @@ class ProductionModelCompatibilityTests(
                 rank_1 = float(
                     metrics[0]
                 )
-                rank_5 = float(
-                    metrics[1]
-                )
 
                 self.assertTrue(
                     np.isfinite(rank_1)
                 )
-                self.assertTrue(
-                    np.isfinite(rank_5)
-                )
-
                 self.assertGreaterEqual(
                     rank_1,
                     0.0,
@@ -355,13 +348,12 @@ class ProductionModelCompatibilityTests(
                     1.0,
                 )
 
-                self.assertGreaterEqual(
-                    rank_5,
-                    rank_1,
-                )
-                self.assertLessEqual(
-                    rank_5,
-                    1.0,
+                # This compatibility fixture has exactly five
+                # gallery identities, so the terminal Rank-5
+                # point is defined in the CMC artifact but is
+                # intentionally not exposed as a headline metric.
+                self.assertIsNone(
+                    metrics[1]
                 )
 
                 self.assertEqual(

@@ -4044,6 +4044,88 @@ def _format_multi_run_metric(
     )
 
 
+
+def _apply_identification_metric_reportability(
+    results,
+    artifacts,
+):
+    """
+    Mask seed-level Rank-5 values that are not suitable for headline reporting.
+
+    Rank-1 remains available. Rank-5 is represented as None when its
+    identification artifact marks it as nonreportable, allowing the shared
+    missing-aware aggregation path to preserve that status across runs.
+    """
+    result_rows = [
+        tuple(result)
+        for result in results
+    ]
+    artifact_rows = list(
+        artifacts
+    )
+
+    if len(result_rows) != len(
+        artifact_rows
+    ):
+        raise ValueError(
+            "Identification results and artifacts "
+            "must contain the same number of runs."
+        )
+
+    reportable_rows = []
+
+    for result, artifact in zip(
+        result_rows,
+        artifact_rows,
+    ):
+        if len(result) != 2:
+            raise ValueError(
+                "Each identification result must "
+                "contain Rank-1 and Rank-5."
+            )
+
+        if (
+            not isinstance(
+                artifact,
+                Mapping,
+            )
+            or artifact.get("type")
+            != "identification"
+        ):
+            raise ValueError(
+                "Each identification result requires "
+                "a matching identification artifact."
+            )
+
+        if (
+            "rank_5_reportable"
+            not in artifact
+        ):
+            raise ValueError(
+                "Identification artifact is missing "
+                "Rank-5 reportability metadata."
+            )
+
+        rank_5 = (
+            result[1]
+            if bool(
+                artifact[
+                    "rank_5_reportable"
+                ]
+            )
+            else None
+        )
+
+        reportable_rows.append(
+            (
+                result[0],
+                rank_5,
+            )
+        )
+
+    return reportable_rows
+
+
 def _build_per_run_results(
     results,
     seeds,
@@ -4696,9 +4778,16 @@ def run_closed_set_identification(x, y, model_class, epochs=150, batch_size=256,
             split_seed=split_seed,
         )
 
+        reportable_results = (
+            _apply_identification_metric_reportability(
+                results,
+                evaluation_artifact_runs,
+            )
+        )
+
         per_run_results = (
             _build_per_run_results(
-                results=results,
+                results=reportable_results,
                 seeds=hyperparams[
                     "run_seeds"
                 ],
@@ -4715,18 +4804,28 @@ def run_closed_set_identification(x, y, model_class, epochs=150, batch_size=256,
         )
                 
         # Aggregate metrics across all runs
-        r1_vals = [r[0] for r in results]
-        r5_vals = [r[1] for r in results]
-        r1_mean, r1_std = np.mean(r1_vals), np.std(r1_vals)
-        r5_mean, r5_std = np.mean(r5_vals), np.std(r5_vals)
+        metric_aggregates = (
+            _aggregate_multi_run_metrics(
+                reportable_results
+            )
+        )
         
         print(f"\n[MULTI-RUN RESULTS | {n_runs} Runs]")
-        print(f"Rank-1 Acc: {r1_mean:.4f} ± {r1_std:.4f} | Rank-5 Acc: {r5_mean:.4f} ± {r5_std:.4f}")
+        print(
+            "Rank-1 Acc: "
+            f"{_format_multi_run_metric(metric_aggregates[0]) or 'N/A'} | "
+            "Rank-5 Acc: "
+            f"{_format_multi_run_metric(metric_aggregates[1]) or 'N/A'}"
+        )
         
         if save_results_and_settings:
             metrics_dict = {
-                "Rank-1 Accuracy": f"{r1_mean:.4f} ± {r1_std:.4f}", 
-                "Rank-5 Accuracy": f"{r5_mean:.4f} ± {r5_std:.4f}"
+                "Rank-1 Accuracy": _format_multi_run_metric(
+                    metric_aggregates[0]
+                ),
+                "Rank-5 Accuracy": _format_multi_run_metric(
+                    metric_aggregates[1]
+                ),
             }
             _log_experiment_results(
                 "Closed-Set Identification",
@@ -4739,7 +4838,7 @@ def run_closed_set_identification(x, y, model_class, epochs=150, batch_size=256,
             )
         
         # Return the aggregated statistics
-        return (r1_mean, r1_std), (r5_mean, r5_std)
+        return tuple(metric_aggregates)
 
     augmentation_config = (
         _normalize_augmentation_config(
@@ -5125,7 +5224,13 @@ def run_closed_set_identification(x, y, model_class, epochs=150, batch_size=256,
             task_title,
             {
                 "Rank-1 Accuracy": rank1,
-                "Rank-5 Accuracy": rank5,
+                "Rank-5 Accuracy": (
+                    rank5
+                    if evaluation_artifacts[
+                        "rank_5_reportable"
+                    ]
+                    else None
+                ),
             },
             data_stats,
             hyperparams,
@@ -5134,6 +5239,7 @@ def run_closed_set_identification(x, y, model_class, epochs=150, batch_size=256,
         )
 
     return rank1, rank5
+
 
 # =============================================================================
 # TASK 2: CLOSED-SET VERIFICATION
@@ -5889,9 +5995,16 @@ def run_subject_disjoint_identification(x, y, model_class, epochs=150, batch_siz
             split_seed=split_seed,
         )
 
+        reportable_results = (
+            _apply_identification_metric_reportability(
+                results,
+                evaluation_artifact_runs,
+            )
+        )
+
         per_run_results = (
             _build_per_run_results(
-                results=results,
+                results=reportable_results,
                 seeds=hyperparams[
                     "run_seeds"
                 ],
@@ -5907,11 +6020,21 @@ def run_subject_disjoint_identification(x, y, model_class, epochs=150, batch_siz
             )
         )
                 
-        r1_mean, r1_std = np.mean([r[0] for r in results]), np.std([r[0] for r in results])
-        r5_mean, r5_std = np.mean([r[1] for r in results]), np.std([r[1] for r in results])
+        metric_aggregates = (
+            _aggregate_multi_run_metrics(
+                reportable_results
+            )
+        )
         
         if save_results_and_settings:
-            metrics_dict = {"Rank-1 Accuracy": f"{r1_mean:.4f} ± {r1_std:.4f}", "Rank-5 Accuracy": f"{r5_mean:.4f} ± {r5_std:.4f}"}
+            metrics_dict = {
+                "Rank-1 Accuracy": _format_multi_run_metric(
+                    metric_aggregates[0]
+                ),
+                "Rank-5 Accuracy": _format_multi_run_metric(
+                    metric_aggregates[1]
+                ),
+            }
             _log_experiment_results(
                 "Subject-Disjoint Identification",
                 metrics_dict,
@@ -5921,7 +6044,7 @@ def run_subject_disjoint_identification(x, y, model_class, epochs=150, batch_siz
                 per_run_results=per_run_results,
                 per_run_evaluation_artifacts=per_run_evaluation_artifacts,
             )
-        return (r1_mean, r1_std), (r5_mean, r5_std)
+        return tuple(metric_aggregates)
     # ----------------------------
 
     augmentation_config = (
@@ -6332,7 +6455,13 @@ def run_subject_disjoint_identification(x, y, model_class, epochs=150, batch_siz
             task_title,
             {
                 "Rank-1 Accuracy": rank1,
-                "Rank-5 Accuracy": rank5,
+                "Rank-5 Accuracy": (
+                    rank5
+                    if evaluation_artifacts[
+                        "rank_5_reportable"
+                    ]
+                    else None
+                ),
             },
             data_stats,
             hyperparams,
@@ -6342,6 +6471,7 @@ def run_subject_disjoint_identification(x, y, model_class, epochs=150, batch_siz
 
     # 11. Report Identification Metrics
     return rank1, rank5
+
 
 # =============================================================================
 # TASK 4: SUBJECT-DISJOINT VERIFICATION
@@ -7225,9 +7355,16 @@ def run_cross_session_identification(x_train, y_train, x_test, y_test, model_cla
             split_seed=split_seed,
         )
 
+        reportable_results = (
+            _apply_identification_metric_reportability(
+                results,
+                evaluation_artifact_runs,
+            )
+        )
+
         per_run_results = (
             _build_per_run_results(
-                results=results,
+                results=reportable_results,
                 seeds=hyperparams[
                     "run_seeds"
                 ],
@@ -7243,11 +7380,21 @@ def run_cross_session_identification(x_train, y_train, x_test, y_test, model_cla
             )
         )
                 
-        r1_mean, r1_std = np.mean([r[0] for r in results]), np.std([r[0] for r in results])
-        r5_mean, r5_std = np.mean([r[1] for r in results]), np.std([r[1] for r in results])
+        metric_aggregates = (
+            _aggregate_multi_run_metrics(
+                reportable_results
+            )
+        )
         
         if save_results_and_settings:
-            metrics_dict = {"Rank-1 Accuracy": f"{r1_mean:.4f} ± {r1_std:.4f}", "Rank-5 Accuracy": f"{r5_mean:.4f} ± {r5_std:.4f}"}
+            metrics_dict = {
+                "Rank-1 Accuracy": _format_multi_run_metric(
+                    metric_aggregates[0]
+                ),
+                "Rank-5 Accuracy": _format_multi_run_metric(
+                    metric_aggregates[1]
+                ),
+            }
             _log_experiment_results(
                 "Cross-Session Identification",
                 metrics_dict,
@@ -7257,7 +7404,7 @@ def run_cross_session_identification(x_train, y_train, x_test, y_test, model_cla
                 per_run_results=per_run_results,
                 per_run_evaluation_artifacts=per_run_evaluation_artifacts,
             )
-        return (r1_mean, r1_std), (r5_mean, r5_std)
+        return tuple(metric_aggregates)
     # ----------------------------
 
     augmentation_config = (
@@ -7657,7 +7804,13 @@ def run_cross_session_identification(x_train, y_train, x_test, y_test, model_cla
             task_title,
             {
                 "Rank-1 Accuracy": rank1,
-                "Rank-5 Accuracy": rank5,
+                "Rank-5 Accuracy": (
+                    rank5
+                    if evaluation_artifacts[
+                        "rank_5_reportable"
+                    ]
+                    else None
+                ),
             },
             data_stats,
             hyperparams,
@@ -7667,6 +7820,7 @@ def run_cross_session_identification(x_train, y_train, x_test, y_test, model_cla
 
     # 8. Report Identification Metrics
     return rank1, rank5
+
 
 # =============================================================================
 # TASK 6: CROSS-SESSION VERIFICATION
@@ -8475,9 +8629,16 @@ def run_subject_disjoint_cross_session_identification(
             split_seed=split_seed,
         )
 
+        reportable_results = (
+            _apply_identification_metric_reportability(
+                results,
+                evaluation_artifact_runs,
+            )
+        )
+
         per_run_results = (
             _build_per_run_results(
-                results=results,
+                results=reportable_results,
                 seeds=hyperparams[
                     "run_seeds"
                 ],
@@ -8493,11 +8654,21 @@ def run_subject_disjoint_cross_session_identification(
             )
         )
                 
-        r1_mean, r1_std = np.mean([r[0] for r in results]), np.std([r[0] for r in results])
-        r5_mean, r5_std = np.mean([r[1] for r in results]), np.std([r[1] for r in results])
+        metric_aggregates = (
+            _aggregate_multi_run_metrics(
+                reportable_results
+            )
+        )
         
         if save_results_and_settings:
-            metrics_dict = {"Rank-1 Accuracy": f"{r1_mean:.4f} ± {r1_std:.4f}", "Rank-5 Accuracy": f"{r5_mean:.4f} ± {r5_std:.4f}"}
+            metrics_dict = {
+                "Rank-1 Accuracy": _format_multi_run_metric(
+                    metric_aggregates[0]
+                ),
+                "Rank-5 Accuracy": _format_multi_run_metric(
+                    metric_aggregates[1]
+                ),
+            }
             _log_experiment_results(
                 "Subject-Disjoint Cross-Session ID",
                 metrics_dict,
@@ -8507,7 +8678,7 @@ def run_subject_disjoint_cross_session_identification(
                 per_run_results=per_run_results,
                 per_run_evaluation_artifacts=per_run_evaluation_artifacts,
             )
-        return (r1_mean, r1_std), (r5_mean, r5_std)
+        return tuple(metric_aggregates)
     # ----------------------------
 
     if not use_template:
@@ -8915,7 +9086,13 @@ def run_subject_disjoint_cross_session_identification(
             task_title,
             {
                 "Rank-1 Accuracy": rank1,
-                "Rank-5 Accuracy": rank5,
+                "Rank-5 Accuracy": (
+                    rank5
+                    if evaluation_artifacts[
+                        "rank_5_reportable"
+                    ]
+                    else None
+                ),
             },
             data_stats,
             hyperparams,
@@ -8924,6 +9101,7 @@ def run_subject_disjoint_cross_session_identification(
         )
 
     return rank1, rank5
+
 
 
 # =============================================================================

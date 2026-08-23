@@ -1573,10 +1573,28 @@ def _build_identification_curve_artifacts(
         dtype=float,
     )
 
-    effective_rank_5 = min(
-        5,
-        gallery_size,
-    )
+    if gallery_size < 5:
+        rank_5_accuracy = None
+        effective_rank_5 = None
+        rank_5_defined = False
+        rank_5_reportable = False
+        rank_5_reportability_reason = (
+            "gallery_size_below_5"
+        )
+    else:
+        rank_5_accuracy = float(
+            identification_rates[4]
+        )
+        effective_rank_5 = 5
+        rank_5_defined = True
+        rank_5_reportable = (
+            gallery_size > 5
+        )
+        rank_5_reportability_reason = (
+            None
+            if rank_5_reportable
+            else "terminal_cmc_rank"
+        )
 
     return {
         "type": "identification",
@@ -1590,13 +1608,20 @@ def _build_identification_curve_artifacts(
         "rank_1_accuracy": float(
             identification_rates[0]
         ),
-        "rank_5_accuracy": float(
-            identification_rates[
-                effective_rank_5 - 1
-            ]
+        "rank_5_accuracy": (
+            rank_5_accuracy
         ),
-        "effective_rank_5": int(
+        "effective_rank_5": (
             effective_rank_5
+        ),
+        "rank_5_defined": (
+            rank_5_defined
+        ),
+        "rank_5_reportable": (
+            rank_5_reportable
+        ),
+        "rank_5_reportability_reason": (
+            rank_5_reportability_reason
         ),
         "correct_match_ranks": [
             int(value)
@@ -1722,12 +1747,18 @@ def _compute_metrics_verification(
     )
 
 
+
 def _compute_metrics_identification(
     preds_probs,
     true_labels,
 ):
     """
     Calculate Rank-1 and Rank-5 identification accuracy from the CMC curve.
+
+    Rank-5 is unavailable when the gallery contains fewer than five
+    identities. A five-identity gallery has a mathematically defined terminal
+    Rank-5 value, which remains available in the CMC artifact but is not
+    presented as a headline metric.
 
     The public return signature remains unchanged.
     """
@@ -1741,20 +1772,33 @@ def _compute_metrics_identification(
     rank1 = artifacts[
         "rank_1_accuracy"
     ]
-    rank5 = artifacts[
-        "rank_5_accuracy"
-    ]
+    rank5 = (
+        artifacts[
+            "rank_5_accuracy"
+        ]
+        if artifacts[
+            "rank_5_reportable"
+        ]
+        else None
+    )
+
+    rank5_text = (
+        f"{rank5:.4f}"
+        if rank5 is not None
+        else "N/A"
+    )
 
     print(
         "[RESULT] "
         f"Rank-1 Acc: {rank1:.4f} | "
-        f"Rank-5 Acc: {rank5:.4f}"
+        f"Rank-5 Acc: {rank5_text}"
     )
 
     return (
         rank1,
         rank5,
     )
+
 
 
 

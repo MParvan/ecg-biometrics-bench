@@ -460,6 +460,7 @@ class RunnerSQIIntegrationTests(
             cls.previous_thread_count
         )
 
+
     def assert_finite_runner_result(
         self,
         result,
@@ -468,25 +469,56 @@ class RunnerSQIIntegrationTests(
             result
         )
 
-        if (
-            len(metrics) == 4
-            and metrics[3] is None
-        ):
-            metric_values = np.asarray(
+        if len(metrics) == 2:
+            rank_1 = float(
+                metrics[0]
+            )
+
+            self.assertTrue(
+                np.isfinite(
+                    rank_1
+                )
+            )
+
+            rank_5 = metrics[1]
+
+            if rank_5 is not None:
+                self.assertTrue(
+                    np.isfinite(
+                        float(
+                            rank_5
+                        )
+                    )
+                )
+
+        elif len(metrics) == 4:
+            required_metrics = np.asarray(
                 metrics[:3],
                 dtype=np.float64,
             )
-        else:
-            metric_values = np.asarray(
-                metrics,
-                dtype=np.float64,
+
+            self.assertTrue(
+                np.isfinite(
+                    required_metrics
+                ).all()
             )
 
-        self.assertTrue(
-            np.isfinite(
-                metric_values
-            ).all()
-        )
+            optional_metric = metrics[3]
+
+            if optional_metric is not None:
+                self.assertTrue(
+                    np.isfinite(
+                        float(
+                            optional_metric
+                        )
+                    )
+                )
+
+        else:
+            self.fail(
+                "Unexpected runner metric "
+                f"count: {len(metrics)}"
+            )
 
         self.assertIsInstance(
             data_statistics,
@@ -497,6 +529,7 @@ class RunnerSQIIntegrationTests(
             hyperparameters,
             dict,
         )
+
 
     def execute_and_check_filter_roles(
         self,

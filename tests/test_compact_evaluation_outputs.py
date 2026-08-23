@@ -252,8 +252,13 @@ class CompactIdentificationOutputTests(
                 "rank_1_accuracy": (
                     1.0 / 3.0
                 ),
-                "rank_5_accuracy": 1.0,
-                "effective_rank_5": 3,
+                "rank_5_accuracy": None,
+                "effective_rank_5": None,
+                "rank_5_defined": False,
+                "rank_5_reportable": False,
+                "rank_5_reportability_reason": (
+                    "gallery_size_below_5"
+                ),
                 "correct_match_ranks": [
                     1,
                     2,

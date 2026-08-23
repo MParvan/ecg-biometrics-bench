@@ -252,6 +252,7 @@ class AllTaskSmokeTests(unittest.TestCase):
             0.0,
         )
 
+
     def assert_identification_result(
         self,
         runner_result,
@@ -265,16 +266,15 @@ class AllTaskSmokeTests(unittest.TestCase):
             2,
         )
 
-        rank_1 = float(metrics[0])
-        rank_5 = float(metrics[1])
-
-        self.assertTrue(
-            np.isfinite(rank_1)
-        )
-        self.assertTrue(
-            np.isfinite(rank_5)
+        rank_1 = float(
+            metrics[0]
         )
 
+        self.assertTrue(
+            np.isfinite(
+                rank_1
+            )
+        )
         self.assertGreaterEqual(
             rank_1,
             0.0,
@@ -283,24 +283,37 @@ class AllTaskSmokeTests(unittest.TestCase):
             rank_1,
             1.0,
         )
-        self.assertGreaterEqual(
-            rank_5,
-            0.0,
-        )
-        self.assertLessEqual(
-            rank_5,
-            1.0,
-        )
 
-        self.assertGreaterEqual(
-            rank_5,
-            rank_1,
-        )
+        rank_5 = metrics[1]
+
+        if rank_5 is not None:
+            rank_5 = float(
+                rank_5
+            )
+
+            self.assertTrue(
+                np.isfinite(
+                    rank_5
+                )
+            )
+            self.assertGreaterEqual(
+                rank_5,
+                0.0,
+            )
+            self.assertLessEqual(
+                rank_5,
+                1.0,
+            )
+            self.assertGreaterEqual(
+                rank_5,
+                rank_1,
+            )
 
         self.assert_common_runner_metadata(
             data_statistics,
             hyperparameters,
         )
+
 
     def assert_verification_result(
         self,

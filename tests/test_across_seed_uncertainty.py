@@ -343,25 +343,26 @@ class AggregateMetricParsingTests(unittest.TestCase):
         self.assertEqual(parsed["mean"], 0.95)
         self.assertEqual(parsed["std"], 0.01)
 
+
     def test_runners_emit_a_recognised_separator(self):
-        # Guards against an encoding round-trip silently replacing the
-        # separator in either the runners or the parser.
-        import io
-        from pathlib import Path
+        formatted = (
+            run._format_multi_run_metric(
+                (
+                    0.75,
+                    0.05,
+                )
+            )
+        )
 
-        source = io.open(
-            Path(run.__file__),
-            encoding="utf-8",
-        ).read()
-
-        self.assertIn(
-            "{r1_mean:.4f} \u00b1 {r1_std:.4f}",
-            source,
+        self.assertEqual(
+            formatted,
+            "0.7500 \u00b1 0.0500",
         )
         self.assertIn(
             "\u00b1",
             run._AGGREGATE_METRIC_SEPARATORS,
         )
+
 
     def test_plain_numbers_pass_through(self):
         self.assertEqual(

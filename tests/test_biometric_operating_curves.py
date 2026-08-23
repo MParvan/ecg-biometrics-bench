@@ -357,17 +357,31 @@ class IdentificationCurveArtifactTests(
             ],
             1.0 / 3.0,
         )
-        self.assertEqual(
+        self.assertIsNone(
             artifacts[
                 "rank_5_accuracy"
-            ],
-            1.0,
+            ]
+        )
+        self.assertIsNone(
+            artifacts[
+                "effective_rank_5"
+            ]
+        )
+        self.assertFalse(
+            artifacts[
+                "rank_5_defined"
+            ]
+        )
+        self.assertFalse(
+            artifacts[
+                "rank_5_reportable"
+            ]
         )
         self.assertEqual(
             artifacts[
-                "effective_rank_5"
+                "rank_5_reportability_reason"
             ],
-            3,
+            "gallery_size_below_5",
         )
 
     def test_existing_metrics_are_derived_from_cmc(self):

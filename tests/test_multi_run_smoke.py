@@ -202,6 +202,7 @@ class MultiRunSmokeTests(unittest.TestCase):
             cls.previous_thread_count
         )
 
+
     def assert_identification_aggregate(
         self,
         result,
@@ -211,64 +212,93 @@ class MultiRunSmokeTests(unittest.TestCase):
             2,
         )
 
-        for metric_index, metric_summary in enumerate(
-            result
-        ):
-            self.assertEqual(
-                len(metric_summary),
-                2,
-            )
+        rank_1_summary = result[0]
 
-            mean_value = float(
-                metric_summary[0]
-            )
-
-            standard_deviation = float(
-                metric_summary[1]
-            )
-
-            self.assertTrue(
-                np.isfinite(mean_value)
-            )
-
-            self.assertTrue(
-                np.isfinite(
-                    standard_deviation
-                )
-            )
-
-            self.assertGreaterEqual(
-                mean_value,
-                0.0,
-            )
-
-            self.assertLessEqual(
-                mean_value,
-                1.0,
-            )
-
-            self.assertGreaterEqual(
-                standard_deviation,
-                0.0,
-            )
-
-            self.assertLessEqual(
-                standard_deviation,
-                1.0,
-            )
+        self.assertEqual(
+            len(rank_1_summary),
+            2,
+        )
 
         rank_1_mean = float(
-            result[0][0]
+            rank_1_summary[0]
         )
+        rank_1_std = float(
+            rank_1_summary[1]
+        )
+
+        self.assertTrue(
+            np.isfinite(
+                rank_1_mean
+            )
+        )
+        self.assertTrue(
+            np.isfinite(
+                rank_1_std
+            )
+        )
+        self.assertGreaterEqual(
+            rank_1_mean,
+            0.0,
+        )
+        self.assertLessEqual(
+            rank_1_mean,
+            1.0,
+        )
+        self.assertGreaterEqual(
+            rank_1_std,
+            0.0,
+        )
+
+        rank_5_summary = result[1]
+
+        self.assertEqual(
+            len(rank_5_summary),
+            2,
+        )
+
+        if (
+            rank_5_summary[0] is None
+            or rank_5_summary[1] is None
+        ):
+            self.assertEqual(
+                rank_5_summary,
+                (
+                    None,
+                    None,
+                ),
+            )
+            return
 
         rank_5_mean = float(
-            result[1][0]
+            rank_5_summary[0]
+        )
+        rank_5_std = float(
+            rank_5_summary[1]
         )
 
+        self.assertTrue(
+            np.isfinite(
+                rank_5_mean
+            )
+        )
+        self.assertTrue(
+            np.isfinite(
+                rank_5_std
+            )
+        )
         self.assertGreaterEqual(
             rank_5_mean,
             rank_1_mean,
         )
+        self.assertLessEqual(
+            rank_5_mean,
+            1.0,
+        )
+        self.assertGreaterEqual(
+            rank_5_std,
+            0.0,
+        )
+
 
 
     def assert_verification_aggregate(
