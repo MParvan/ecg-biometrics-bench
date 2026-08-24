@@ -342,6 +342,16 @@ def parse_experiment_arguments(argv=None):
         **effective_values
     )
 
+    # Record which argument names were explicitly configured (in YAML or on
+    # the command line). Some validation rules depend on whether a value was
+    # supplied at all, which the merged namespace alone cannot reveal once
+    # parser defaults are applied.
+    args.explicitly_configured_arguments = frozenset(
+        yaml_defaults
+    ) | frozenset(
+        explicit_cli_values
+    )
+
     return (
         validate_experiment_arguments(
             args,
@@ -481,6 +491,8 @@ OPTIONAL_CHOICE_ARGUMENTS = frozenset(
     {
         "signal_type",
         "electrode_unit",
+        "template_selection_method",
+        "template_score_aggregation",
     }
 )
 
@@ -1360,6 +1372,72 @@ def validate_experiment_arguments(args, parser):
             "positive integer; the paper configurations use 1."
         )
 
+    # ---------------------------------------------------------
+    # 13. Enrollment template mode consistency
+    # ---------------------------------------------------------
+    explicitly_configured = getattr(
+        args,
+        "explicitly_configured_arguments",
+        frozenset(),
+    )
+
+    if args.enrollment_template_mode == "fusion":
+        conflicting_arguments = [
+            argument_name
+            for argument_name in (
+                "num_templates_per_identity",
+                "template_selection_method",
+                "template_score_aggregation",
+            )
+            if getattr(args, argument_name) is not None
+        ]
+
+        if conflicting_arguments:
+            parser.error(
+                "enrollment_template_mode='fusion' does not use "
+                + ", ".join(conflicting_arguments)
+                + ". Remove them or set "
+                "enrollment_template_mode='multi_template'."
+            )
+    else:
+        if "template_fusion_method" in explicitly_configured:
+            parser.error(
+                "enrollment_template_mode='multi_template' selects "
+                "enrollment templates directly and does not use "
+                "'template_fusion_method'. Remove it from the "
+                "configuration."
+            )
+
+        if not args.use_template:
+            parser.error(
+                "enrollment_template_mode='multi_template' requires "
+                "'use_template: true' in YAML or '--use_template' on "
+                "the CLI."
+            )
+
+        if args.num_templates_per_identity is None:
+            parser.error(
+                "enrollment_template_mode='multi_template' requires "
+                "'num_templates_per_identity'."
+            )
+
+        require_integer(
+            "num_templates_per_identity",
+            minimum=1,
+        )
+
+        if args.use_deployment_evaluation:
+            parser.error(
+                "enrollment_template_mode='multi_template' is not "
+                "compatible with use_deployment_evaluation. Identity-level "
+                "aggregation over multiple stored templates changes the "
+                "score distribution a deployment threshold is calibrated "
+                "on."
+            )
+
+    # ---------------------------------------------------------
+    # 14. Deployment evaluation prerequisites
+    # ---------------------------------------------------------
     if (
         args.use_deployment_evaluation
         and args.val_split <= 0.0
@@ -1384,6 +1462,7 @@ def build_effective_configuration(args):
     excluded_aliases = {
         "num_pairs",
         "sampling_mode",
+        "explicitly_configured_arguments",
     }
 
     return copy.deepcopy(
@@ -2324,6 +2403,51 @@ def get_parser():
     )
     eval_group.add_argument('--template_size', type=int, default=None,
                             help="Max number of beats to use for enrollment (None = use all).")
+    eval_group.add_argument(
+        '--enrollment_template_mode',
+        type=str,
+        default='fusion',
+        choices=['fusion', 'multi_template'],
+        help=(
+            "Enrollment strategy. 'fusion' (default) aggregates enrollment "
+            "embeddings into templates with --template_fusion_method. "
+            "'multi_template' instead stores a fixed number of "
+            "representative enrollment embeddings per identity and "
+            "aggregates match scores at the identity level."
+        ),
+    )
+    eval_group.add_argument(
+        '--num_templates_per_identity',
+        type=int,
+        default=None,
+        help=(
+            "Number of stored templates per enrolled identity. Required "
+            "when enrollment_template_mode='multi_template'; every enrolled "
+            "identity must have at least this many enrollment observations."
+        ),
+    )
+    eval_group.add_argument(
+        '--template_selection_method',
+        type=str,
+        default=None,
+        choices=['farthest_first_cosine'],
+        help=(
+            "Deterministic template selection rule for "
+            "enrollment_template_mode='multi_template'. Defaults to "
+            "'farthest_first_cosine'."
+        ),
+    )
+    eval_group.add_argument(
+        '--template_score_aggregation',
+        type=str,
+        default=None,
+        choices=['max'],
+        help=(
+            "Rule combining per-template match scores into one identity "
+            "score for enrollment_template_mode='multi_template'. Defaults "
+            "to 'max'."
+        ),
+    )
     eval_group.add_argument('--matching_method', type=str, default='cosine',
                             choices=['cosine', 'euclidean', 'manhattan', 'correlation'],
                             help="Distance metric for verification/identification.")
@@ -2917,6 +3041,17 @@ def main():
             'parameters': args.augmentation_parameters,
         },
     }
+
+    common_args['enrollment_template_mode'] = args.enrollment_template_mode
+
+    if args.enrollment_template_mode == 'multi_template':
+        # Multi-template enrollment replaces template fusion entirely: the
+        # runners reject an explicit fusion method in this mode, so the
+        # argument is withheld rather than forwarded at its parser default.
+        common_args.pop('template_fusion_method')
+        common_args['num_templates_per_identity'] = args.num_templates_per_identity
+        common_args['template_selection_method'] = args.template_selection_method
+        common_args['template_score_aggregation'] = args.template_score_aggregation
 
     # ==========================================
     # 5. EXECUTE THE SELECTED TASK

@@ -17,6 +17,19 @@ RUNNERS_USING_ENROLLMENT_SPLIT = [
     "run_subject_disjoint_verification",
 ]
 
+# Expected source-level call counts for _split_enrollment_probe_embeddings.
+# run_subject_disjoint_identification always requires use_template=True, so
+# the split is computed once, shared by both the multi-template and the
+# single-template (fusion) branches. run_subject_disjoint_verification also
+# accepts use_template=False (a template-free probe-only strategy that never
+# splits), so its multi-template branch and its single-template branch are
+# mutually exclusive and each calls the shared helper independently rather
+# than threading enrollment data through the template-free branch.
+EXPECTED_SPLIT_CALL_COUNTS = {
+    "run_subject_disjoint_identification": 1,
+    "run_subject_disjoint_verification": 2,
+}
+
 
 def make_ordered_embeddings():
     """
@@ -494,11 +507,12 @@ class EnrollmentProbePartitionTests(
 
                 self.assertEqual(
                     len(helper_calls),
-                    1,
+                    EXPECTED_SPLIT_CALL_COUNTS[runner_name],
                     (
                         f"{runner_name} must call "
                         "_split_enrollment_probe_embeddings "
-                        "exactly once."
+                        f"exactly {EXPECTED_SPLIT_CALL_COUNTS[runner_name]} "
+                        "time(s)."
                     ),
                 )
 

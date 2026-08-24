@@ -1,4 +1,5 @@
 import sys
+import tempfile
 import unittest
 from contextlib import redirect_stderr
 from io import StringIO
@@ -234,6 +235,180 @@ class ArgumentValidationTests(unittest.TestCase):
 
         self.assertTrue(validated.use_template)
         self.assertEqual(validated.template_size, 5)
+
+
+class EnrollmentTemplateModeValidation(unittest.TestCase):
+    """
+    Argument validation for ``--enrollment_template_mode`` and its three
+    companion parameters, exercised directly against
+    ``validate_experiment_arguments`` and, where presence tracking matters,
+    through the full ``parse_experiment_arguments`` pipeline.
+    """
+
+    def assert_validation_error(self, parser, arguments, expected_message):
+        captured_stderr = StringIO()
+
+        with redirect_stderr(captured_stderr):
+            with self.assertRaises(SystemExit) as context:
+                main.validate_experiment_arguments(arguments, parser)
+
+        self.assertEqual(context.exception.code, 2)
+        self.assertIn(expected_message, captured_stderr.getvalue())
+
+    def test_default_mode_is_fusion(self):
+        _, arguments = parse_basic_arguments()
+        self.assertEqual(arguments.enrollment_template_mode, "fusion")
+        self.assertIsNone(arguments.num_templates_per_identity)
+
+    def test_fusion_mode_rejects_explicit_num_templates_per_identity(self):
+        parser, arguments = parse_basic_arguments()
+        arguments.num_templates_per_identity = 3
+
+        self.assert_validation_error(
+            parser,
+            arguments,
+            "enrollment_template_mode='fusion' does not use "
+            "num_templates_per_identity",
+        )
+
+    def test_fusion_mode_rejects_explicit_selection_method(self):
+        parser, arguments = parse_basic_arguments()
+        arguments.template_selection_method = "farthest_first_cosine"
+
+        self.assert_validation_error(
+            parser,
+            arguments,
+            "enrollment_template_mode='fusion' does not use",
+        )
+
+    def test_multi_template_requires_use_template(self):
+        parser, arguments = parse_basic_arguments()
+        arguments.enrollment_template_mode = "multi_template"
+        arguments.num_templates_per_identity = 3
+        arguments.use_template = False
+
+        self.assert_validation_error(
+            parser,
+            arguments,
+            "enrollment_template_mode='multi_template' requires "
+            "'use_template: true'",
+        )
+
+    def test_multi_template_requires_num_templates_per_identity(self):
+        parser, arguments = parse_basic_arguments()
+        arguments.enrollment_template_mode = "multi_template"
+        arguments.use_template = True
+
+        self.assert_validation_error(
+            parser,
+            arguments,
+            "enrollment_template_mode='multi_template' requires "
+            "'num_templates_per_identity'",
+        )
+
+    def test_multi_template_rejects_non_positive_k(self):
+        parser, arguments = parse_basic_arguments()
+        arguments.enrollment_template_mode = "multi_template"
+        arguments.use_template = True
+        arguments.num_templates_per_identity = 0
+
+        self.assert_validation_error(
+            parser,
+            arguments,
+            "'num_templates_per_identity' must be greater than or equal "
+            "to 1",
+        )
+
+    def test_multi_template_rejects_deployment_evaluation(self):
+        parser, arguments = parse_basic_arguments(task="2")
+        arguments.enrollment_template_mode = "multi_template"
+        arguments.use_template = True
+        arguments.num_templates_per_identity = 3
+        arguments.use_deployment_evaluation = True
+        arguments.val_split = 0.2
+
+        self.assert_validation_error(
+            parser,
+            arguments,
+            "enrollment_template_mode='multi_template' is not compatible "
+            "with use_deployment_evaluation",
+        )
+
+    def test_valid_multi_template_configuration_passes(self):
+        parser, arguments = parse_basic_arguments()
+        arguments.enrollment_template_mode = "multi_template"
+        arguments.use_template = True
+        arguments.num_templates_per_identity = 3
+
+        validated = main.validate_experiment_arguments(arguments, parser)
+
+        self.assertEqual(validated.num_templates_per_identity, 3)
+
+    def test_explicit_template_fusion_method_with_multi_template_is_rejected(
+        self,
+    ):
+        # Presence tracking distinguishes an explicitly configured
+        # template_fusion_method from the untouched parser default, which
+        # validate_experiment_arguments alone cannot see. This exercises the
+        # full parse_experiment_arguments pipeline via a YAML file.
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "config.yaml"
+            config_path.write_text(
+                "dataset: ecgid\n"
+                "task: 1\n"
+                "template_fusion_method: mean\n",
+                encoding="utf-8",
+            )
+
+            captured_stderr = StringIO()
+            with redirect_stderr(captured_stderr):
+                with self.assertRaises(SystemExit) as context:
+                    main.parse_experiment_arguments(
+                        [
+                            "--config",
+                            str(config_path),
+                            "--use_template",
+                            "--enrollment_template_mode",
+                            "multi_template",
+                            "--num_templates_per_identity",
+                            "3",
+                        ]
+                    )
+
+            self.assertEqual(context.exception.code, 2)
+            self.assertIn(
+                "does not use 'template_fusion_method'",
+                captured_stderr.getvalue(),
+            )
+
+    def test_fusion_mode_yaml_default_is_untouched_by_presence_tracking(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "config.yaml"
+            config_path.write_text(
+                "dataset: ecgid\ntask: 1\n",
+                encoding="utf-8",
+            )
+
+            args, _ = main.parse_experiment_arguments(
+                ["--config", str(config_path)]
+            )
+
+            self.assertEqual(args.enrollment_template_mode, "fusion")
+            self.assertEqual(args.template_fusion_method, "mean")
+
+    def test_effective_configuration_omits_presence_tracking_attribute(self):
+        _, arguments = parse_basic_arguments()
+        arguments.explicitly_configured_arguments = frozenset(
+            {"dataset", "task"}
+        )
+
+        effective = main.build_effective_configuration(arguments)
+
+        self.assertNotIn(
+            "explicitly_configured_arguments", effective
+        )
 
 
 if __name__ == "__main__":

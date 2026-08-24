@@ -227,6 +227,312 @@ def _create_templates(embeddings, labels, method='mean', max_beats=None, provena
         
     return np.stack(templates), np.array(new_labels)
 
+
+_MULTI_TEMPLATE_SELECTION_METHODS = ("farthest_first_cosine",)
+_MULTI_TEMPLATE_SCORE_AGGREGATIONS = ("max",)
+_MULTI_TEMPLATE_NORM_EPS = 1e-12
+
+
+def _select_multi_templates(
+    embeddings,
+    labels,
+    provenance,
+    num_templates_per_identity,
+    template_selection_method="farthest_first_cosine",
+    max_beats=None,
+):
+    """
+    Select a fixed number of representative enrollment templates per identity.
+
+    Every enrolled identity contributes exactly ``num_templates_per_identity``
+    actual enrollment observations (never synthetic centroids). Candidates are
+    first ordered canonically -- truthful source order when per-beat
+    provenance is supplied, input order otherwise -- and ``max_beats`` then
+    keeps the first that many of them; a ``None`` budget uses every available
+    observation. This canonical order also decides deterministic tie-breaking
+    during selection below, whether or not ``max_beats`` actually truncates
+    the pool.
+
+    The only implemented selection method is ``farthest_first_cosine``: a
+    deterministic farthest-first traversal under cosine geometry. The first
+    representative is the candidate closest to the aggregate (unit-normalized)
+    direction of its pool; each subsequent representative is the unselected
+    candidate with the smallest maximum cosine similarity to the
+    representatives chosen so far. Ties break toward the earliest candidate in
+    source order. No random seed is used.
+
+    Parameters
+    ----------
+    embeddings : np.ndarray
+        Enrollment embedding matrix, shape ``(n_samples, feature_dim)``.
+    labels : np.ndarray
+        Enrollment identity labels aligned with ``embeddings``.
+    provenance : BeatProvenance or None
+        Optional per-beat source provenance, index-aligned with ``embeddings``.
+    num_templates_per_identity : int
+        The number of templates ``K`` selected for every enrolled identity.
+    template_selection_method : str
+        Only ``"farthest_first_cosine"`` is implemented.
+    max_beats : int or None
+        Enrollment-depth budget applied to the candidate pool before
+        selection, using the same source-order semantics as
+        :func:`_create_templates`.
+
+    Returns
+    -------
+    template_embeddings : np.ndarray
+        Shape ``(n_identities * K, feature_dim)``.
+    template_identities : np.ndarray
+        Shape ``(n_identities * K,)``, the identity of every template row.
+    template_source_indices : np.ndarray
+        Shape ``(n_identities * K,)``: global row indices into ``embeddings``
+        for every selected template, in output order.
+    diagnostics : dict
+        Compact, reproducible selection statistics.
+    """
+    if template_selection_method not in _MULTI_TEMPLATE_SELECTION_METHODS:
+        raise ValueError(
+            "Unknown template_selection_method: "
+            f"{template_selection_method!r}. Expected one of "
+            f"{_MULTI_TEMPLATE_SELECTION_METHODS}."
+        )
+
+    if (
+        isinstance(num_templates_per_identity, (bool, np.bool_))
+        or not isinstance(num_templates_per_identity, (int, np.integer))
+        or int(num_templates_per_identity) < 1
+    ):
+        raise ValueError(
+            "num_templates_per_identity must be a positive integer, "
+            f"received {num_templates_per_identity!r}."
+        )
+
+    num_templates_per_identity = int(num_templates_per_identity)
+
+    embeddings = np.asarray(embeddings)
+    labels = np.asarray(labels)
+
+    if embeddings.ndim != 2:
+        raise ValueError("Enrollment embeddings must be two-dimensional.")
+
+    if len(embeddings) != len(labels):
+        raise ValueError(
+            "Enrollment embeddings and labels must have equal length."
+        )
+
+    if provenance is not None:
+        provenance.validate(len(labels))
+
+    if max_beats is not None:
+        try:
+            max_beats = int(max_beats)
+        except (TypeError, ValueError):
+            max_beats = None
+
+    K = num_templates_per_identity
+    unique_identities = np.unique(labels)
+
+    # Pass 1: candidate pools, reproducing _create_templates' enrollment-depth
+    # policy exactly, and the strict-K sufficiency check.
+    candidate_pools = {}
+    insufficient = {}
+
+    for identity in unique_identities:
+        idxs = np.where(labels == identity)[0]
+
+        # Canonical candidate order: truthful source order when provenance is
+        # available, otherwise input order. This governs which candidates
+        # survive an ``max_beats`` truncation AND the deterministic
+        # tie-breaking used by farthest-first selection below, regardless of
+        # whether truncation actually happens.
+        if provenance is not None:
+            order = _source_order_indices(provenance.subset(idxs))
+            idxs = idxs[order]
+
+        if max_beats is not None:
+            idxs = idxs[:max_beats]
+
+        candidate_pools[identity] = idxs
+
+        if len(idxs) < K:
+            insufficient[identity] = int(len(idxs))
+
+    if insufficient:
+        details = ", ".join(
+            f"{identity!r}: {count}"
+            for identity, count in insufficient.items()
+        )
+        raise ValueError(
+            "Multi-template enrollment requires "
+            f"num_templates_per_identity={K} candidate enrollment "
+            "observations for every enrolled identity. Identities with "
+            f"fewer available candidates: {details}."
+        )
+
+    # Pass 2: finite, non-zero-norm candidate validation (before any scoring).
+    invalid = []
+
+    for identity in unique_identities:
+        idxs = candidate_pools[identity]
+        subj_embs = embeddings[idxs]
+
+        finite_rows = np.all(np.isfinite(subj_embs), axis=1)
+        for local in np.flatnonzero(~finite_rows):
+            invalid.append((identity, int(local), int(idxs[local]), "non-finite"))
+
+        norms = np.linalg.norm(subj_embs, axis=1)
+        for local in np.flatnonzero(norms <= _MULTI_TEMPLATE_NORM_EPS):
+            invalid.append((identity, int(local), int(idxs[local]), "near-zero norm"))
+
+    if invalid:
+        details = "; ".join(
+            f"identity {identity!r}, candidate position {local} "
+            f"(source index {source_index}): {reason}"
+            for identity, local, source_index, reason in invalid
+        )
+        raise ValueError(
+            "farthest_first_cosine requires finite, non-zero-norm candidate "
+            f"embeddings. Problem(s) found: {details}."
+        )
+
+    # Pass 3: deterministic farthest-first selection under cosine geometry.
+    feature_dim = embeddings.shape[1]
+    template_embeddings = []
+    template_identities = []
+    template_source_indices = []
+    candidate_counts = []
+
+    for identity in unique_identities:
+        idxs = candidate_pools[identity]
+        candidate_counts.append(len(idxs))
+
+        subj_embs = embeddings[idxs]
+        norms = np.linalg.norm(subj_embs, axis=1, keepdims=True)
+        u = subj_embs / norms
+
+        # Step 1: the candidate closest to the aggregate unit direction.
+        aggregate_direction = u.sum(axis=0)
+        centrality = u @ aggregate_direction
+        first_local = int(np.argmax(centrality))
+
+        selected_local = [first_local]
+        max_similarity_to_selected = u @ u[first_local]
+        max_similarity_to_selected[first_local] = np.inf
+
+        # Steps 2..K: farthest-first traversal.
+        for _ in range(2, K + 1):
+            next_local = int(np.argmin(max_similarity_to_selected))
+            selected_local.append(next_local)
+            similarity_to_next = u @ u[next_local]
+            max_similarity_to_selected = np.maximum(
+                max_similarity_to_selected, similarity_to_next
+            )
+            max_similarity_to_selected[next_local] = np.inf
+
+        global_selected = idxs[np.asarray(selected_local, dtype=np.int64)]
+
+        template_embeddings.append(embeddings[global_selected])
+        template_identities.append(np.full(K, identity, dtype=labels.dtype))
+        template_source_indices.append(global_selected)
+
+    template_embeddings = np.concatenate(template_embeddings, axis=0).reshape(
+        -1, feature_dim
+    )
+    template_identities = np.concatenate(template_identities)
+    template_source_indices = np.concatenate(template_source_indices).astype(
+        np.int64
+    )
+
+    fingerprint_source = "|".join(
+        f"{identity}:{index}"
+        for identity, index in zip(
+            template_identities.tolist(), template_source_indices.tolist()
+        )
+    )
+    fingerprint = hashlib.sha256(
+        fingerprint_source.encode("utf-8")
+    ).hexdigest()
+
+    candidate_counts = np.asarray(candidate_counts, dtype=np.int64)
+
+    diagnostics = {
+        "enrollment_template_mode": "multi_template",
+        "template_selection_method": template_selection_method,
+        "num_templates_per_identity": K,
+        "enrolled_identities": int(len(unique_identities)),
+        "templates_selected_total": int(len(template_identities)),
+        "candidate_count_min": int(candidate_counts.min()),
+        "candidate_count_median": float(np.median(candidate_counts)),
+        "candidate_count_max": int(candidate_counts.max()),
+        "candidate_count_total": int(candidate_counts.sum()),
+        "deterministic": True,
+        "selected_index_fingerprint": fingerprint,
+    }
+
+    return (
+        template_embeddings,
+        template_identities,
+        template_source_indices,
+        diagnostics,
+    )
+
+
+def _reduce_template_scores_to_identities(
+    scores,
+    template_identities,
+    identity_order,
+    template_score_aggregation="max",
+):
+    """
+    Reduce per-template-row scores to one score per enrolled identity.
+
+    For each identity in ``identity_order`` the returned column is the
+    maximum over that identity's template-row columns in ``scores``.
+    ``"max"`` is currently the only implemented aggregation.
+
+    Every identity in ``identity_order`` is a required output column: a
+    caller is expected to pass the complete canonical identity space for the
+    evaluation, so an identity present in ``identity_order`` but absent from
+    ``template_identities`` indicates a structural enrollment gap (a required
+    identity has no stored template) rather than a value to leave unscored.
+    This is treated as an error rather than silently retaining a negative-
+    infinity column.
+    """
+    if template_score_aggregation not in _MULTI_TEMPLATE_SCORE_AGGREGATIONS:
+        raise ValueError(
+            "Unknown template_score_aggregation: "
+            f"{template_score_aggregation!r}. Expected one of "
+            f"{_MULTI_TEMPLATE_SCORE_AGGREGATIONS}."
+        )
+
+    scores = np.asarray(scores)
+    template_identities = np.asarray(template_identities)
+    identity_order = np.asarray(identity_order)
+
+    present_identities = set(template_identities.tolist())
+    missing_identities = [
+        identity
+        for identity in identity_order.tolist()
+        if identity not in present_identities
+    ]
+    if missing_identities:
+        raise ValueError(
+            "Multi-template score reduction requires a stored template for "
+            "every identity in the evaluation's canonical identity space. "
+            f"Missing identities: {missing_identities!r}."
+        )
+
+    reduced = np.empty((scores.shape[0], len(identity_order)), dtype=float)
+
+    for column_index, identity in enumerate(identity_order):
+        identity_mask = template_identities == identity
+        reduced[:, column_index] = np.max(
+            scores[:, identity_mask], axis=1
+        )
+
+    return reduced
+
+
 # =============================================================================
 # 2. MATCHING & SCORE HELPERS (NEW SECTION)
 # =============================================================================
@@ -931,6 +1237,469 @@ def _generate_fused_verification_pairs(
         }
     )
     return fused_scores, labels_pair, diagnostics
+
+
+def _generate_multi_template_verification_pairs(
+    probe_embeddings,
+    probe_labels,
+    probe_provenance,
+    template_embeddings,
+    template_identities,
+    num_templates_per_identity,
+    probe_fusion_size,
+    matching_method,
+    *,
+    pair_sampling_mode="all_genuine",
+    pair_sampling_budget=None,
+    max_impostor_pairs=1000000,
+    pair_sampling_seed=None,
+    template_score_aggregation="max",
+    decision_batch_size=8192,
+):
+    """
+    Score verification comparisons at the identity-decision level, against a
+    multi-template enrolled gallery.
+
+    The atomic decision is ``(probe group, enrolled identity)``, never
+    ``(probe group, template row)``: every enrolled identity holds exactly
+    ``num_templates_per_identity`` template rows (validated below against the
+    configured value, not merely inferred from whatever the template matrix
+    happens to contain), and the decision score is
+
+        S(G, i) = max_j [ mean_b score(p_b, T_ij) ]
+
+    i.e. probe-score fusion happens independently against each fixed template
+    column, and only afterward are the K resulting per-template scores
+    reduced to one identity score by the maximum. ``probe_fusion_size == 1``
+    treats every probe observation as its own group of one and does not
+    require provenance. ``probe_fusion_size > 1`` groups probe observations
+    with :func:`_build_probe_groups`, inheriting its source-boundary
+    guarantees.
+
+    The four pair-sampling modes mirror :func:`_generate_fused_verification_pairs`
+    exactly, applied to probe-group-by-identity decisions instead of
+    probe-group-by-template-row decisions:
+
+      - ``"all"``: every group-by-identity decision, no sampling.
+      - ``"all_genuine"``: every genuine decision (exactly one per probe
+        group) plus impostor decisions sampled uniformly without replacement
+        up to ``max_impostor_pairs``.
+      - ``"balanced"``: budget//2 genuine and budget//2 impostor decisions,
+        drawn with replacement, mirroring the mature two-set balanced
+        semantics.
+      - ``"random"``: ``pair_sampling_budget`` decisions drawn uniformly at
+        random with replacement.
+
+    Only ``template_score_aggregation = "max"`` is implemented.
+
+    Returns
+    -------
+    scores : np.ndarray
+        Identity-decision verification scores, higher-is-more-similar.
+    labels_pair : np.ndarray
+        Binary genuine (1) / impostor (0) labels aligned with ``scores``.
+    diagnostics : dict
+        Grouping and sampling diagnostics for this decision space.
+    """
+    if template_score_aggregation not in _MULTI_TEMPLATE_SCORE_AGGREGATIONS:
+        raise ValueError(
+            "Unknown template_score_aggregation: "
+            f"{template_score_aggregation!r}. Expected one of "
+            f"{_MULTI_TEMPLATE_SCORE_AGGREGATIONS}."
+        )
+
+    if (
+        isinstance(num_templates_per_identity, (bool, np.bool_))
+        or not isinstance(num_templates_per_identity, (int, np.integer))
+        or int(num_templates_per_identity) < 1
+    ):
+        raise ValueError(
+            "num_templates_per_identity must be a positive integer, "
+            f"received {num_templates_per_identity!r}."
+        )
+    num_templates_per_identity = int(num_templates_per_identity)
+
+    valid_modes = {"all", "all_genuine", "balanced", "random"}
+    if pair_sampling_mode not in valid_modes:
+        raise ValueError(
+            "Unknown verification pair sampling mode for multi-template "
+            f"decisions: {pair_sampling_mode!r}."
+        )
+
+    probe_embeddings = np.asarray(probe_embeddings)
+    probe_labels = np.asarray(probe_labels)
+    template_embeddings = np.asarray(template_embeddings)
+    template_identities = np.asarray(template_identities)
+
+    if probe_embeddings.ndim != 2 or template_embeddings.ndim != 2:
+        raise ValueError("Verification embeddings must be two-dimensional.")
+
+    if probe_embeddings.shape[1] != template_embeddings.shape[1]:
+        raise ValueError(
+            "Verification embedding sets must have the same feature dimension."
+        )
+
+    probe_fusion_size = int(probe_fusion_size)
+    max_impostor_pairs = int(max_impostor_pairs)
+
+    if pair_sampling_mode in {"balanced", "random"}:
+        if pair_sampling_budget is None:
+            raise ValueError(
+                f"pair_sampling_mode={pair_sampling_mode!r} requires a "
+                "positive pair_sampling_budget."
+            )
+        if int(pair_sampling_budget) < 1:
+            raise ValueError(
+                "pair_sampling_budget must be a positive integer."
+            )
+        pair_sampling_budget = int(pair_sampling_budget)
+
+    enrolled_identity_ids, template_row_counts = np.unique(
+        template_identities, return_counts=True
+    )
+
+    if len(enrolled_identity_ids) == 0:
+        raise ValueError(
+            "Multi-template verification requires at least one enrolled "
+            "identity."
+        )
+
+    if len(set(template_row_counts.tolist())) != 1:
+        raise ValueError(
+            "Multi-template verification requires exactly the same number "
+            "of template rows for every enrolled identity."
+        )
+
+    templates_per_identity = int(template_row_counts[0])
+
+    if templates_per_identity != num_templates_per_identity:
+        raise ValueError(
+            "Multi-template verification requires every enrolled identity "
+            "to hold exactly the configured num_templates_per_identity="
+            f"{num_templates_per_identity} template rows, but the supplied "
+            f"gallery has {templates_per_identity} row(s) per identity for "
+            f"all {len(enrolled_identity_ids)} enrolled identities."
+        )
+
+    columns_by_identity_index = np.stack(
+        [
+            np.flatnonzero(template_identities == identity)
+            for identity in enrolled_identity_ids
+        ]
+    )
+
+    identity_index_by_value = {
+        identity: index
+        for index, identity in enumerate(enrolled_identity_ids)
+    }
+
+    # ------------------------------------------------------------------
+    # Build probe groups. probe_fusion_size == 1 needs no provenance: every
+    # probe observation is its own group of one.
+    # ------------------------------------------------------------------
+    if probe_fusion_size <= 1:
+        groups = np.arange(len(probe_labels), dtype=np.int64).reshape(-1, 1)
+        group_identities = probe_labels
+        diagnostics = {
+            "fusion_size": 1,
+            "raw_probe_observations": int(len(probe_labels)),
+            "valid_probe_groups": int(len(groups)),
+            "source_blocks_below_fusion_size": 0,
+            "dropped_remainder_observations": 0,
+            "identities_without_a_fused_decision": 0,
+        }
+    else:
+        grouping = _build_probe_groups(
+            probe_labels, probe_provenance, probe_fusion_size
+        )
+        groups = grouping["groups"]
+        group_identities = grouping["identities"]
+        diagnostics = dict(grouping["diagnostics"])
+
+    diagnostics["pair_sampling_mode"] = pair_sampling_mode
+    diagnostics["num_enrolled_identities"] = int(len(enrolled_identity_ids))
+    diagnostics["num_templates_per_identity"] = templates_per_identity
+
+    number_of_groups = int(len(groups))
+    number_of_identities = int(len(enrolled_identity_ids))
+
+    # ------------------------------------------------------------------
+    # Closed-set identity validation: every probe/group identity must have a
+    # genuine enrolled target.
+    # ------------------------------------------------------------------
+    probe_identity_set = set(np.unique(group_identities).tolist())
+    enrolled_identity_set = set(enrolled_identity_ids.tolist())
+    missing_targets = sorted(probe_identity_set - enrolled_identity_set)
+
+    if missing_targets:
+        raise ValueError(
+            "Multi-template verification found probe identities with no "
+            f"enrolled target identity: {missing_targets}."
+        )
+
+    if number_of_groups == 0:
+        diagnostics["genuine_fused_decisions"] = 0
+        diagnostics["impostor_fused_decisions"] = 0
+        return (
+            np.empty(0, dtype=float),
+            np.empty(0, dtype=int),
+            diagnostics,
+        )
+
+    def _score_selected_decisions(row_group_indices, identity_indices):
+        """
+        Score a batch of ``(probe_group, enrolled_identity)`` decisions.
+
+        Every decision expands to exactly ``P`` probe beats times ``K``
+        template columns. The flat elementary index arrays are built so that
+        reshaping the elementary scores to ``(batch, P, K)`` recovers, for
+        every ``(p, k)``, the score between the p-th beat of the decision's
+        group and the k-th template column of the decision's target identity.
+        """
+        row_group_indices = np.asarray(row_group_indices, dtype=np.int64)
+        identity_indices = np.asarray(identity_indices, dtype=np.int64)
+
+        final_scores = np.empty(len(row_group_indices), dtype=float)
+        batch_size = max(1, int(decision_batch_size))
+
+        for start in range(0, len(row_group_indices), batch_size):
+            end = min(start + batch_size, len(row_group_indices))
+
+            batch_group_rows = groups[row_group_indices[start:end]]
+            batch_identity_idx = identity_indices[start:end]
+            batch_target_columns = columns_by_identity_index[batch_identity_idx]
+
+            decisions_in_batch = end - start
+            beats_per_group = batch_group_rows.shape[1]
+            templates_per_decision = batch_target_columns.shape[1]
+
+            left = np.repeat(
+                batch_group_rows, templates_per_decision, axis=1
+            ).reshape(-1)
+            right = np.tile(
+                batch_target_columns, (1, beats_per_group)
+            ).reshape(-1)
+
+            elementary_scores = _score_selected_pair_indices(
+                probe_embeddings,
+                template_embeddings,
+                left,
+                right,
+                matching_method=matching_method,
+            )
+            elementary_scores = elementary_scores.reshape(
+                decisions_in_batch, beats_per_group, templates_per_decision
+            )
+
+            fused_per_template = elementary_scores.mean(axis=1)
+            final_scores[start:end] = fused_per_template.max(axis=1)
+
+        return final_scores
+
+    # ------------------------------------------------------------------
+    # Mode "all": exhaustive group-by-identity decision space.
+    # ------------------------------------------------------------------
+    if pair_sampling_mode == "all":
+        row_grid, identity_grid = np.meshgrid(
+            np.arange(number_of_groups, dtype=np.int64),
+            np.arange(number_of_identities, dtype=np.int64),
+            indexing="ij",
+        )
+        selected_rows = row_grid.reshape(-1)
+        selected_identity_idx = identity_grid.reshape(-1)
+
+        labels_pair = (
+            group_identities[selected_rows]
+            == enrolled_identity_ids[selected_identity_idx]
+        ).astype(int)
+
+        final_scores = _score_selected_decisions(
+            selected_rows, selected_identity_idx
+        )
+
+        diagnostics.update(
+            {
+                "genuine_fused_decisions": int(labels_pair.sum()),
+                "impostor_fused_decisions": int(
+                    labels_pair.size - labels_pair.sum()
+                ),
+            }
+        )
+        return final_scores, labels_pair, diagnostics
+
+    # ------------------------------------------------------------------
+    # Mode "all_genuine": every genuine decision (one per probe group) plus
+    # uniformly sampled impostor identity decisions.
+    # ------------------------------------------------------------------
+    if pair_sampling_mode == "all_genuine":
+        resolved_pair_seed = (
+            42 if pair_sampling_seed is None else int(pair_sampling_seed)
+        )
+
+        genuine_rows = np.arange(number_of_groups, dtype=np.int64)
+        genuine_identity_idx = np.asarray(
+            [
+                identity_index_by_value[identity]
+                for identity in group_identities
+            ],
+            dtype=np.int64,
+        )
+
+        (
+            impostor_rows,
+            impostor_identity_idx,
+            total_impostor_decisions,
+        ) = _sample_impostor_pair_indices(
+            group_identities,
+            enrolled_identity_ids,
+            max_impostor_pairs=max_impostor_pairs,
+            pair_sampling_seed=resolved_pair_seed,
+        )
+
+        selected_rows = np.concatenate(
+            (genuine_rows, impostor_rows)
+        ).astype(np.int64, copy=False)
+        selected_identity_idx = np.concatenate(
+            (genuine_identity_idx, impostor_identity_idx)
+        ).astype(np.int64, copy=False)
+        labels_pair = np.concatenate(
+            (
+                np.ones(len(genuine_rows), dtype=int),
+                np.zeros(len(impostor_rows), dtype=int),
+            )
+        )
+
+        final_scores = _score_selected_decisions(
+            selected_rows, selected_identity_idx
+        )
+
+        diagnostics.update(
+            {
+                "genuine_fused_decisions": int(len(genuine_rows)),
+                "impostor_fused_decisions": int(len(impostor_rows)),
+                "total_impostor_fused_decisions": int(total_impostor_decisions),
+                "max_impostor_pairs": max_impostor_pairs,
+                "pair_sampling_seed": resolved_pair_seed,
+            }
+        )
+        return final_scores, labels_pair, diagnostics
+
+    # ------------------------------------------------------------------
+    # Stochastic modes: mirror the mature _generate_pairs semantics at the
+    # identity-decision level.
+    # ------------------------------------------------------------------
+    rng = _verification_pair_rng(pair_sampling_seed)
+
+    if pair_sampling_mode == "balanced":
+        groups_by_identity = collections.defaultdict(list)
+        for row_index, identity in enumerate(group_identities):
+            groups_by_identity[identity].append(row_index)
+
+        common_identities = [
+            identity
+            for identity in groups_by_identity
+            if identity in identity_index_by_value
+        ]
+
+        if len(common_identities) < 2:
+            diagnostics.update(
+                {
+                    "genuine_fused_decisions": 0,
+                    "impostor_fused_decisions": 0,
+                    "pair_sampling_budget": pair_sampling_budget,
+                    "pair_sampling_seed": pair_sampling_seed,
+                }
+            )
+            return (
+                np.empty(0, dtype=float),
+                np.empty(0, dtype=int),
+                diagnostics,
+            )
+
+        genuine_rows = []
+        genuine_identity_idx = []
+        for _ in range(pair_sampling_budget // 2):
+            identity = rng.choice(common_identities)
+            row = int(rng.choice(groups_by_identity[identity]))
+            genuine_rows.append(row)
+            genuine_identity_idx.append(identity_index_by_value[identity])
+
+        all_group_identities = list(groups_by_identity.keys())
+        all_enrolled_identities = list(identity_index_by_value.keys())
+
+        impostor_rows = []
+        impostor_identity_idx = []
+        for _ in range(pair_sampling_budget // 2):
+            identity_a = rng.choice(all_group_identities)
+            possible_b = [
+                identity
+                for identity in all_enrolled_identities
+                if identity != identity_a
+            ]
+            if not possible_b:
+                continue
+            identity_b = rng.choice(possible_b)
+            row = int(rng.choice(groups_by_identity[identity_a]))
+            impostor_rows.append(row)
+            impostor_identity_idx.append(identity_index_by_value[identity_b])
+
+        selected_rows = np.asarray(
+            genuine_rows + impostor_rows, dtype=np.int64
+        )
+        selected_identity_idx = np.asarray(
+            genuine_identity_idx + impostor_identity_idx, dtype=np.int64
+        )
+        labels_pair = np.asarray(
+            [1] * len(genuine_rows) + [0] * len(impostor_rows), dtype=int
+        )
+
+        final_scores = _score_selected_decisions(
+            selected_rows, selected_identity_idx
+        )
+
+        diagnostics.update(
+            {
+                "genuine_fused_decisions": int(len(genuine_rows)),
+                "impostor_fused_decisions": int(len(impostor_rows)),
+                "pair_sampling_budget": pair_sampling_budget,
+                "pair_sampling_seed": pair_sampling_seed,
+            }
+        )
+        return final_scores, labels_pair, diagnostics
+
+    # pair_sampling_mode == "random"
+    row_choices = np.arange(number_of_groups, dtype=np.int64)
+    identity_choices = np.arange(number_of_identities, dtype=np.int64)
+
+    selected_rows = []
+    selected_identity_idx = []
+    labels_pair = []
+    for _ in range(pair_sampling_budget):
+        row = int(rng.choice(row_choices))
+        identity_idx = int(rng.choice(identity_choices))
+        selected_rows.append(row)
+        selected_identity_idx.append(identity_idx)
+        labels_pair.append(
+            int(group_identities[row] == enrolled_identity_ids[identity_idx])
+        )
+
+    selected_rows = np.asarray(selected_rows, dtype=np.int64)
+    selected_identity_idx = np.asarray(selected_identity_idx, dtype=np.int64)
+    labels_pair = np.asarray(labels_pair, dtype=int)
+
+    final_scores = _score_selected_decisions(
+        selected_rows, selected_identity_idx
+    )
+
+    diagnostics.update(
+        {
+            "genuine_fused_decisions": int((labels_pair == 1).sum()),
+            "impostor_fused_decisions": int((labels_pair == 0).sum()),
+            "pair_sampling_budget": pair_sampling_budget,
+            "pair_sampling_seed": pair_sampling_seed,
+        }
+    )
+    return final_scores, labels_pair, diagnostics
 
 
 def _find_optimal_threshold(scores, labels):

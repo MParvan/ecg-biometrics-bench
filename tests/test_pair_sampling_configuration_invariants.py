@@ -235,6 +235,33 @@ class PairSamplingConfigurationInvariants(
             110,
         )
 
+    def test_no_configuration_enables_multi_template_enrollment(self):
+        # Every shipped configuration uses the existing fusion enrollment
+        # path. None of them opts into multi-template enrollment, and none
+        # carries a multi-template-only parameter with fusion left implicit.
+        multi_template_only_keys = {
+            "num_templates_per_identity",
+            "template_selection_method",
+            "template_score_aggregation",
+        }
+
+        for path, config in self.configurations:
+            self.assertIn(
+                config.get("enrollment_template_mode", "fusion"),
+                ("fusion",),
+                f"{path.name} does not use the fusion reproduction path",
+            )
+
+            present = multi_template_only_keys & set(config)
+            self.assertFalse(
+                present,
+                (
+                    f"{path.name} sets multi-template-only parameter(s) "
+                    f"while enrollment_template_mode is not set: "
+                    f"{sorted(present)}"
+                ),
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

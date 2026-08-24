@@ -1009,5 +1009,80 @@ class MainCLIRoutingTests(unittest.TestCase):
         )
 
 
+class EnrollmentTemplateModeCLIRouting(unittest.TestCase):
+    """
+    ``--enrollment_template_mode`` dispatch: fusion mode keeps forwarding
+    ``template_fusion_method`` exactly as before, multi_template mode
+    withholds it entirely and forwards the three new parameters instead.
+    """
+
+    run_main_with_mocked_runners = (
+        MainCLIRoutingTests.run_main_with_mocked_runners
+    )
+
+    def _multi_template_cli_arguments(self, task):
+        arguments = build_cli_arguments(task)
+
+        fusion_flag_index = arguments.index("--template_fusion_method")
+        del arguments[fusion_flag_index:fusion_flag_index + 2]
+
+        if task not in {3, 7}:
+            arguments.append("--use_template")
+
+        arguments.extend(
+            [
+                "--enrollment_template_mode",
+                "multi_template",
+                "--num_templates_per_identity",
+                "3",
+            ]
+        )
+        return arguments
+
+    def test_fusion_mode_forwards_template_fusion_method(self):
+        execution = self.run_main_with_mocked_runners(1)
+        keyword_arguments = execution["runner_mocks"][
+            RUNNER_BY_TASK[1]
+        ].call_args.kwargs
+
+        self.assertEqual(
+            keyword_arguments["enrollment_template_mode"], "fusion"
+        )
+        self.assertEqual(
+            keyword_arguments["template_fusion_method"], "median"
+        )
+        self.assertNotIn(
+            "num_templates_per_identity", keyword_arguments
+        )
+
+    def test_multi_template_mode_withholds_fusion_method(self):
+        for task in range(1, 9):
+            with self.subTest(task=task):
+                execution = self.run_main_with_mocked_runners(
+                    task,
+                    cli_arguments=self._multi_template_cli_arguments(task),
+                )
+                keyword_arguments = execution["runner_mocks"][
+                    RUNNER_BY_TASK[task]
+                ].call_args.kwargs
+
+                self.assertEqual(
+                    keyword_arguments["enrollment_template_mode"],
+                    "multi_template",
+                )
+                self.assertNotIn(
+                    "template_fusion_method", keyword_arguments
+                )
+                self.assertEqual(
+                    keyword_arguments["num_templates_per_identity"], 3
+                )
+                self.assertIsNone(
+                    keyword_arguments["template_selection_method"]
+                )
+                self.assertIsNone(
+                    keyword_arguments["template_score_aggregation"]
+                )
+
+
 if __name__ == "__main__":
     unittest.main()

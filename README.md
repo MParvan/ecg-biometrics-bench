@@ -116,6 +116,58 @@ a dedicated pair-sampling seed.
 
 ---
 
+## 👥 Enrollment Templates
+
+For any task that enrolls identities into a gallery (`use_template=True`),
+`--enrollment_template_mode` selects how the enrolled observations become a
+matchable representation:
+
+- **`fusion`** (default): every enrollment observation for an identity is
+  aggregated into a single template, using `--template_fusion_method` (mean,
+  median, trimmed mean, a representative-beat selection, or no aggregation at
+  all). This is the path every shipped configuration uses, and it is
+  unaffected by the option below.
+- **`multi_template`**: instead of aggregating, the framework stores a fixed
+  number of representative enrollment observations per identity —
+  `--num_templates_per_identity` — and keeps them as separate rows in the
+  gallery.
+
+`--template_size` keeps its existing meaning under both modes: the number of
+enrollment observations available per identity (`None` uses all of them).
+`num_templates_per_identity` is a separate, smaller number — how many of
+those observations are actually kept as templates — and every enrolled
+identity must have at least that many available observations, or the run
+fails with the identities and counts that fell short rather than silently
+enrolling with fewer.
+
+Representatives are chosen with `farthest_first_cosine`, a deterministic
+selection that has no random seed and never re-runs differently between
+repetitions: the first representative is the enrollment observation closest
+to the identity's overall (unit-normalized) direction, and each following
+representative is whichever remaining observation is least similar, by
+cosine distance, to the representatives already chosen. This spreads the
+stored templates across the identity's variability instead of clustering
+them around one typical beat.
+
+At match time, a probe is scored against every stored template and the
+identity's score is the maximum over its templates
+(`--template_score_aggregation`, currently only `max`). When probe-side
+fusion is also enabled (`--probe_fusion_size > 1`), fusion is applied first,
+independently for each stored template, and only the resulting per-template
+scores are reduced to one identity score by the maximum — never the other
+order. Concretely, for probe beats `b` and an identity's templates `T_j`:
+
+```
+identity_score = max_j( mean_b( score(probe_b, T_j) ) )
+```
+
+Multi-template enrollment currently does not support
+`--use_deployment_evaluation`: identity-level aggregation over several
+templates changes the score distribution a deployment threshold would be
+calibrated on, so the two options are mutually exclusive for now.
+
+---
+
 ## 🗄️ Supported Datasets
 
 The framework provides plug-and-play automated download and parsing for the following datasets:

@@ -48,6 +48,7 @@ from scipy import stats
 
 from utils import (
     _apply_score_fusion, _generate_fused_verification_pairs, _source_order_indices, _make_loader, _encode_labels, _get_device, _set_seed,
+    _select_multi_templates, _reduce_template_scores_to_identities, _generate_multi_template_verification_pairs,
     _apply_outlier_filter, _compute_sqi, _compute_score_matrix,
     _get_embeddings, _create_templates, _generate_pairs, _resolve_pair_sampling_arguments,
     _find_optimal_threshold, _evaluate_with_global_threshold, _summarize_verification_pairs,
@@ -1905,6 +1906,146 @@ def _validate_verification_probe_fusion(
             )
 
     return depth
+
+
+_UNSET = object()
+"""Sentinel distinguishing an omitted keyword argument from an explicit
+``None`` or other falsy value. ``template_fusion_method`` uses ``None`` as a
+genuine, legacy no-fusion selector, so plain ``None`` cannot serve as the
+"argument omitted" marker."""
+
+
+def _validate_multi_template_arguments(
+    enrollment_template_mode,
+    template_fusion_method,
+    num_templates_per_identity,
+    template_selection_method,
+    template_score_aggregation,
+    use_template,
+    use_deployment_evaluation,
+    task_name,
+):
+    """
+    Validate and resolve the enrollment-template-mode arguments.
+
+    ``enrollment_template_mode='fusion'`` is the existing enrollment path:
+    ``template_fusion_method`` selects how enrollment observations combine
+    into one template per identity (or, for ``'none'``/``None``, are kept
+    unfused). The new multi-template parameters have no meaning in this mode
+    and are rejected if explicitly supplied.
+
+    ``enrollment_template_mode='multi_template'`` selects a fixed number of
+    representative enrollment observations per identity instead of fusing
+    them. ``template_fusion_method`` has no meaning in this mode: supplying
+    it explicitly (any value, including ``'mean'``, ``'none'`` or ``None``)
+    is rejected rather than silently ignored, and ``num_templates_per_identity``
+    is required. It also requires ``use_template=True`` and is not compatible
+    with ``use_deployment_evaluation``.
+
+    Returns the resolved
+    ``(enrollment_template_mode, num_templates_per_identity,
+    template_selection_method, template_score_aggregation)``.
+    """
+    if enrollment_template_mode not in {"fusion", "multi_template"}:
+        raise ValueError(
+            f"{task_name}: 'enrollment_template_mode' must be 'fusion' or "
+            f"'multi_template', received {enrollment_template_mode!r}."
+        )
+
+    if enrollment_template_mode == "fusion":
+        conflicting = [
+            name
+            for name, value in (
+                ("num_templates_per_identity", num_templates_per_identity),
+                ("template_selection_method", template_selection_method),
+                ("template_score_aggregation", template_score_aggregation),
+            )
+            if value is not None
+        ]
+        if conflicting:
+            raise ValueError(
+                f"{task_name}: enrollment_template_mode='fusion' does not "
+                "use " + ", ".join(conflicting) + ". Remove them or set "
+                "enrollment_template_mode='multi_template'."
+            )
+        return (
+            enrollment_template_mode,
+            None,
+            None,
+            None,
+        )
+
+    # enrollment_template_mode == "multi_template"
+    if template_fusion_method is not _UNSET:
+        raise ValueError(
+            f"{task_name}: enrollment_template_mode='multi_template' "
+            "selects enrollment templates directly and does not use "
+            "'template_fusion_method'. Remove it from the configuration."
+        )
+
+    if not use_template:
+        raise ValueError(
+            f"{task_name}: enrollment_template_mode='multi_template' "
+            "requires use_template=True."
+        )
+
+    if num_templates_per_identity is None:
+        raise ValueError(
+            f"{task_name}: enrollment_template_mode='multi_template' "
+            "requires 'num_templates_per_identity'."
+        )
+
+    if (
+        isinstance(num_templates_per_identity, (bool, np.bool_))
+        or not isinstance(num_templates_per_identity, (int, np.integer))
+        or int(num_templates_per_identity) < 1
+    ):
+        raise ValueError(
+            f"{task_name}: 'num_templates_per_identity' must be a positive "
+            f"integer, received {num_templates_per_identity!r}."
+        )
+
+    resolved_k = int(num_templates_per_identity)
+
+    resolved_selection_method = (
+        "farthest_first_cosine"
+        if template_selection_method is None
+        else template_selection_method
+    )
+    if resolved_selection_method != "farthest_first_cosine":
+        raise ValueError(
+            f"{task_name}: 'template_selection_method' must be "
+            "'farthest_first_cosine', received "
+            f"{template_selection_method!r}."
+        )
+
+    resolved_aggregation = (
+        "max"
+        if template_score_aggregation is None
+        else template_score_aggregation
+    )
+    if resolved_aggregation != "max":
+        raise ValueError(
+            f"{task_name}: 'template_score_aggregation' must be 'max', "
+            f"received {template_score_aggregation!r}."
+        )
+
+    if use_deployment_evaluation:
+        raise ValueError(
+            f"{task_name}: enrollment_template_mode='multi_template' is "
+            "not compatible with use_deployment_evaluation. Identity-level "
+            "aggregation over multiple stored templates changes the score "
+            "distribution a deployment threshold is calibrated on. "
+            "Calibrate with enrollment_template_mode='fusion', or disable "
+            "deployment evaluation."
+        )
+
+    return (
+        enrollment_template_mode,
+        resolved_k,
+        resolved_selection_method,
+        resolved_aggregation,
+    )
 
 
 def _split_subject_cohorts(
@@ -4713,14 +4854,16 @@ def _add_seed_metadata(
 def run_closed_set_identification(x, y, model_class, epochs=150, batch_size=256, 
                                   lr=1e-3, test_split=0.2, val_split=0.0, seed=42, 
                                   device=None, visualize=False, use_template=False, 
-                                  template_fusion_method='mean', template_size=None,
+                                  template_fusion_method=_UNSET, template_size=None,
                                   matching_method='cosine', outlier_filtering_on_train=False,
                                   outlier_filtering_on_test=False, sqi_scores=None,
                                   sqi_threshold=0.05, sqi_keep_pct=0.8, probe_fusion_size=1,
                                   save_results_and_settings=False, loader=None, 
                                   n_runs=1, _return_stats=False,
                                   intelligent_weight_loading=True,
-                                  augmentation_config=None, split_seed=None, provenance=None):
+                                  augmentation_config=None, split_seed=None, provenance=None,
+        enrollment_template_mode='fusion', num_templates_per_identity=None,
+        template_selection_method=None, template_score_aggregation=None):
     """
     Standard Closed-Set Identification Pipeline (Intra-session).
     Determines "Who is this person?" from a known pool of subjects seen during training.
@@ -4767,6 +4910,22 @@ def run_closed_set_identification(x, y, model_class, epochs=150, batch_size=256,
         tuple: (Rank-1 Accuracy, Rank-5 Accuracy)
                If n_runs > 1, returns tuples of (Mean, Std_Dev) for both metrics.
     """
+
+    (
+        enrollment_template_mode,
+        num_templates_per_identity,
+        template_selection_method,
+        template_score_aggregation,
+    ) = _validate_multi_template_arguments(
+        enrollment_template_mode,
+        template_fusion_method,
+        num_templates_per_identity,
+        template_selection_method,
+        template_score_aggregation,
+        use_template,
+        False,
+        "Closed-Set Identification",
+    )
 
     # ====================================================
     # 0. Capture Hyperparameters for Logger & MULTI-RUN AGGREGATOR
@@ -4906,6 +5065,20 @@ def run_closed_set_identification(x, y, model_class, epochs=150, batch_size=256,
     hyperparams[
         "augmentation"
     ] = augmentation_config
+
+    if enrollment_template_mode == "fusion":
+        if template_fusion_method is _UNSET:
+            template_fusion_method = "mean"
+    else:
+        template_fusion_method = None
+
+    hyperparams["enrollment_template_mode"] = enrollment_template_mode
+    hyperparams["template_fusion_method"] = template_fusion_method
+
+    if enrollment_template_mode == "multi_template":
+        hyperparams["num_templates_per_identity"] = num_templates_per_identity
+        hyperparams["template_selection_method"] = template_selection_method
+        hyperparams["template_score_aggregation"] = template_score_aggregation
 
     _set_seed(seed); device = _get_device(device)
     resolved_split_seed = seed if split_seed is None else split_seed
@@ -5178,7 +5351,65 @@ def run_closed_set_identification(x, y, model_class, epochs=150, batch_size=256,
         model = _run_training_loop(model, train_loader, val_loader, optimizer, criterion, device, epochs)
 
     # 4. Evaluation Logic
-    if not use_template:
+    if enrollment_template_mode == "multi_template":
+        print(
+            "[INFO] Building multi-template gallery "
+            f"({num_templates_per_identity} templates/identity, "
+            f"{template_selection_method})..."
+        )
+        model.include_top = False
+        train_extract_loader = _make_loader(X_train, y_train_enc, batch_size, shuffle=False)
+        train_emb, train_lab = _get_embeddings(model, train_extract_loader, device)
+        (
+            mt_templates,
+            mt_template_identities,
+            mt_template_source_indices,
+            template_diagnostics,
+        ) = _select_multi_templates(
+            train_emb, train_lab,
+            provenance=provenance_train,
+            num_templates_per_identity=num_templates_per_identity,
+            template_selection_method=template_selection_method,
+            max_beats=template_size,
+        )
+
+        test_emb, test_lab = _get_embeddings(model, test_loader, device)
+        raw_scores = _compute_score_matrix(test_emb, mt_templates, method=matching_method)
+
+        if probe_fusion_size > 1:
+            fused_template_scores, fused_probe_labels, fusion_diagnostics = _apply_score_fusion(
+                raw_scores, test_lab, fusion_size=probe_fusion_size,
+                provenance=provenance_test, return_diagnostics=True,
+            )
+        else:
+            fused_template_scores = raw_scores
+            fused_probe_labels = test_lab
+            fusion_diagnostics = {
+                "fusion_size": 1,
+                "raw_probe_observations": int(len(test_lab)),
+                "fused_probe_decisions": int(len(test_lab)),
+                "dropped_remainder_observations": 0,
+                "source_blocks_below_fusion_size": 0,
+                "identities_without_a_fused_decision": 0,
+            }
+
+        if probe_fusion_size > 1 and len(fused_probe_labels) == 0:
+            raise ValueError(
+                "Probe fusion produced no complete fused decisions for any "
+                "identity: with the configured probe fusion size no source "
+                "segment holds enough probe beats to form a group. Reduce the "
+                "probe fusion size or provide more probe data."
+            )
+
+        identity_order = np.arange(len(classes))
+        final_scores = _reduce_template_scores_to_identities(
+            fused_template_scores, mt_template_identities, identity_order,
+            template_score_aggregation=template_score_aggregation,
+        )
+        final_labels = fused_probe_labels
+
+        model.include_top = True
+    elif not use_template:
         # --- PATH A: Standard Softmax ---
         model.eval()
         all_probs, all_trues = [], []
@@ -5229,20 +5460,21 @@ def run_closed_set_identification(x, y, model_class, epochs=150, batch_size=256,
     # ====================================================
     # 5. APPLY SCORE-LEVEL FUSION (If requested)
     # ====================================================
-    final_scores, final_labels, fusion_diagnostics = _apply_score_fusion(
-        final_scores,
-        final_labels,
-        fusion_size=probe_fusion_size,
-        provenance=provenance_test,
-        return_diagnostics=True,
-    )
-    if probe_fusion_size > 1 and len(final_labels) == 0:
-        raise ValueError(
-            "Probe fusion produced no complete fused decisions for any "
-            "identity: with the configured probe fusion size no source "
-            "segment holds enough probe beats to form a group. Reduce the "
-            "probe fusion size or provide more probe data."
+    if enrollment_template_mode != "multi_template":
+        final_scores, final_labels, fusion_diagnostics = _apply_score_fusion(
+            final_scores,
+            final_labels,
+            fusion_size=probe_fusion_size,
+            provenance=provenance_test,
+            return_diagnostics=True,
         )
+        if probe_fusion_size > 1 and len(final_labels) == 0:
+            raise ValueError(
+                "Probe fusion produced no complete fused decisions for any "
+                "identity: with the configured probe fusion size no source "
+                "segment holds enough probe beats to form a group. Reduce the "
+                "probe fusion size or provide more probe data."
+            )
 
     if visualize:
         viz = Visualizer()
@@ -5272,6 +5504,8 @@ def run_closed_set_identification(x, y, model_class, epochs=150, batch_size=256,
         "Test (Probe) Samples": len(X_test),
         "Probe Fusion": fusion_diagnostics,
     }
+    if enrollment_template_mode == "multi_template":
+        data_stats["Enrollment Templates"] = template_diagnostics
 
     if _return_stats:
         return (rank1, rank5), data_stats, hyperparams
@@ -5304,7 +5538,7 @@ def run_closed_set_identification(x, y, model_class, epochs=150, batch_size=256,
 def run_closed_set_verification(x, y, model_class, epochs=150, batch_size=256, lr=1e-3,
                                 test_split=0.2, val_split=0.0, num_pairs=None,
                                 sampling_mode=None, seed=42, device=None, visualize=False,
-                                use_template=False, template_fusion_method='mean', 
+                                use_template=False, template_fusion_method=_UNSET,
                                 template_size=None, matching_method='cosine',
                                 outlier_filtering_on_train=False, outlier_filtering_on_test=False, 
                                 sqi_scores=None, sqi_threshold=0.05, sqi_keep_pct=0.8, 
@@ -5318,7 +5552,9 @@ def run_closed_set_verification(x, y, model_class, epochs=150, batch_size=256, l
         pair_sampling_mode=None,
         max_impostor_pairs=1000000,
         pair_sampling_seed=42,
-        probe_fusion_size=1):
+        probe_fusion_size=1,
+        enrollment_template_mode='fusion', num_templates_per_identity=None,
+        template_selection_method=None, template_score_aggregation=None):
     """
     Standard Closed-Set Verification Pipeline (Intra-session).
     Determines "Is this person who they claim to be?" (1:1 matching) for subjects known to the model.
@@ -5367,6 +5603,22 @@ def run_closed_set_verification(x, y, model_class, epochs=150, batch_size=256, l
         tuple: (EER, AUC, d-prime, TAR @ 0.1% FAR)
                If n_runs > 1, returns tuples of (Mean, Std_Dev) for all four metrics.
     """
+
+    (
+        enrollment_template_mode,
+        num_templates_per_identity,
+        template_selection_method,
+        template_score_aggregation,
+    ) = _validate_multi_template_arguments(
+        enrollment_template_mode,
+        template_fusion_method,
+        num_templates_per_identity,
+        template_selection_method,
+        template_score_aggregation,
+        use_template,
+        use_deployment_evaluation,
+        "Closed-Set Verification",
+    )
 
     _validate_deployment_evaluation(
         use_deployment_evaluation,
@@ -5539,6 +5791,20 @@ def run_closed_set_verification(x, y, model_class, epochs=150, batch_size=256, l
     hyperparams[
         "augmentation"
     ] = augmentation_config
+
+    if enrollment_template_mode == "fusion":
+        if template_fusion_method is _UNSET:
+            template_fusion_method = "mean"
+    else:
+        template_fusion_method = None
+
+    hyperparams["enrollment_template_mode"] = enrollment_template_mode
+    hyperparams["template_fusion_method"] = template_fusion_method
+
+    if enrollment_template_mode == "multi_template":
+        hyperparams["num_templates_per_identity"] = num_templates_per_identity
+        hyperparams["template_selection_method"] = template_selection_method
+        hyperparams["template_score_aggregation"] = template_score_aggregation
 
     _set_seed(seed); device = _get_device(device)
     resolved_split_seed = seed if split_seed is None else split_seed
@@ -5831,8 +6097,44 @@ def run_closed_set_verification(x, y, model_class, epochs=150, batch_size=256, l
     # 9. EVALUATION STRATEGY
     # ====================================================
     fusion_diagnostics = None
+    template_diagnostics = None
 
-    if not use_template:
+    if enrollment_template_mode == "multi_template":
+        print(
+            "[INFO] Building multi-template gallery "
+            f"({num_templates_per_identity} templates/identity, "
+            f"{template_selection_method})..."
+        )
+        train_extract_loader = _make_loader(X_train, y_train_enc, batch_size, shuffle=False)
+        train_emb, train_lab = _get_embeddings(model, train_extract_loader, device)
+        (
+            mt_templates,
+            mt_template_identities,
+            mt_template_source_indices,
+            template_diagnostics,
+        ) = _select_multi_templates(
+            train_emb, train_lab,
+            provenance=provenance_train,
+            num_templates_per_identity=num_templates_per_identity,
+            template_selection_method=template_selection_method,
+            max_beats=template_size,
+        )
+        scores, labels_pair, fusion_diagnostics = _generate_multi_template_verification_pairs(
+            probe_embeddings=test_emb,
+            probe_labels=test_lab,
+            probe_provenance=provenance_test,
+            template_embeddings=mt_templates,
+            template_identities=mt_template_identities,
+            num_templates_per_identity=num_templates_per_identity,
+            probe_fusion_size=probe_fusion_size,
+            matching_method=matching_method,
+            pair_sampling_mode=pair_sampling_mode,
+            pair_sampling_budget=pair_sampling_budget,
+            max_impostor_pairs=max_impostor_pairs,
+            pair_sampling_seed=pair_sampling_seed,
+            template_score_aggregation=template_score_aggregation,
+        )
+    elif not use_template:
         # STRATEGY A: Test vs Test (Intra-session unseen evaluation)
         print(f"[INFO] Bypassing Templates. Generating pairs exclusively from Test split...")
         scores, labels_pair = _generate_pairs(
@@ -5928,6 +6230,8 @@ def run_closed_set_verification(x, y, model_class, epochs=150, batch_size=256, l
 
     if fusion_diagnostics is not None:
         data_stats["Probe Fusion"] = fusion_diagnostics
+    if template_diagnostics is not None:
+        data_stats["Enrollment Templates"] = template_diagnostics
 
     if _return_stats:
         return (
@@ -5962,14 +6266,16 @@ def run_closed_set_verification(x, y, model_class, epochs=150, batch_size=256, l
 def run_subject_disjoint_identification(x, y, model_class, epochs=150, batch_size=256, lr=1e-3, 
                                         test_split=0.2, val_split=0.0, seed=42, device=None, 
                                         visualize=False, use_template=True, 
-                                        template_fusion_method='mean', template_size=1, 
+                                        template_fusion_method=_UNSET, template_size=1,
                                         matching_method='cosine', outlier_filtering_on_train=False, 
                                         outlier_filtering_on_test=False, sqi_scores=None, 
                                         sqi_threshold=0.05, sqi_keep_pct=0.8, probe_fusion_size=1,
                                         save_results_and_settings=False, loader=None, 
                                         n_runs=1, _return_stats=False,
                                         intelligent_weight_loading=True,
-                                        augmentation_config=None, split_seed=None, provenance=None):
+                                        augmentation_config=None, split_seed=None, provenance=None,
+        enrollment_template_mode='fusion', num_templates_per_identity=None,
+        template_selection_method=None, template_score_aggregation=None):
     """
     Subject-Disjoint Identification Pipeline.
     Evaluates identification performance on subjects entirely UNSEEN during the training phase.
@@ -6034,6 +6340,22 @@ def run_subject_disjoint_identification(x, y, model_class, epochs=150, batch_siz
             "template_size to the number of enrollment beats per subject; the "
             "paper configurations use 1."
         )
+
+    (
+        enrollment_template_mode,
+        num_templates_per_identity,
+        template_selection_method,
+        template_score_aggregation,
+    ) = _validate_multi_template_arguments(
+        enrollment_template_mode,
+        template_fusion_method,
+        num_templates_per_identity,
+        template_selection_method,
+        template_score_aggregation,
+        use_template,
+        False,
+        "Subject-Disjoint Identification",
+    )
 
     # ====================================================
     # 0. Capture Hyperparameters for Logger & MULTI-RUN AGGREGATOR
@@ -6154,6 +6476,20 @@ def run_subject_disjoint_identification(x, y, model_class, epochs=150, batch_siz
     hyperparams[
         "augmentation"
     ] = augmentation_config
+
+    if enrollment_template_mode == "fusion":
+        if template_fusion_method is _UNSET:
+            template_fusion_method = "mean"
+    else:
+        template_fusion_method = None
+
+    hyperparams["enrollment_template_mode"] = enrollment_template_mode
+    hyperparams["template_fusion_method"] = template_fusion_method
+
+    if enrollment_template_mode == "multi_template":
+        hyperparams["num_templates_per_identity"] = num_templates_per_identity
+        hyperparams["template_selection_method"] = template_selection_method
+        hyperparams["template_score_aggregation"] = template_score_aggregation
 
     _set_seed(seed); device = _get_device(device)
     resolved_split_seed = seed if split_seed is None else split_seed
@@ -6473,40 +6809,102 @@ def run_subject_disjoint_identification(x, y, model_class, epochs=150, batch_siz
         provenance_probe = provenance_test.subset(
             enrollment_probe_partitions["indices"]["probe"]
         )
-    
-    # 8. Apply Template Fusion Strategy to the Gallery
-    gallery_emb, gallery_lab = _create_templates(
-        emb_enroll, lab_enroll, method=template_fusion_method, max_beats=None
-    )
-    
-    # 9. Generate Score Matrix for Rank-N Evaluation
-    probe_mapped = np.array([test_sub_map[l] for l in lab_probe])
-    
-    raw_scores = _compute_score_matrix(emb_probe, gallery_emb, method=matching_method)
-    scores = np.full((len(emb_probe), len(test_subs_final)), -np.inf)
-    
-    for class_idx, sub in enumerate(test_subs_final):
-        gallery_mask = (gallery_lab == sub)
-        if np.any(gallery_mask):
-            scores[:, class_idx] = np.max(raw_scores[:, gallery_mask], axis=1)
 
-    # ====================================================
-    # 10. APPLY SCORE-LEVEL FUSION
-    # ====================================================
-    final_scores, final_labels, fusion_diagnostics = _apply_score_fusion(
-        scores,
-        probe_mapped,
-        fusion_size=probe_fusion_size,
-        provenance=provenance_probe,
-        return_diagnostics=True,
-    )
-    if probe_fusion_size > 1 and len(final_labels) == 0:
-        raise ValueError(
-            "Probe fusion produced no complete fused decisions for any "
-            "identity: with the configured probe fusion size no source "
-            "segment holds enough probe beats to form a group. Reduce the "
-            "probe fusion size or provide more probe data."
+    template_diagnostics = None
+
+    if enrollment_template_mode == "multi_template":
+        provenance_enroll = None
+        if provenance_test is not None:
+            provenance_enroll = provenance_test.subset(
+                enrollment_probe_partitions["indices"]["enrollment"]
+            )
+
+        print(
+            "[INFO] Building multi-template gallery "
+            f"({num_templates_per_identity} templates/identity, "
+            f"{template_selection_method})..."
         )
+        (
+            mt_templates,
+            mt_template_identities,
+            mt_template_source_indices,
+            template_diagnostics,
+        ) = _select_multi_templates(
+            emb_enroll, lab_enroll,
+            provenance=provenance_enroll,
+            num_templates_per_identity=num_templates_per_identity,
+            template_selection_method=template_selection_method,
+            max_beats=None,
+        )
+        gallery_emb = mt_templates
+
+        probe_mapped = np.array([test_sub_map[l] for l in lab_probe])
+        raw_scores = _compute_score_matrix(emb_probe, mt_templates, method=matching_method)
+
+        if probe_fusion_size > 1:
+            fused_template_scores, fused_probe_mapped, fusion_diagnostics = _apply_score_fusion(
+                raw_scores, probe_mapped, fusion_size=probe_fusion_size,
+                provenance=provenance_probe, return_diagnostics=True,
+            )
+        else:
+            fused_template_scores = raw_scores
+            fused_probe_mapped = probe_mapped
+            fusion_diagnostics = {
+                "fusion_size": 1,
+                "raw_probe_observations": int(len(probe_mapped)),
+                "fused_probe_decisions": int(len(probe_mapped)),
+                "dropped_remainder_observations": 0,
+                "source_blocks_below_fusion_size": 0,
+                "identities_without_a_fused_decision": 0,
+            }
+
+        if probe_fusion_size > 1 and len(fused_probe_mapped) == 0:
+            raise ValueError(
+                "Probe fusion produced no complete fused decisions for any "
+                "identity: with the configured probe fusion size no source "
+                "segment holds enough probe beats to form a group. Reduce the "
+                "probe fusion size or provide more probe data."
+            )
+
+        final_scores = _reduce_template_scores_to_identities(
+            fused_template_scores, mt_template_identities, np.asarray(test_subs_final),
+            template_score_aggregation=template_score_aggregation,
+        )
+        final_labels = fused_probe_mapped
+    else:
+        # 8. Apply Template Fusion Strategy to the Gallery
+        gallery_emb, gallery_lab = _create_templates(
+            emb_enroll, lab_enroll, method=template_fusion_method, max_beats=None
+        )
+
+        # 9. Generate Score Matrix for Rank-N Evaluation
+        probe_mapped = np.array([test_sub_map[l] for l in lab_probe])
+
+        raw_scores = _compute_score_matrix(emb_probe, gallery_emb, method=matching_method)
+        scores = np.full((len(emb_probe), len(test_subs_final)), -np.inf)
+
+        for class_idx, sub in enumerate(test_subs_final):
+            gallery_mask = (gallery_lab == sub)
+            if np.any(gallery_mask):
+                scores[:, class_idx] = np.max(raw_scores[:, gallery_mask], axis=1)
+
+        # ====================================================
+        # 10. APPLY SCORE-LEVEL FUSION
+        # ====================================================
+        final_scores, final_labels, fusion_diagnostics = _apply_score_fusion(
+            scores,
+            probe_mapped,
+            fusion_size=probe_fusion_size,
+            provenance=provenance_probe,
+            return_diagnostics=True,
+        )
+        if probe_fusion_size > 1 and len(final_labels) == 0:
+            raise ValueError(
+                "Probe fusion produced no complete fused decisions for any "
+                "identity: with the configured probe fusion size no source "
+                "segment holds enough probe beats to form a group. Reduce the "
+                "probe fusion size or provide more probe data."
+            )
 
     if visualize:
         # Visualizing original un-fused test embeddings
@@ -6544,6 +6942,8 @@ def run_subject_disjoint_identification(x, y, model_class, epochs=150, batch_siz
         "Probe Samples": len(emb_probe),
         "Probe Fusion": fusion_diagnostics,
     }
+    if template_diagnostics is not None:
+        data_stats["Enrollment Templates"] = template_diagnostics
 
     if _return_stats:
         return (rank1, rank5), data_stats, hyperparams
@@ -6577,7 +6977,7 @@ def run_subject_disjoint_identification(x, y, model_class, epochs=150, batch_siz
 def run_subject_disjoint_verification(x, y, model_class, epochs=150, batch_size=256, lr=1e-3, 
                                       test_split=0.2, val_split=0.0, num_pairs=None,
                                       sampling_mode=None, seed=42, device=None,
-                                      visualize=False, use_template=False, template_fusion_method='mean', 
+                                      visualize=False, use_template=False, template_fusion_method=_UNSET,
                                       template_size=1, matching_method='cosine',
                                       outlier_filtering_on_train=False, outlier_filtering_on_test=False, 
                                       sqi_scores=None, sqi_threshold=0.05, sqi_keep_pct=0.8, 
@@ -6591,7 +6991,9 @@ def run_subject_disjoint_verification(x, y, model_class, epochs=150, batch_size=
         pair_sampling_mode=None,
         max_impostor_pairs=1000000,
         pair_sampling_seed=42,
-        probe_fusion_size=1):
+        probe_fusion_size=1,
+        enrollment_template_mode='fusion', num_templates_per_identity=None,
+        template_selection_method=None, template_score_aggregation=None):
     """
     Subject-Disjoint Verification Pipeline (Subject-Disjoint 1:1 Matching).
     Tests the system's ability to verify the identity of completely new users.
@@ -6640,6 +7042,22 @@ def run_subject_disjoint_verification(x, y, model_class, epochs=150, batch_size=
         tuple: (EER, AUC, d-prime, TAR @ 0.1% FAR)
                If n_runs > 1, returns tuples of (Mean, Std_Dev) for all four metrics.
     """
+
+    (
+        enrollment_template_mode,
+        num_templates_per_identity,
+        template_selection_method,
+        template_score_aggregation,
+    ) = _validate_multi_template_arguments(
+        enrollment_template_mode,
+        template_fusion_method,
+        num_templates_per_identity,
+        template_selection_method,
+        template_score_aggregation,
+        use_template,
+        use_deployment_evaluation,
+        "Subject-Disjoint Verification",
+    )
 
     _validate_deployment_evaluation(
         use_deployment_evaluation,
@@ -6816,6 +7234,20 @@ def run_subject_disjoint_verification(x, y, model_class, epochs=150, batch_size=
     hyperparams[
         "augmentation"
     ] = augmentation_config
+
+    if enrollment_template_mode == "fusion":
+        if template_fusion_method is _UNSET:
+            template_fusion_method = "mean"
+    else:
+        template_fusion_method = None
+
+    hyperparams["enrollment_template_mode"] = enrollment_template_mode
+    hyperparams["template_fusion_method"] = template_fusion_method
+
+    if enrollment_template_mode == "multi_template":
+        hyperparams["num_templates_per_identity"] = num_templates_per_identity
+        hyperparams["template_selection_method"] = template_selection_method
+        hyperparams["template_score_aggregation"] = template_score_aggregation
 
     _set_seed(seed); device = _get_device(device)
     resolved_split_seed = seed if split_seed is None else split_seed
@@ -7128,8 +7560,82 @@ def run_subject_disjoint_verification(x, y, model_class, epochs=150, batch_size=
 
     # 9. Evaluation Strategy
     fusion_diagnostics = None
+    template_diagnostics = None
 
-    if not use_template:
+    if enrollment_template_mode == "multi_template":
+        print(
+            "[INFO] Splitting Test Data: "
+            f"First {template_size} beats = Enroll, "
+            "Rest = Probe"
+        )
+
+        enrollment_probe_partitions = (
+            _split_enrollment_probe_embeddings(
+                test_emb,
+                test_lab,
+                subjects=test_subs_final,
+                template_size=template_size,
+                provenance=provenance_test,
+            )
+        )
+
+        (
+            emb_enroll,
+            lab_enroll,
+        ) = enrollment_probe_partitions[
+            "enrollment"
+        ]
+
+        (
+            emb_probe,
+            lab_probe,
+        ) = enrollment_probe_partitions[
+            "probe"
+        ]
+
+        provenance_enroll = None
+        provenance_probe = None
+        if provenance_test is not None:
+            provenance_enroll = provenance_test.subset(
+                enrollment_probe_partitions["indices"]["enrollment"]
+            )
+            provenance_probe = provenance_test.subset(
+                enrollment_probe_partitions["indices"]["probe"]
+            )
+
+        print(
+            "[INFO] Building multi-template gallery "
+            f"({num_templates_per_identity} templates/identity, "
+            f"{template_selection_method})..."
+        )
+        (
+            mt_templates,
+            mt_template_identities,
+            mt_template_source_indices,
+            template_diagnostics,
+        ) = _select_multi_templates(
+            emb_enroll, lab_enroll,
+            provenance=provenance_enroll,
+            num_templates_per_identity=num_templates_per_identity,
+            template_selection_method=template_selection_method,
+            max_beats=None,
+        )
+        scores, labels_pair, fusion_diagnostics = _generate_multi_template_verification_pairs(
+            probe_embeddings=emb_probe,
+            probe_labels=lab_probe,
+            probe_provenance=provenance_probe,
+            template_embeddings=mt_templates,
+            template_identities=mt_template_identities,
+            num_templates_per_identity=num_templates_per_identity,
+            probe_fusion_size=probe_fusion_size,
+            matching_method=matching_method,
+            pair_sampling_mode=pair_sampling_mode,
+            pair_sampling_budget=pair_sampling_budget,
+            max_impostor_pairs=max_impostor_pairs,
+            pair_sampling_seed=pair_sampling_seed,
+            template_score_aggregation=template_score_aggregation,
+        )
+    elif not use_template:
         print(f"[INFO] Bypassing Templates. Generating pairs entirely from Unseen Test Subjects...")
         scores, labels_pair = _generate_pairs(
             embeddings1=test_emb, labels1=test_lab, 
@@ -7248,6 +7754,8 @@ def run_subject_disjoint_verification(x, y, model_class, epochs=150, batch_size=
 
     if fusion_diagnostics is not None:
         data_stats["Probe Fusion"] = fusion_diagnostics
+    if template_diagnostics is not None:
+        data_stats["Enrollment Templates"] = template_diagnostics
 
     if _return_stats:
         return (
@@ -7369,7 +7877,7 @@ def _prepare_cross_session_enrollment_role(
 
 def run_cross_session_identification(x_train, y_train, x_test, y_test, model_class, epochs=150, 
                                      batch_size=256, lr=1e-3, val_split=0.0, seed=42, device=None, 
-                                     visualize=False, use_template=False, template_fusion_method='mean',
+                                     visualize=False, use_template=False, template_fusion_method=_UNSET,
                                      template_size=None, matching_method='cosine',
                                      outlier_filtering_on_train=False, outlier_filtering_on_test=False, 
                                      sqi_train=None, sqi_test=None, sqi_threshold=0.05, 
@@ -7377,7 +7885,9 @@ def run_cross_session_identification(x_train, y_train, x_test, y_test, model_cla
                                      loader=None, n_runs=1, _return_stats=False,
                                      intelligent_weight_loading=True,
                                      augmentation_config=None, split_seed=None, provenance_s1=None, provenance_s2=None,
-                                     x_enroll=None, y_enroll=None, provenance_enroll=None):
+                                     x_enroll=None, y_enroll=None, provenance_enroll=None,
+        enrollment_template_mode='fusion', num_templates_per_identity=None,
+        template_selection_method=None, template_score_aggregation=None):
     """
     Cross-session identification with protocol-defined data roles.
 
@@ -7428,6 +7938,22 @@ def run_cross_session_identification(x_train, y_train, x_test, y_test, model_cla
         tuple: (Rank-1 Accuracy, Rank-5 Accuracy)
                If n_runs > 1, returns tuples of (Mean, Std_Dev) for both metrics.
     """
+
+    (
+        enrollment_template_mode,
+        num_templates_per_identity,
+        template_selection_method,
+        template_score_aggregation,
+    ) = _validate_multi_template_arguments(
+        enrollment_template_mode,
+        template_fusion_method,
+        num_templates_per_identity,
+        template_selection_method,
+        template_score_aggregation,
+        use_template,
+        False,
+        "Cross-Session Identification",
+    )
 
     # ====================================================
     # 0. Capture Hyperparameters for Logger & MULTI-RUN AGGREGATOR
@@ -7547,6 +8073,20 @@ def run_cross_session_identification(x_train, y_train, x_test, y_test, model_cla
     hyperparams[
         "augmentation"
     ] = augmentation_config
+
+    if enrollment_template_mode == "fusion":
+        if template_fusion_method is _UNSET:
+            template_fusion_method = "mean"
+    else:
+        template_fusion_method = None
+
+    hyperparams["enrollment_template_mode"] = enrollment_template_mode
+    hyperparams["template_fusion_method"] = template_fusion_method
+
+    if enrollment_template_mode == "multi_template":
+        hyperparams["num_templates_per_identity"] = num_templates_per_identity
+        hyperparams["template_selection_method"] = template_selection_method
+        hyperparams["template_score_aggregation"] = template_score_aggregation
 
     _set_seed(seed); device = _get_device(device)
     resolved_split_seed = seed if split_seed is None else split_seed
@@ -7828,7 +8368,73 @@ def run_cross_session_identification(x_train, y_train, x_test, y_test, model_cla
     # ====================================================
     # 6. EVALUATION STRATEGY
     # ====================================================
-    if not use_template:
+    template_diagnostics = None
+
+    if enrollment_template_mode == "multi_template":
+        print(
+            "[INFO] Building multi-template gallery "
+            f"({num_templates_per_identity} templates/identity, "
+            f"{template_selection_method})..."
+        )
+        model.include_top = False
+
+        enroll_loader = _make_loader(
+            x_enroll_filtered,
+            y_enroll_enc,
+            batch_size,
+            shuffle=False,
+        )
+        emb_enroll, lab_enroll = _get_embeddings(model, enroll_loader, device)
+        (
+            mt_templates,
+            mt_template_identities,
+            mt_template_source_indices,
+            template_diagnostics,
+        ) = _select_multi_templates(
+            emb_enroll, lab_enroll,
+            provenance=template_provenance,
+            num_templates_per_identity=num_templates_per_identity,
+            template_selection_method=template_selection_method,
+            max_beats=template_size,
+        )
+
+        emb_probe, lab_probe = _get_embeddings(model, probe_loader, device)
+        raw_scores = _compute_score_matrix(emb_probe, mt_templates, method=matching_method)
+
+        if probe_fusion_size > 1:
+            fused_template_scores, fused_probe_labels, fusion_diagnostics = _apply_score_fusion(
+                raw_scores, lab_probe, fusion_size=probe_fusion_size,
+                provenance=provenance_probe, return_diagnostics=True,
+            )
+        else:
+            fused_template_scores = raw_scores
+            fused_probe_labels = lab_probe
+            fusion_diagnostics = {
+                "fusion_size": 1,
+                "raw_probe_observations": int(len(lab_probe)),
+                "fused_probe_decisions": int(len(lab_probe)),
+                "dropped_remainder_observations": 0,
+                "source_blocks_below_fusion_size": 0,
+                "identities_without_a_fused_decision": 0,
+            }
+
+        if probe_fusion_size > 1 and len(fused_probe_labels) == 0:
+            raise ValueError(
+                "Probe fusion produced no complete fused decisions for any "
+                "identity: with the configured probe fusion size no source "
+                "segment holds enough probe beats to form a group. Reduce the "
+                "probe fusion size or provide more probe data."
+            )
+
+        identity_order = np.arange(len(classes))
+        final_scores = _reduce_template_scores_to_identities(
+            fused_template_scores, mt_template_identities, identity_order,
+            template_score_aggregation=template_score_aggregation,
+        )
+        final_labels = fused_probe_labels
+
+        model.include_top = True
+    elif not use_template:
         # STRATEGY A: Standard Softmax Classification
         print("[INFO] Bypassing templates. Using the classifier fitted on training data...")
         model.eval()
@@ -7880,20 +8486,21 @@ def run_cross_session_identification(x_train, y_train, x_test, y_test, model_cla
     # ====================================================
     # 7. APPLY SCORE-LEVEL FUSION
     # ====================================================
-    final_scores, final_labels, fusion_diagnostics = _apply_score_fusion(
-        final_scores,
-        final_labels,
-        fusion_size=probe_fusion_size,
-        provenance=provenance_probe,
-        return_diagnostics=True,
-    )
-    if probe_fusion_size > 1 and len(final_labels) == 0:
-        raise ValueError(
-            "Probe fusion produced no complete fused decisions for any "
-            "identity: with the configured probe fusion size no source "
-            "segment holds enough probe beats to form a group. Reduce the "
-            "probe fusion size or provide more probe data."
+    if enrollment_template_mode != "multi_template":
+        final_scores, final_labels, fusion_diagnostics = _apply_score_fusion(
+            final_scores,
+            final_labels,
+            fusion_size=probe_fusion_size,
+            provenance=provenance_probe,
+            return_diagnostics=True,
         )
+        if probe_fusion_size > 1 and len(final_labels) == 0:
+            raise ValueError(
+                "Probe fusion produced no complete fused decisions for any "
+                "identity: with the configured probe fusion size no source "
+                "segment holds enough probe beats to form a group. Reduce the "
+                "probe fusion size or provide more probe data."
+            )
 
     if visualize and use_template:
         viz = Visualizer()
@@ -7926,6 +8533,8 @@ def run_cross_session_identification(x_train, y_train, x_test, y_test, model_cla
         "Probe Samples": len(x_test_filtered),
         "Probe Fusion": fusion_diagnostics,
     }
+    if template_diagnostics is not None:
+        data_stats["Enrollment Templates"] = template_diagnostics
 
     if _return_stats:
         return (rank1, rank5), data_stats, hyperparams
@@ -7959,7 +8568,7 @@ def run_cross_session_identification(x_train, y_train, x_test, y_test, model_cla
 def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class, epochs=150, 
                                    batch_size=256, lr=1e-3, val_split=0.0, num_pairs=None,
                                    sampling_mode=None, seed=42, device=None, visualize=False,
-                                   use_template=False, template_fusion_method='mean', template_size=None, 
+                                   use_template=False, template_fusion_method=_UNSET, template_size=None,
                                    matching_method='cosine', outlier_filtering_on_train=False, 
                                    outlier_filtering_on_test=False, sqi_train=None, sqi_test=None, 
                                    sqi_threshold=0.05, sqi_keep_pct=0.8, use_deployment_evaluation=False,
@@ -7974,7 +8583,9 @@ def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class
         pair_sampling_mode=None,
         max_impostor_pairs=1000000,
         pair_sampling_seed=42,
-        probe_fusion_size=1):
+        probe_fusion_size=1,
+        enrollment_template_mode='fusion', num_templates_per_identity=None,
+        template_selection_method=None, template_score_aggregation=None):
     """
     Cross-session verification with protocol-defined data roles.
 
@@ -8026,6 +8637,22 @@ def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class
         tuple: (EER, AUC, d-prime, TAR @ 0.1% FAR)
                If n_runs > 1, returns tuples of (Mean, Std_Dev) for all four metrics.
     """
+
+    (
+        enrollment_template_mode,
+        num_templates_per_identity,
+        template_selection_method,
+        template_score_aggregation,
+    ) = _validate_multi_template_arguments(
+        enrollment_template_mode,
+        template_fusion_method,
+        num_templates_per_identity,
+        template_selection_method,
+        template_score_aggregation,
+        use_template,
+        use_deployment_evaluation,
+        "Cross-Session Verification",
+    )
 
     _validate_deployment_evaluation(
         use_deployment_evaluation,
@@ -8191,6 +8818,20 @@ def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class
     hyperparams[
         "augmentation"
     ] = augmentation_config
+
+    if enrollment_template_mode == "fusion":
+        if template_fusion_method is _UNSET:
+            template_fusion_method = "mean"
+    else:
+        template_fusion_method = None
+
+    hyperparams["enrollment_template_mode"] = enrollment_template_mode
+    hyperparams["template_fusion_method"] = template_fusion_method
+
+    if enrollment_template_mode == "multi_template":
+        hyperparams["num_templates_per_identity"] = num_templates_per_identity
+        hyperparams["template_selection_method"] = template_selection_method
+        hyperparams["template_score_aggregation"] = template_score_aggregation
 
     _set_seed(seed); device = _get_device(device)
     resolved_split_seed = seed if split_seed is None else split_seed
@@ -8531,8 +9172,49 @@ def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class
     emb_probe, lab_probe = _get_embeddings(model, probe_loader, device)
 
     fusion_diagnostics = None
+    template_diagnostics = None
 
-    if not use_template:
+    if enrollment_template_mode == "multi_template":
+        print(
+            "[INFO] Building multi-template gallery "
+            f"({num_templates_per_identity} templates/identity, "
+            f"{template_selection_method})..."
+        )
+        enroll_loader = _make_loader(
+            x_enroll_filtered,
+            y_enroll_enc,
+            batch_size,
+            shuffle=False,
+        )
+        emb_enroll, lab_enroll = _get_embeddings(model, enroll_loader, device)
+        (
+            mt_templates,
+            mt_template_identities,
+            mt_template_source_indices,
+            template_diagnostics,
+        ) = _select_multi_templates(
+            emb_enroll, lab_enroll,
+            provenance=template_provenance,
+            num_templates_per_identity=num_templates_per_identity,
+            template_selection_method=template_selection_method,
+            max_beats=template_size,
+        )
+        scores, labels_pair, fusion_diagnostics = _generate_multi_template_verification_pairs(
+            probe_embeddings=emb_probe,
+            probe_labels=lab_probe,
+            probe_provenance=provenance_probe,
+            template_embeddings=mt_templates,
+            template_identities=mt_template_identities,
+            num_templates_per_identity=num_templates_per_identity,
+            probe_fusion_size=probe_fusion_size,
+            matching_method=matching_method,
+            pair_sampling_mode=pair_sampling_mode,
+            pair_sampling_budget=pair_sampling_budget,
+            max_impostor_pairs=max_impostor_pairs,
+            pair_sampling_seed=pair_sampling_seed,
+            template_score_aggregation=template_score_aggregation,
+        )
+    elif not use_template:
         # STRATEGY A: probe-only verification
         print("[INFO] Bypassing templates. Generating verification pairs from probe data...")
         scores, labels_pair = _generate_pairs(
@@ -8640,6 +9322,8 @@ def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class
 
     if fusion_diagnostics is not None:
         data_stats["Probe Fusion"] = fusion_diagnostics
+    if template_diagnostics is not None:
+        data_stats["Enrollment Templates"] = template_diagnostics
 
     if _return_stats:
         return (
@@ -8674,13 +9358,15 @@ def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class
 # =============================================================================
 def run_subject_disjoint_cross_session_identification(
         x_s1, y_s1, x_s2, y_s2, model_class, epochs=150, batch_size=256, lr=1e-3, test_split=0.2, val_split=0.0, 
-        seed=42, device=None, visualize=False, use_template=True, template_fusion_method='mean', template_size=None, 
+        seed=42, device=None, visualize=False, use_template=True, template_fusion_method=_UNSET, template_size=None,
         matching_method='cosine', outlier_filtering_on_train=False, outlier_filtering_on_test=False, sqi_s1=None, 
         sqi_s2=None, sqi_threshold=0.05, sqi_keep_pct=0.8, probe_fusion_size=1, save_results_and_settings=False,
         loader=None, n_runs=1, _return_stats=False,
         intelligent_weight_loading=True,
         augmentation_config=None, split_seed=None, provenance_s1=None, provenance_s2=None,
-        x_enroll=None, y_enroll=None, provenance_enroll=None):
+        x_enroll=None, y_enroll=None, provenance_enroll=None,
+        enrollment_template_mode='fusion', num_templates_per_identity=None,
+        template_selection_method=None, template_score_aggregation=None):
     """
     Subject-disjoint cross-session identification.
     1. Fits a feature extractor using the training role for Subject Group A.
@@ -8730,6 +9416,22 @@ def run_subject_disjoint_cross_session_identification(
                If n_runs > 1, returns tuples of (Mean, Std_Dev) for both metrics.
     """
     
+    (
+        enrollment_template_mode,
+        num_templates_per_identity,
+        template_selection_method,
+        template_score_aggregation,
+    ) = _validate_multi_template_arguments(
+        enrollment_template_mode,
+        template_fusion_method,
+        num_templates_per_identity,
+        template_selection_method,
+        template_score_aggregation,
+        use_template,
+        False,
+        "Subject-Disjoint Cross-Session Identification",
+    )
+
     # ====================================================
     # 0. Capture Hyperparameters for Logger & MULTI-RUN AGGREGATOR
     # ====================================================
@@ -8851,6 +9553,20 @@ def run_subject_disjoint_cross_session_identification(
     hyperparams[
         "augmentation"
     ] = augmentation_config
+
+    if enrollment_template_mode == "fusion":
+        if template_fusion_method is _UNSET:
+            template_fusion_method = "mean"
+    else:
+        template_fusion_method = None
+
+    hyperparams["enrollment_template_mode"] = enrollment_template_mode
+    hyperparams["template_fusion_method"] = template_fusion_method
+
+    if enrollment_template_mode == "multi_template":
+        hyperparams["num_templates_per_identity"] = num_templates_per_identity
+        hyperparams["template_selection_method"] = template_selection_method
+        hyperparams["template_score_aggregation"] = template_score_aggregation
 
     _set_seed(seed); device = _get_device(device)
     resolved_split_seed = seed if split_seed is None else split_seed
@@ -9170,41 +9886,100 @@ def run_subject_disjoint_cross_session_identification(
     enroll_loader = _make_loader(X_enroll, y_enroll_enc, batch_size, shuffle=False)
     emb_enroll, lab_enroll = _get_embeddings(model, enroll_loader, device)
     
-    gallery_emb, gallery_lab = _create_templates(
-        emb_enroll, lab_enroll, method=template_fusion_method, max_beats=template_size, provenance=template_provenance
-    )
+    template_diagnostics = None
 
-    print("[INFO] Evaluating unseen subjects with probe data...")
-    probe_loader = _make_loader(X_probe, y_probe_enc, batch_size, shuffle=False)
-    emb_probe, lab_probe = _get_embeddings(model, probe_loader, device)
-
-    # Because we mapped y_enroll_enc and y_probe_enc to integers, 
-    # gallery_lab and lab_probe are already perfectly aligned from 0 to N-1!
-    raw_scores = _compute_score_matrix(emb_probe, gallery_emb, method=matching_method)
-    scores = np.full((len(emb_probe), len(test_subs)), -np.inf)
-    
-    for class_idx in range(len(test_subs)):
-        gallery_mask = (gallery_lab == class_idx)
-        if np.any(gallery_mask):
-            scores[:, class_idx] = np.max(raw_scores[:, gallery_mask], axis=1)
-
-    # ====================================================
-    # 6. APPLY SCORE-LEVEL FUSION & EVALUATE
-    # ====================================================
-    final_scores, final_labels, fusion_diagnostics = _apply_score_fusion(
-        scores,
-        lab_probe,
-        fusion_size=probe_fusion_size,
-        provenance=provenance_probe,
-        return_diagnostics=True,
-    )
-    if probe_fusion_size > 1 and len(final_labels) == 0:
-        raise ValueError(
-            "Probe fusion produced no complete fused decisions for any "
-            "identity: with the configured probe fusion size no source "
-            "segment holds enough probe beats to form a group. Reduce the "
-            "probe fusion size or provide more probe data."
+    if enrollment_template_mode == "multi_template":
+        print(
+            "[INFO] Building multi-template gallery "
+            f"({num_templates_per_identity} templates/identity, "
+            f"{template_selection_method})..."
         )
+        (
+            mt_templates,
+            mt_template_identities,
+            mt_template_source_indices,
+            template_diagnostics,
+        ) = _select_multi_templates(
+            emb_enroll, lab_enroll,
+            provenance=template_provenance,
+            num_templates_per_identity=num_templates_per_identity,
+            template_selection_method=template_selection_method,
+            max_beats=template_size,
+        )
+
+        print("[INFO] Evaluating unseen subjects with probe data...")
+        probe_loader = _make_loader(X_probe, y_probe_enc, batch_size, shuffle=False)
+        emb_probe, lab_probe = _get_embeddings(model, probe_loader, device)
+
+        raw_scores = _compute_score_matrix(emb_probe, mt_templates, method=matching_method)
+
+        if probe_fusion_size > 1:
+            fused_template_scores, fused_probe_labels, fusion_diagnostics = _apply_score_fusion(
+                raw_scores, lab_probe, fusion_size=probe_fusion_size,
+                provenance=provenance_probe, return_diagnostics=True,
+            )
+        else:
+            fused_template_scores = raw_scores
+            fused_probe_labels = lab_probe
+            fusion_diagnostics = {
+                "fusion_size": 1,
+                "raw_probe_observations": int(len(lab_probe)),
+                "fused_probe_decisions": int(len(lab_probe)),
+                "dropped_remainder_observations": 0,
+                "source_blocks_below_fusion_size": 0,
+                "identities_without_a_fused_decision": 0,
+            }
+
+        if probe_fusion_size > 1 and len(fused_probe_labels) == 0:
+            raise ValueError(
+                "Probe fusion produced no complete fused decisions for any "
+                "identity: with the configured probe fusion size no source "
+                "segment holds enough probe beats to form a group. Reduce the "
+                "probe fusion size or provide more probe data."
+            )
+
+        identity_order = np.arange(len(test_subs))
+        final_scores = _reduce_template_scores_to_identities(
+            fused_template_scores, mt_template_identities, identity_order,
+            template_score_aggregation=template_score_aggregation,
+        )
+        final_labels = fused_probe_labels
+    else:
+        gallery_emb, gallery_lab = _create_templates(
+            emb_enroll, lab_enroll, method=template_fusion_method, max_beats=template_size, provenance=template_provenance
+        )
+
+        print("[INFO] Evaluating unseen subjects with probe data...")
+        probe_loader = _make_loader(X_probe, y_probe_enc, batch_size, shuffle=False)
+        emb_probe, lab_probe = _get_embeddings(model, probe_loader, device)
+
+        # Because we mapped y_enroll_enc and y_probe_enc to integers,
+        # gallery_lab and lab_probe are already perfectly aligned from 0 to N-1!
+        raw_scores = _compute_score_matrix(emb_probe, gallery_emb, method=matching_method)
+        scores = np.full((len(emb_probe), len(test_subs)), -np.inf)
+    
+        for class_idx in range(len(test_subs)):
+            gallery_mask = (gallery_lab == class_idx)
+            if np.any(gallery_mask):
+                scores[:, class_idx] = np.max(raw_scores[:, gallery_mask], axis=1)
+
+        # ====================================================
+        # 6. APPLY SCORE-LEVEL FUSION & EVALUATE
+        # ====================================================
+        final_scores, final_labels, fusion_diagnostics = _apply_score_fusion(
+            scores,
+            lab_probe,
+            fusion_size=probe_fusion_size,
+            provenance=provenance_probe,
+            return_diagnostics=True,
+        )
+        if probe_fusion_size > 1 and len(final_labels) == 0:
+            raise ValueError(
+                "Probe fusion produced no complete fused decisions for any "
+                "identity: with the configured probe fusion size no source "
+                "segment holds enough probe beats to form a group. Reduce the "
+                "probe fusion size or provide more probe data."
+            )
 
     if visualize:
         viz = Visualizer()
@@ -9235,6 +10010,8 @@ def run_subject_disjoint_cross_session_identification(
         "Probe Samples": len(X_probe),
         "Probe Fusion": fusion_diagnostics,
     }
+    if template_diagnostics is not None:
+        data_stats["Enrollment Templates"] = template_diagnostics
 
     if _return_stats:
         return (rank1, rank5), data_stats, hyperparams
@@ -9268,7 +10045,7 @@ def run_subject_disjoint_cross_session_identification(
 def run_subject_disjoint_cross_session_verification(
         x_s1, y_s1, x_s2, y_s2, model_class, epochs=150, batch_size=256, lr=1e-3, test_split=0.2, val_split=0.0, 
         num_pairs=None, sampling_mode=None, seed=42, device=None, visualize=False, use_template=False,
-        template_fusion_method='mean', template_size=None, matching_method='cosine', outlier_filtering_on_train=False, 
+        template_fusion_method=_UNSET, template_size=None, matching_method='cosine', outlier_filtering_on_train=False,
         outlier_filtering_on_test=False, sqi_s1=None, sqi_s2=None, sqi_threshold=0.05, sqi_keep_pct=0.8,
         use_deployment_evaluation=False, target_fars=None,
         save_results_and_settings=False, loader=None, n_runs=1, _return_stats=False,
@@ -9280,7 +10057,9 @@ def run_subject_disjoint_cross_session_verification(
         pair_sampling_mode=None,
         max_impostor_pairs=1000000,
         pair_sampling_seed=42,
-        probe_fusion_size=1):
+        probe_fusion_size=1,
+        enrollment_template_mode='fusion', num_templates_per_identity=None,
+        template_selection_method=None, template_score_aggregation=None):
     """
     Subject-disjoint cross-session verification.
 
@@ -9334,6 +10113,22 @@ def run_subject_disjoint_cross_session_verification(
         tuple: (EER, AUC, d-prime, TAR @ 0.1% FAR)
                If n_runs > 1, returns tuples of (Mean, Std_Dev) for all four metrics.
     """
+
+    (
+        enrollment_template_mode,
+        num_templates_per_identity,
+        template_selection_method,
+        template_score_aggregation,
+    ) = _validate_multi_template_arguments(
+        enrollment_template_mode,
+        template_fusion_method,
+        num_templates_per_identity,
+        template_selection_method,
+        template_score_aggregation,
+        use_template,
+        use_deployment_evaluation,
+        "Subject-Disjoint Cross-Session Verification",
+    )
 
     _validate_deployment_evaluation(
         use_deployment_evaluation,
@@ -9502,6 +10297,20 @@ def run_subject_disjoint_cross_session_verification(
     hyperparams[
         "augmentation"
     ] = augmentation_config
+
+    if enrollment_template_mode == "fusion":
+        if template_fusion_method is _UNSET:
+            template_fusion_method = "mean"
+    else:
+        template_fusion_method = None
+
+    hyperparams["enrollment_template_mode"] = enrollment_template_mode
+    hyperparams["template_fusion_method"] = template_fusion_method
+
+    if enrollment_template_mode == "multi_template":
+        hyperparams["num_templates_per_identity"] = num_templates_per_identity
+        hyperparams["template_selection_method"] = template_selection_method
+        hyperparams["template_score_aggregation"] = template_score_aggregation
 
     _set_seed(seed); device = _get_device(device)
     resolved_split_seed = seed if split_seed is None else split_seed
@@ -9849,8 +10658,44 @@ def run_subject_disjoint_cross_session_verification(
     emb_probe, lab_probe = _get_embeddings(model, probe_loader, device)
 
     fusion_diagnostics = None
+    template_diagnostics = None
 
-    if not use_template:
+    if enrollment_template_mode == "multi_template":
+        print(
+            "[INFO] Building multi-template gallery "
+            f"({num_templates_per_identity} templates/identity, "
+            f"{template_selection_method})..."
+        )
+        enroll_loader = _make_loader(X_enroll, y_enroll_enc, batch_size, shuffle=False)
+        emb_enroll, lab_enroll = _get_embeddings(model, enroll_loader, device)
+        (
+            mt_templates,
+            mt_template_identities,
+            mt_template_source_indices,
+            template_diagnostics,
+        ) = _select_multi_templates(
+            emb_enroll, lab_enroll,
+            provenance=template_provenance,
+            num_templates_per_identity=num_templates_per_identity,
+            template_selection_method=template_selection_method,
+            max_beats=template_size,
+        )
+        scores, labels_pair, fusion_diagnostics = _generate_multi_template_verification_pairs(
+            probe_embeddings=emb_probe,
+            probe_labels=lab_probe,
+            probe_provenance=provenance_probe,
+            template_embeddings=mt_templates,
+            template_identities=mt_template_identities,
+            num_templates_per_identity=num_templates_per_identity,
+            probe_fusion_size=probe_fusion_size,
+            matching_method=matching_method,
+            pair_sampling_mode=pair_sampling_mode,
+            pair_sampling_budget=pair_sampling_budget,
+            max_impostor_pairs=max_impostor_pairs,
+            pair_sampling_seed=pair_sampling_seed,
+            template_score_aggregation=template_score_aggregation,
+        )
+    elif not use_template:
         print("[INFO] Bypassing templates. Generating verification pairs from probe data for unseen subjects...")
         scores, labels_pair = _generate_pairs(
             embeddings1=emb_probe, labels1=lab_probe, 
@@ -9951,6 +10796,8 @@ def run_subject_disjoint_cross_session_verification(
 
     if fusion_diagnostics is not None:
         data_stats["Probe Fusion"] = fusion_diagnostics
+    if template_diagnostics is not None:
+        data_stats["Enrollment Templates"] = template_diagnostics
 
     if _return_stats:
         return (
