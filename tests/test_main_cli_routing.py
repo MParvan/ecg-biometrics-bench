@@ -384,6 +384,12 @@ class MainCLIRoutingTests(unittest.TestCase):
                 keyword_arguments["sqi_scores"],
                 "kurtosis",
             )
+            self.assertEqual(
+                keyword_arguments[
+                    "probe_fusion_size"
+                ],
+                2,
+            )
 
         elif task == 5:
             self.assertEqual(
@@ -422,6 +428,12 @@ class MainCLIRoutingTests(unittest.TestCase):
             self.assertEqual(
                 keyword_arguments["sqi_test"],
                 "kurtosis",
+            )
+            self.assertEqual(
+                keyword_arguments[
+                    "probe_fusion_size"
+                ],
+                2,
             )
 
         elif task == 7:
@@ -469,6 +481,12 @@ class MainCLIRoutingTests(unittest.TestCase):
             self.assertEqual(
                 keyword_arguments["sqi_s2"],
                 "kurtosis",
+            )
+            self.assertEqual(
+                keyword_arguments[
+                    "probe_fusion_size"
+                ],
+                2,
             )
 
     def test_all_eight_tasks_route_to_correct_runner(self):

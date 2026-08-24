@@ -2383,8 +2383,8 @@ def get_parser():
     eval_group.add_argument(
         '--probe_fusion_size',
         type=int,
-        default=3,
-        help="Number of probe scores to fuse for identification tasks."
+        default=1,
+        help="Score-level probe fusion depth for identification and template-based verification tasks. Defaults to 1, which scores each probe beat as a single decision; values above 1 average that many probe scores from consecutive observations within one source block into one fused decision. Verification requires use_template=True and does not compose with use_deployment_evaluation."
     )
 
     eval_group.add_argument(
@@ -2948,6 +2948,7 @@ def main():
                 pair_sampling_seed=args.pair_sampling_seed,
                 use_deployment_evaluation=args.use_deployment_evaluation,
                 target_fars=args.target_fars,
+                probe_fusion_size=args.probe_fusion_size,
                 sqi_scores=args.sqi_method,
                 provenance=provenance,
                 **common_args
@@ -2975,6 +2976,7 @@ def main():
                 pair_sampling_seed=args.pair_sampling_seed,
                 use_deployment_evaluation=args.use_deployment_evaluation,
                 target_fars=args.target_fars,
+                probe_fusion_size=args.probe_fusion_size,
                 sqi_scores=args.sqi_method,
                 provenance=provenance,
                 **common_args
@@ -3005,6 +3007,7 @@ def main():
                 pair_sampling_seed=args.pair_sampling_seed,
                 use_deployment_evaluation=args.use_deployment_evaluation,
                 target_fars=args.target_fars,
+                probe_fusion_size=args.probe_fusion_size,
                 sqi_train=args.sqi_method,
                 sqi_test=args.sqi_method,
                 provenance_s1=provenance_train,
@@ -3042,6 +3045,7 @@ def main():
                 pair_sampling_seed=args.pair_sampling_seed,
                 use_deployment_evaluation=args.use_deployment_evaluation,
                 target_fars=args.target_fars,
+                probe_fusion_size=args.probe_fusion_size,
                 sqi_s1=args.sqi_method,
                 sqi_s2=args.sqi_method,
                 provenance_s1=provenance_train,

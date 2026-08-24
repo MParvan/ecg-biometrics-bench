@@ -47,7 +47,7 @@ from scipy.interpolate import interp1d
 from scipy import stats
 
 from utils import (
-    _apply_score_fusion, _source_order_indices, _make_loader, _encode_labels, _get_device, _set_seed,
+    _apply_score_fusion, _generate_fused_verification_pairs, _source_order_indices, _make_loader, _encode_labels, _get_device, _set_seed,
     _apply_outlier_filter, _compute_sqi, _compute_score_matrix,
     _get_embeddings, _create_templates, _generate_pairs, _resolve_pair_sampling_arguments,
     _find_optimal_threshold, _evaluate_with_global_threshold, _summarize_verification_pairs,
@@ -344,6 +344,9 @@ _ORIGINAL_GENERATE_PAIRS = (
 _ORIGINAL_APPLY_SCORE_FUSION = (
     _apply_score_fusion
 )
+_ORIGINAL_GENERATE_FUSED_VERIFICATION_PAIRS = (
+    _generate_fused_verification_pairs
+)
 _ORIGINAL_COMPUTE_METRICS_IDENTIFICATION = (
     _compute_metrics_identification
 )
@@ -387,6 +390,11 @@ _generate_pairs = _make_runtime_wrapper(
 _apply_score_fusion = _make_runtime_wrapper(
     "Probe Fusion",
     _ORIGINAL_APPLY_SCORE_FUSION,
+)
+
+_generate_fused_verification_pairs = _make_runtime_wrapper(
+    "Probe Fusion",
+    _ORIGINAL_GENERATE_FUSED_VERIFICATION_PAIRS,
 )
 
 _compute_metrics_identification = (
@@ -1849,6 +1857,55 @@ def _validate_deployment_evaluation(
             "0 < val_split < 1. Training-data threshold calibration "
             "is not permitted."
         )
+
+
+def _validate_verification_probe_fusion(
+    probe_fusion_size,
+    use_template,
+    use_deployment_evaluation,
+    task_name,
+):
+    """
+    Validate probe_fusion_size for a verification runner.
+
+    Multi-beat probe fusion (probe_fusion_size > 1) requires an explicit
+    enrollment target and does not compose with threshold-calibrated
+    deployment evaluation. probe_fusion_size == 1 preserves the standard
+    verification pair-generation path exactly.
+    """
+    try:
+        depth = int(probe_fusion_size)
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            f"{task_name}: 'probe_fusion_size' must be an integer greater "
+            f"than or equal to 1, received {probe_fusion_size!r}."
+        ) from error
+
+    if depth < 1:
+        raise ValueError(
+            f"{task_name}: 'probe_fusion_size' must be an integer greater "
+            f"than or equal to 1, received {depth}."
+        )
+
+    if depth > 1:
+        if not use_template:
+            raise ValueError(
+                f"{task_name}: multi-beat probe fusion "
+                "(probe_fusion_size > 1) requires use_template=True so "
+                "that a distinct enrollment target is defined for the "
+                "fused decision."
+            )
+        if use_deployment_evaluation:
+            raise ValueError(
+                f"{task_name}: multi-beat probe fusion "
+                "(probe_fusion_size > 1) is not compatible with "
+                "use_deployment_evaluation. Calibrate the deployment "
+                "threshold at probe_fusion_size = 1 and study probe "
+                "fusion depths as a separate evaluation."
+            )
+
+    return depth
+
 
 def _split_subject_cohorts(
     subjects,
@@ -4659,7 +4716,7 @@ def run_closed_set_identification(x, y, model_class, epochs=150, batch_size=256,
                                   template_fusion_method='mean', template_size=None,
                                   matching_method='cosine', outlier_filtering_on_train=False,
                                   outlier_filtering_on_test=False, sqi_scores=None,
-                                  sqi_threshold=0.05, sqi_keep_pct=0.8, probe_fusion_size=3,
+                                  sqi_threshold=0.05, sqi_keep_pct=0.8, probe_fusion_size=1,
                                   save_results_and_settings=False, loader=None, 
                                   n_runs=1, _return_stats=False,
                                   intelligent_weight_loading=True,
@@ -5260,7 +5317,8 @@ def run_closed_set_verification(x, y, model_class, epochs=150, batch_size=256, l
         pair_sampling_budget=None,
         pair_sampling_mode=None,
         max_impostor_pairs=1000000,
-        pair_sampling_seed=42):
+        pair_sampling_seed=42,
+        probe_fusion_size=1):
     """
     Standard Closed-Set Verification Pipeline (Intra-session).
     Determines "Is this person who they claim to be?" (1:1 matching) for subjects known to the model.
@@ -5316,6 +5374,13 @@ def run_closed_set_verification(x, y, model_class, epochs=150, batch_size=256, l
         "Closed-Set Verification",
     )
 
+    probe_fusion_size = _validate_verification_probe_fusion(
+        probe_fusion_size,
+        use_template,
+        use_deployment_evaluation,
+        "Closed-Set Verification",
+    )
+
     (
         pair_sampling_mode,
         pair_sampling_budget,
@@ -5365,14 +5430,13 @@ def run_closed_set_verification(x, y, model_class, epochs=150, batch_size=256, l
                 else None
             ),
             "pair_sampling_seed": (
-                pair_sampling_seed
-                if pair_sampling_mode in {
-                    "all_genuine",
-                    "balanced",
-                    "random",
-                }
+                (42 if pair_sampling_seed is None else pair_sampling_seed)
+                if pair_sampling_mode == "all_genuine"
+                else pair_sampling_seed
+                if pair_sampling_mode in {"balanced", "random"}
                 else None
             ),
+            "probe_fusion_size": probe_fusion_size,
         }
     )
 
@@ -5544,9 +5608,13 @@ def run_closed_set_verification(x, y, model_class, epochs=150, batch_size=256, l
     ]
 
     provenance_train = None
+    provenance_test = None
     if provenance is not None:
         provenance_train = provenance.subset(
             train_test_partitions["indices"]["retained"]
+        )
+        provenance_test = provenance.subset(
+            train_test_partitions["indices"]["holdout"]
         )
 
     # ====================================================
@@ -5568,9 +5636,17 @@ def run_closed_set_verification(x, y, model_class, epochs=150, batch_size=256, l
 
     if outlier_filtering_on_test and sqi_test is not None:
         print("\n[INFO] Filtering Test Set (Probes)...")
-        X_test, y_test = _apply_outlier_filter(
-            X_test, y_test, sqi_test, absolute_threshold=sqi_threshold, keep_percentage=sqi_keep_pct, apply_subject_ranking=False
-        )
+        if provenance_test is not None:
+            X_test, y_test, retained_indices = _apply_outlier_filter(
+                X_test, y_test, sqi_test, absolute_threshold=sqi_threshold,
+                keep_percentage=sqi_keep_pct, apply_subject_ranking=False,
+                return_indices=True,
+            )
+            provenance_test = provenance_test.subset(retained_indices)
+        else:
+            X_test, y_test = _apply_outlier_filter(
+                X_test, y_test, sqi_test, absolute_threshold=sqi_threshold, keep_percentage=sqi_keep_pct, apply_subject_ranking=False
+            )
 
     # ====================================================
     # 5. CLASS SYNCHRONIZATION & ENCODING
@@ -5588,6 +5664,8 @@ def run_closed_set_verification(x, y, model_class, epochs=150, batch_size=256, l
         print(f"[WARN] Dropping {orphaned_test_beats} Test beats because their corresponding Train subjects were filtered out.")
 
     X_test, y_test = X_test[test_mask], y_test[test_mask]
+    if provenance_test is not None:
+        provenance_test = provenance_test.subset(test_mask)
 
     if len(valid_train_classes) < 2:
         raise ValueError("[ERROR] Data filtering was too aggressive. Not enough subjects left to continue!")
@@ -5752,6 +5830,8 @@ def run_closed_set_verification(x, y, model_class, epochs=150, batch_size=256, l
     # ====================================================
     # 9. EVALUATION STRATEGY
     # ====================================================
+    fusion_diagnostics = None
+
     if not use_template:
         # STRATEGY A: Test vs Test (Intra-session unseen evaluation)
         print(f"[INFO] Bypassing Templates. Generating pairs exclusively from Test split...")
@@ -5776,15 +5856,30 @@ def run_closed_set_verification(x, y, model_class, epochs=150, batch_size=256, l
             max_beats=template_size, provenance=provenance_train
         )
         
-        scores, labels_pair = _generate_pairs(
-            embeddings1=test_emb, # Probes
-            labels1=test_lab, 
-            embeddings2=templates, # Enrollment
-            labels2=temp_labels, 
-            pair_sampling_budget=pair_sampling_budget,
-            pair_sampling_mode=pair_sampling_mode,
-            max_impostor_pairs=max_impostor_pairs, pair_sampling_seed=pair_sampling_seed, matching_method=matching_method
-        )
+        if probe_fusion_size > 1:
+            scores, labels_pair, fusion_diagnostics = _generate_fused_verification_pairs(
+                probe_embeddings=test_emb,
+                probe_labels=test_lab,
+                probe_provenance=provenance_test,
+                template_embeddings=templates,
+                template_identities=temp_labels,
+                group_size=probe_fusion_size,
+                matching_method=matching_method,
+                pair_sampling_mode=pair_sampling_mode,
+                pair_sampling_budget=pair_sampling_budget,
+                max_impostor_pairs=max_impostor_pairs,
+                pair_sampling_seed=pair_sampling_seed,
+            )
+        else:
+            scores, labels_pair = _generate_pairs(
+                embeddings1=test_emb, # Probes
+                labels1=test_lab,
+                embeddings2=templates, # Enrollment
+                labels2=temp_labels,
+                pair_sampling_budget=pair_sampling_budget,
+                pair_sampling_mode=pair_sampling_mode,
+                max_impostor_pairs=max_impostor_pairs, pair_sampling_seed=pair_sampling_seed, matching_method=matching_method
+            )
         
     if visualize:
         viz = Visualizer()
@@ -5831,6 +5926,9 @@ def run_closed_set_verification(x, y, model_class, epochs=150, batch_size=256, l
         )
     )
 
+    if fusion_diagnostics is not None:
+        data_stats["Probe Fusion"] = fusion_diagnostics
+
     if _return_stats:
         return (
             eer,
@@ -5867,7 +5965,7 @@ def run_subject_disjoint_identification(x, y, model_class, epochs=150, batch_siz
                                         template_fusion_method='mean', template_size=1, 
                                         matching_method='cosine', outlier_filtering_on_train=False, 
                                         outlier_filtering_on_test=False, sqi_scores=None, 
-                                        sqi_threshold=0.05, sqi_keep_pct=0.8, probe_fusion_size=3, 
+                                        sqi_threshold=0.05, sqi_keep_pct=0.8, probe_fusion_size=1,
                                         save_results_and_settings=False, loader=None, 
                                         n_runs=1, _return_stats=False,
                                         intelligent_weight_loading=True,
@@ -6492,7 +6590,8 @@ def run_subject_disjoint_verification(x, y, model_class, epochs=150, batch_size=
         pair_sampling_budget=None,
         pair_sampling_mode=None,
         max_impostor_pairs=1000000,
-        pair_sampling_seed=42):
+        pair_sampling_seed=42,
+        probe_fusion_size=1):
     """
     Subject-Disjoint Verification Pipeline (Subject-Disjoint 1:1 Matching).
     Tests the system's ability to verify the identity of completely new users.
@@ -6548,6 +6647,13 @@ def run_subject_disjoint_verification(x, y, model_class, epochs=150, batch_size=
         "Subject-Disjoint Verification",
     )
 
+    probe_fusion_size = _validate_verification_probe_fusion(
+        probe_fusion_size,
+        use_template,
+        use_deployment_evaluation,
+        "Subject-Disjoint Verification",
+    )
+
     (
         pair_sampling_mode,
         pair_sampling_budget,
@@ -6594,14 +6700,13 @@ def run_subject_disjoint_verification(x, y, model_class, epochs=150, batch_size=
                 else None
             ),
             "pair_sampling_seed": (
-                pair_sampling_seed
-                if pair_sampling_mode in {
-                    "all_genuine",
-                    "balanced",
-                    "random",
-                }
+                (42 if pair_sampling_seed is None else pair_sampling_seed)
+                if pair_sampling_mode == "all_genuine"
+                else pair_sampling_seed
+                if pair_sampling_mode in {"balanced", "random"}
                 else None
             ),
+            "probe_fusion_size": probe_fusion_size,
         }
     )
 
@@ -7022,6 +7127,8 @@ def run_subject_disjoint_verification(x, y, model_class, epochs=150, batch_size=
     test_emb, test_lab = _get_embeddings(model, test_loader, device)
 
     # 9. Evaluation Strategy
+    fusion_diagnostics = None
+
     if not use_template:
         print(f"[INFO] Bypassing Templates. Generating pairs entirely from Unseen Test Subjects...")
         scores, labels_pair = _generate_pairs(
@@ -7059,16 +7166,37 @@ def run_subject_disjoint_verification(x, y, model_class, epochs=150, batch_size=
         ) = enrollment_probe_partitions[
             "probe"
         ]
+
+        provenance_probe = None
+        if provenance_test is not None:
+            provenance_probe = provenance_test.subset(
+                enrollment_probe_partitions["indices"]["probe"]
+            )
         
         templates, temp_labels = _create_templates(
             emb_enroll, lab_enroll, method=template_fusion_method, max_beats=None
         )
         
-        scores, labels_pair = _generate_pairs(
-            embeddings1=emb_probe, labels1=lab_probe, 
-            embeddings2=templates, labels2=temp_labels, 
-            pair_sampling_budget=pair_sampling_budget, pair_sampling_mode=pair_sampling_mode, max_impostor_pairs=max_impostor_pairs, pair_sampling_seed=pair_sampling_seed, matching_method=matching_method
-        )
+        if probe_fusion_size > 1:
+            scores, labels_pair, fusion_diagnostics = _generate_fused_verification_pairs(
+                probe_embeddings=emb_probe,
+                probe_labels=lab_probe,
+                probe_provenance=provenance_probe,
+                template_embeddings=templates,
+                template_identities=temp_labels,
+                group_size=probe_fusion_size,
+                matching_method=matching_method,
+                pair_sampling_mode=pair_sampling_mode,
+                pair_sampling_budget=pair_sampling_budget,
+                max_impostor_pairs=max_impostor_pairs,
+                pair_sampling_seed=pair_sampling_seed,
+            )
+        else:
+            scores, labels_pair = _generate_pairs(
+                embeddings1=emb_probe, labels1=lab_probe,
+                embeddings2=templates, labels2=temp_labels,
+                pair_sampling_budget=pair_sampling_budget, pair_sampling_mode=pair_sampling_mode, max_impostor_pairs=max_impostor_pairs, pair_sampling_seed=pair_sampling_seed, matching_method=matching_method
+            )
         
     if visualize:
         viz = Visualizer()
@@ -7117,6 +7245,9 @@ def run_subject_disjoint_verification(x, y, model_class, epochs=150, batch_size=
             target_far=0.001,
         )
     )
+
+    if fusion_diagnostics is not None:
+        data_stats["Probe Fusion"] = fusion_diagnostics
 
     if _return_stats:
         return (
@@ -7242,7 +7373,7 @@ def run_cross_session_identification(x_train, y_train, x_test, y_test, model_cla
                                      template_size=None, matching_method='cosine',
                                      outlier_filtering_on_train=False, outlier_filtering_on_test=False, 
                                      sqi_train=None, sqi_test=None, sqi_threshold=0.05, 
-                                     sqi_keep_pct=0.8, probe_fusion_size=3, save_results_and_settings=False, 
+                                     sqi_keep_pct=0.8, probe_fusion_size=1, save_results_and_settings=False,
                                      loader=None, n_runs=1, _return_stats=False,
                                      intelligent_weight_loading=True,
                                      augmentation_config=None, split_seed=None, provenance_s1=None, provenance_s2=None,
@@ -7842,7 +7973,8 @@ def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class
         pair_sampling_budget=None,
         pair_sampling_mode=None,
         max_impostor_pairs=1000000,
-        pair_sampling_seed=42):
+        pair_sampling_seed=42,
+        probe_fusion_size=1):
     """
     Cross-session verification with protocol-defined data roles.
 
@@ -7900,6 +8032,13 @@ def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class
         val_split,
         "Cross-Session Verification",
     )
+
+    probe_fusion_size = _validate_verification_probe_fusion(
+        probe_fusion_size,
+        use_template,
+        use_deployment_evaluation,
+        "Cross-Session Verification",
+    )
     
     (
         pair_sampling_mode,
@@ -7946,14 +8085,13 @@ def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class
                 else None
             ),
             "pair_sampling_seed": (
-                pair_sampling_seed
-                if pair_sampling_mode in {
-                    "all_genuine",
-                    "balanced",
-                    "random",
-                }
+                (42 if pair_sampling_seed is None else pair_sampling_seed)
+                if pair_sampling_mode == "all_genuine"
+                else pair_sampling_seed
+                if pair_sampling_mode in {"balanced", "random"}
                 else None
             ),
+            "probe_fusion_size": probe_fusion_size,
         }
     )
 
@@ -8392,6 +8530,8 @@ def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class
     # ====================================================
     emb_probe, lab_probe = _get_embeddings(model, probe_loader, device)
 
+    fusion_diagnostics = None
+
     if not use_template:
         # STRATEGY A: probe-only verification
         print("[INFO] Bypassing templates. Generating verification pairs from probe data...")
@@ -8423,15 +8563,30 @@ def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class
             provenance=template_provenance,
         )
         
-        scores, labels_pair = _generate_pairs(
-            embeddings1=emb_probe,
-            labels1=lab_probe, 
-            embeddings2=templates,
-            labels2=temp_labels, 
-            pair_sampling_budget=pair_sampling_budget,
-            pair_sampling_mode=pair_sampling_mode,
-            max_impostor_pairs=max_impostor_pairs, pair_sampling_seed=pair_sampling_seed, matching_method=matching_method
-        )
+        if probe_fusion_size > 1:
+            scores, labels_pair, fusion_diagnostics = _generate_fused_verification_pairs(
+                probe_embeddings=emb_probe,
+                probe_labels=lab_probe,
+                probe_provenance=provenance_probe,
+                template_embeddings=templates,
+                template_identities=temp_labels,
+                group_size=probe_fusion_size,
+                matching_method=matching_method,
+                pair_sampling_mode=pair_sampling_mode,
+                pair_sampling_budget=pair_sampling_budget,
+                max_impostor_pairs=max_impostor_pairs,
+                pair_sampling_seed=pair_sampling_seed,
+            )
+        else:
+            scores, labels_pair = _generate_pairs(
+                embeddings1=emb_probe,
+                labels1=lab_probe,
+                embeddings2=templates,
+                labels2=temp_labels,
+                pair_sampling_budget=pair_sampling_budget,
+                pair_sampling_mode=pair_sampling_mode,
+                max_impostor_pairs=max_impostor_pairs, pair_sampling_seed=pair_sampling_seed, matching_method=matching_method
+            )
 
     if visualize:
         viz = Visualizer()
@@ -8483,6 +8638,9 @@ def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class
         )
     )
 
+    if fusion_diagnostics is not None:
+        data_stats["Probe Fusion"] = fusion_diagnostics
+
     if _return_stats:
         return (
             eer,
@@ -8518,7 +8676,7 @@ def run_subject_disjoint_cross_session_identification(
         x_s1, y_s1, x_s2, y_s2, model_class, epochs=150, batch_size=256, lr=1e-3, test_split=0.2, val_split=0.0, 
         seed=42, device=None, visualize=False, use_template=True, template_fusion_method='mean', template_size=None, 
         matching_method='cosine', outlier_filtering_on_train=False, outlier_filtering_on_test=False, sqi_s1=None, 
-        sqi_s2=None, sqi_threshold=0.05, sqi_keep_pct=0.8, probe_fusion_size=3, save_results_and_settings=False, 
+        sqi_s2=None, sqi_threshold=0.05, sqi_keep_pct=0.8, probe_fusion_size=1, save_results_and_settings=False,
         loader=None, n_runs=1, _return_stats=False,
         intelligent_weight_loading=True,
         augmentation_config=None, split_seed=None, provenance_s1=None, provenance_s2=None,
@@ -9121,7 +9279,8 @@ def run_subject_disjoint_cross_session_verification(
         pair_sampling_budget=None,
         pair_sampling_mode=None,
         max_impostor_pairs=1000000,
-        pair_sampling_seed=42):
+        pair_sampling_seed=42,
+        probe_fusion_size=1):
     """
     Subject-disjoint cross-session verification.
 
@@ -9181,6 +9340,13 @@ def run_subject_disjoint_cross_session_verification(
         val_split,
         "Subject-Disjoint Cross-Session Verification",
     )
+
+    probe_fusion_size = _validate_verification_probe_fusion(
+        probe_fusion_size,
+        use_template,
+        use_deployment_evaluation,
+        "Subject-Disjoint Cross-Session Verification",
+    )
     
     (
         pair_sampling_mode,
@@ -9227,14 +9393,13 @@ def run_subject_disjoint_cross_session_verification(
                 else None
             ),
             "pair_sampling_seed": (
-                pair_sampling_seed
-                if pair_sampling_mode in {
-                    "all_genuine",
-                    "balanced",
-                    "random",
-                }
+                (42 if pair_sampling_seed is None else pair_sampling_seed)
+                if pair_sampling_mode == "all_genuine"
+                else pair_sampling_seed
+                if pair_sampling_mode in {"balanced", "random"}
                 else None
             ),
+            "probe_fusion_size": probe_fusion_size,
         }
     )
 
@@ -9683,6 +9848,8 @@ def run_subject_disjoint_cross_session_verification(
     probe_loader = _make_loader(X_probe, y_probe_enc, batch_size, shuffle=False)
     emb_probe, lab_probe = _get_embeddings(model, probe_loader, device)
 
+    fusion_diagnostics = None
+
     if not use_template:
         print("[INFO] Bypassing templates. Generating verification pairs from probe data for unseen subjects...")
         scores, labels_pair = _generate_pairs(
@@ -9703,15 +9870,30 @@ def run_subject_disjoint_cross_session_verification(
             provenance=template_provenance,
         )
         
-        scores, labels_pair = _generate_pairs(
-            embeddings1=emb_probe,
-            labels1=lab_probe, 
-            embeddings2=templates,
-            labels2=temp_labels, 
-            pair_sampling_budget=pair_sampling_budget,
-            pair_sampling_mode=pair_sampling_mode,
-            max_impostor_pairs=max_impostor_pairs, pair_sampling_seed=pair_sampling_seed, matching_method=matching_method
-        )
+        if probe_fusion_size > 1:
+            scores, labels_pair, fusion_diagnostics = _generate_fused_verification_pairs(
+                probe_embeddings=emb_probe,
+                probe_labels=lab_probe,
+                probe_provenance=provenance_probe,
+                template_embeddings=templates,
+                template_identities=temp_labels,
+                group_size=probe_fusion_size,
+                matching_method=matching_method,
+                pair_sampling_mode=pair_sampling_mode,
+                pair_sampling_budget=pair_sampling_budget,
+                max_impostor_pairs=max_impostor_pairs,
+                pair_sampling_seed=pair_sampling_seed,
+            )
+        else:
+            scores, labels_pair = _generate_pairs(
+                embeddings1=emb_probe,
+                labels1=lab_probe,
+                embeddings2=templates,
+                labels2=temp_labels,
+                pair_sampling_budget=pair_sampling_budget,
+                pair_sampling_mode=pair_sampling_mode,
+                max_impostor_pairs=max_impostor_pairs, pair_sampling_seed=pair_sampling_seed, matching_method=matching_method
+            )
         
     if visualize:
         viz = Visualizer()
@@ -9766,6 +9948,9 @@ def run_subject_disjoint_cross_session_verification(
             target_far=0.001,
         )
     )
+
+    if fusion_diagnostics is not None:
+        data_stats["Probe Fusion"] = fusion_diagnostics
 
     if _return_stats:
         return (

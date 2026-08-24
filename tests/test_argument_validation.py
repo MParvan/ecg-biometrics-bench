@@ -92,6 +92,30 @@ class ArgumentValidationTests(unittest.TestCase):
                     "must be greater than or equal to 1",
                 )
 
+    def test_probe_fusion_size_default_is_one(self):
+        _, arguments = parse_basic_arguments()
+        self.assertEqual(arguments.probe_fusion_size, 1)
+
+    def test_probe_fusion_size_accepts_explicit_multi_beat_values(self):
+        parser = main.get_parser()
+
+        for explicit_value in (2, 3, 5):
+            with self.subTest(explicit_value=explicit_value):
+                arguments = parser.parse_args(
+                    [
+                        "--dataset",
+                        "ecgid",
+                        "--task",
+                        "1",
+                        "--probe_fusion_size",
+                        str(explicit_value),
+                    ]
+                )
+                self.assertEqual(
+                    arguments.probe_fusion_size,
+                    explicit_value,
+                )
+
     def test_template_size_must_be_positive_when_set(self):
         parser, arguments = parse_basic_arguments()
         arguments.template_size = 0

@@ -469,6 +469,470 @@ def _apply_score_fusion(
     return fused_scores, fused_labels
 
 
+def _build_probe_groups(labels, provenance, group_size):
+    """
+    Partition probe observations into source-bounded fixed-depth groups.
+
+    Every returned group holds exactly ``group_size`` probe indices that share
+    a subject identity, session/acquisition, physical record and source
+    segment, taken in truthful source order. Groups never bridge those
+    boundaries; the final incomplete remainder of a block is dropped rather
+    than reported at a smaller depth.
+
+    Parameters
+    ----------
+    labels : np.ndarray
+        Probe subject identities aligned with the probe observations.
+    provenance : BeatProvenance
+        Per-beat provenance aligned with ``labels``. Required.
+    group_size : int
+        The number of probe observations to place in one group. Must be at
+        least two; single-observation grouping is a no-op that callers handle
+        without invoking this helper.
+
+    Returns
+    -------
+    dict with keys ``groups`` (int64 array of shape ``(n_groups, group_size)``
+    holding the member indices), ``identities`` (array of length ``n_groups``
+    with the subject identity of each group) and ``diagnostics`` (counts of
+    raw observations, valid groups, dropped remainders, short source blocks
+    and identities that produced no fused decision).
+    """
+    labels = np.asarray(labels)
+    group_size = int(group_size)
+
+    if group_size < 2:
+        raise ValueError("group_size must be at least 2 for probe grouping.")
+
+    if provenance is None:
+        raise ValueError(
+            "Per-beat provenance is required to build source-bounded probe "
+            "groups so that fused observations stay within one subject, "
+            "acquisition, record and source segment."
+        )
+
+    provenance.validate(len(labels))
+
+    block_keys = _source_block_keys(provenance)
+    member_matrix = []
+    identities = []
+    dropped_remainder = 0
+    short_blocks = 0
+    identities_without_a_group = 0
+
+    for identity in np.unique(labels):
+        identity_indices = np.flatnonzero(labels == identity)
+        produced_for_identity = 0
+
+        blocks = {}
+        for index in identity_indices:
+            blocks.setdefault(block_keys[index], []).append(int(index))
+
+        for block_key in sorted(blocks):
+            member_indices = np.asarray(blocks[block_key], dtype=np.int64)
+            order = _source_order_indices(provenance.subset(member_indices))
+            ordered = member_indices[order]
+
+            complete_groups = len(ordered) // group_size
+            if complete_groups == 0:
+                short_blocks += 1
+                dropped_remainder += len(ordered)
+                continue
+
+            for group_index in range(complete_groups):
+                start = group_index * group_size
+                end = start + group_size
+                member_matrix.append(ordered[start:end])
+                identities.append(identity)
+                produced_for_identity += 1
+
+            dropped_remainder += len(ordered) - complete_groups * group_size
+
+        if produced_for_identity == 0:
+            identities_without_a_group += 1
+
+    if member_matrix:
+        groups = np.stack(member_matrix).astype(np.int64, copy=False)
+    else:
+        groups = np.empty((0, group_size), dtype=np.int64)
+    identities = np.asarray(identities)
+
+    return {
+        "groups": groups,
+        "identities": identities,
+        "diagnostics": {
+            "fusion_size": int(group_size),
+            "raw_probe_observations": int(len(labels)),
+            "valid_probe_groups": int(len(groups)),
+            "source_blocks_below_fusion_size": int(short_blocks),
+            "dropped_remainder_observations": int(dropped_remainder),
+            "identities_without_a_fused_decision": int(identities_without_a_group),
+        },
+    }
+
+
+def _generate_fused_verification_pairs(
+    probe_embeddings,
+    probe_labels,
+    probe_provenance,
+    template_embeddings,
+    template_identities,
+    group_size,
+    matching_method,
+    *,
+    pair_sampling_mode="all_genuine",
+    pair_sampling_budget=None,
+    max_impostor_pairs=1000000,
+    pair_sampling_seed=None,
+    decision_batch_size=8192,
+):
+    """
+    Score verification comparisons at the fused-decision level.
+
+    Probe observations are grouped by :func:`_build_probe_groups`, and the
+    atomic decision becomes ``(probe_group, enrollment_template)``. The four
+    pair-sampling modes mirror the semantics of :func:`_generate_pairs` at the
+    fused-decision level:
+
+      - ``"all"``: evaluate the complete probe-group by template Cartesian
+        space. No stochastic sampling.
+      - ``"all_genuine"``: retain every genuine group-template decision;
+        uniformly sample impostor group-template decisions without replacement
+        up to ``max_impostor_pairs``.
+      - ``"balanced"``: sample equal numbers of genuine and impostor fused
+        decisions using ``pair_sampling_budget``.
+      - ``"random"``: draw ``pair_sampling_budget`` fused decisions uniformly
+        at random from the group-by-template Cartesian.
+
+    Each fused score is the arithmetic mean of the beat-template similarities
+    of its ``group_size`` constituent observations, in the same
+    higher-is-more-similar orientation returned by the per-pair matching
+    function. Selected fused decisions are scored in bounded batches of
+    ``decision_batch_size`` fused decisions, so the full
+    ``#groups x #templates`` similarity matrix is never materialized.
+
+    ``template_identities`` must be unique: multi-beat verification probe
+    fusion requires exactly one enrollment template per identity.
+
+    Returns
+    -------
+    scores : np.ndarray
+        Fused verification scores, higher-is-more-similar.
+    labels_pair : np.ndarray
+        Binary genuine (1) / impostor (0) labels aligned with ``scores``.
+    diagnostics : dict
+        Mode-aware fused-fusion diagnostics; see the ``Probe Fusion`` block in
+        the verification runner ``data_stats`` output.
+    """
+    if int(group_size) < 2:
+        raise ValueError(
+            "_generate_fused_verification_pairs requires group_size >= 2. "
+            "Fall back to the standard verification path for group_size == 1."
+        )
+
+    valid_modes = {"all", "all_genuine", "balanced", "random"}
+    if pair_sampling_mode not in valid_modes:
+        raise ValueError(
+            "Unknown verification pair sampling mode for fused decisions: "
+            f"{pair_sampling_mode!r}."
+        )
+
+    probe_embeddings = np.asarray(probe_embeddings)
+    probe_labels = np.asarray(probe_labels)
+    template_embeddings = np.asarray(template_embeddings)
+    template_identities = np.asarray(template_identities)
+
+    if probe_embeddings.ndim != 2 or template_embeddings.ndim != 2:
+        raise ValueError("Verification embeddings must be two-dimensional.")
+
+    if probe_embeddings.shape[1] != template_embeddings.shape[1]:
+        raise ValueError(
+            "Verification embedding sets must have the same feature dimension."
+        )
+
+    if len(template_identities) != len(np.unique(template_identities)):
+        raise ValueError(
+            "Multi-beat verification probe fusion requires exactly one "
+            "enrollment template per identity. Fuse the enrollment samples "
+            "into one template per identity, or evaluate with "
+            "probe_fusion_size = 1."
+        )
+
+    group_size = int(group_size)
+    max_impostor_pairs = int(max_impostor_pairs)
+
+    if pair_sampling_mode in {"balanced", "random"}:
+        if pair_sampling_budget is None:
+            raise ValueError(
+                f"pair_sampling_mode={pair_sampling_mode!r} requires a "
+                "positive pair_sampling_budget."
+            )
+        if int(pair_sampling_budget) < 1:
+            raise ValueError(
+                "pair_sampling_budget must be a positive integer."
+            )
+        pair_sampling_budget = int(pair_sampling_budget)
+
+    grouping = _build_probe_groups(probe_labels, probe_provenance, group_size)
+    groups = grouping["groups"]
+    group_identities = grouping["identities"]
+    diagnostics = dict(grouping["diagnostics"])
+    diagnostics["pair_sampling_mode"] = pair_sampling_mode
+
+    number_of_groups = int(len(groups))
+    number_of_templates = int(len(template_identities))
+
+    if number_of_groups == 0 or number_of_templates == 0:
+        diagnostics.setdefault("genuine_fused_decisions", 0)
+        diagnostics.setdefault("impostor_fused_decisions", 0)
+        return (
+            np.empty(0, dtype=float),
+            np.empty(0, dtype=int),
+            diagnostics,
+        )
+
+    template_column_by_identity = {
+        identity: index for index, identity in enumerate(template_identities)
+    }
+
+    def _score_selected(rows, cols):
+        """Compute fused scores for the given (row, column) decision arrays."""
+        rows = np.asarray(rows, dtype=np.int64)
+        cols = np.asarray(cols, dtype=np.int64)
+        fused = np.empty(len(rows), dtype=float)
+        batch = max(1, int(decision_batch_size))
+        for batch_start in range(0, len(rows), batch):
+            batch_end = min(batch_start + batch, len(rows))
+            batch_rows = rows[batch_start:batch_end]
+            batch_cols = cols[batch_start:batch_end]
+            batch_size = len(batch_rows)
+            beat_indices = groups[batch_rows].reshape(-1)
+            template_indices = np.repeat(batch_cols, group_size)
+            beat_scores = _score_selected_pair_indices(
+                probe_embeddings,
+                template_embeddings,
+                beat_indices,
+                template_indices,
+                matching_method=matching_method,
+            )
+            fused[batch_start:batch_end] = (
+                beat_scores.reshape(batch_size, group_size).mean(axis=1)
+            )
+        return fused
+
+    # ------------------------------------------------------------------
+    # Mode "all": exhaustive group x template evaluation, in bounded batches
+    # of one group at a time. Fused scores for one group against all
+    # templates require only a ``group_size x #templates`` transient block.
+    # ------------------------------------------------------------------
+    if pair_sampling_mode == "all":
+        genuine_labels_bool = (
+            group_identities[:, None] == template_identities[None, :]
+        )
+
+        fused_score_blocks = []
+        for row_index in range(number_of_groups):
+            beat_indices = np.repeat(groups[row_index], number_of_templates)
+            template_indices = np.tile(
+                np.arange(number_of_templates, dtype=np.int64), group_size
+            )
+            beat_scores = _score_selected_pair_indices(
+                probe_embeddings,
+                template_embeddings,
+                beat_indices,
+                template_indices,
+                matching_method=matching_method,
+            )
+            fused_row = (
+                beat_scores.reshape(group_size, number_of_templates)
+                .mean(axis=0)
+            )
+            fused_score_blocks.append(fused_row)
+
+        fused_scores = np.concatenate(fused_score_blocks)
+        labels_pair = genuine_labels_bool.reshape(-1).astype(int)
+
+        diagnostics.update(
+            {
+                "genuine_fused_decisions": int(genuine_labels_bool.sum()),
+                "impostor_fused_decisions": int(
+                    labels_pair.size - genuine_labels_bool.sum()
+                ),
+            }
+        )
+        return fused_scores, labels_pair, diagnostics
+
+    # ------------------------------------------------------------------
+    # Mode "all_genuine": retain every genuine decision; sample impostor
+    # decisions uniformly without replacement up to ``max_impostor_pairs``.
+    # ------------------------------------------------------------------
+    if pair_sampling_mode == "all_genuine":
+        resolved_pair_seed = (
+            42 if pair_sampling_seed is None else int(pair_sampling_seed)
+        )
+
+        genuine_rows = []
+        genuine_columns = []
+        for row_index, identity in enumerate(group_identities):
+            column = template_column_by_identity.get(identity)
+            if column is None:
+                continue
+            genuine_rows.append(row_index)
+            genuine_columns.append(column)
+        genuine_rows = np.asarray(genuine_rows, dtype=np.int64)
+        genuine_columns = np.asarray(genuine_columns, dtype=np.int64)
+
+        (
+            impostor_rows,
+            impostor_columns,
+            total_impostor_decisions,
+        ) = _sample_impostor_pair_indices(
+            group_identities,
+            template_identities,
+            max_impostor_pairs=max_impostor_pairs,
+            pair_sampling_seed=resolved_pair_seed,
+        )
+
+        selected_rows = np.concatenate(
+            (genuine_rows, impostor_rows)
+        ).astype(np.int64, copy=False)
+        selected_columns = np.concatenate(
+            (genuine_columns, impostor_columns)
+        ).astype(np.int64, copy=False)
+        labels_pair = np.concatenate(
+            (
+                np.ones(len(genuine_rows), dtype=int),
+                np.zeros(len(impostor_rows), dtype=int),
+            )
+        )
+        fused_scores = _score_selected(selected_rows, selected_columns)
+
+        diagnostics.update(
+            {
+                "genuine_fused_decisions": int(len(genuine_rows)),
+                "impostor_fused_decisions": int(len(impostor_rows)),
+                "total_impostor_fused_decisions": int(total_impostor_decisions),
+                "max_impostor_pairs": max_impostor_pairs,
+                "pair_sampling_seed": resolved_pair_seed,
+            }
+        )
+        return fused_scores, labels_pair, diagnostics
+
+    # ------------------------------------------------------------------
+    # Stochastic modes: mirror the existing _generate_pairs semantics at the
+    # fused-decision level using the shared _verification_pair_rng.
+    # ------------------------------------------------------------------
+    rng = _verification_pair_rng(pair_sampling_seed)
+
+    if pair_sampling_mode == "balanced":
+        groups_by_identity = collections.defaultdict(list)
+        for row_index, identity in enumerate(group_identities):
+            groups_by_identity[identity].append(row_index)
+
+        template_identity_set = set(template_column_by_identity)
+        common_identities = [
+            identity
+            for identity in groups_by_identity
+            if identity in template_identity_set
+        ]
+
+        if len(common_identities) < 2:
+            diagnostics.update(
+                {
+                    "genuine_fused_decisions": 0,
+                    "impostor_fused_decisions": 0,
+                    "pair_sampling_budget": pair_sampling_budget,
+                    "pair_sampling_seed": pair_sampling_seed,
+                }
+            )
+            return (
+                np.empty(0, dtype=float),
+                np.empty(0, dtype=int),
+                diagnostics,
+            )
+
+        genuine_rows = []
+        genuine_columns = []
+        for _ in range(pair_sampling_budget // 2):
+            identity = rng.choice(common_identities)
+            row = int(rng.choice(groups_by_identity[identity]))
+            column = template_column_by_identity[identity]
+            genuine_rows.append(row)
+            genuine_columns.append(column)
+
+        all_group_identities = list(groups_by_identity.keys())
+        all_template_identities = list(template_column_by_identity.keys())
+
+        impostor_rows = []
+        impostor_columns = []
+        for _ in range(pair_sampling_budget // 2):
+            identity_a = rng.choice(all_group_identities)
+            possible_b = [
+                identity
+                for identity in all_template_identities
+                if identity != identity_a
+            ]
+            if not possible_b:
+                continue
+            identity_b = rng.choice(possible_b)
+            row = int(rng.choice(groups_by_identity[identity_a]))
+            column = template_column_by_identity[identity_b]
+            impostor_rows.append(row)
+            impostor_columns.append(column)
+
+        selected_rows = np.asarray(
+            genuine_rows + impostor_rows, dtype=np.int64
+        )
+        selected_columns = np.asarray(
+            genuine_columns + impostor_columns, dtype=np.int64
+        )
+        labels_pair = np.asarray(
+            [1] * len(genuine_rows) + [0] * len(impostor_rows), dtype=int
+        )
+        fused_scores = _score_selected(selected_rows, selected_columns)
+
+        diagnostics.update(
+            {
+                "genuine_fused_decisions": int(len(genuine_rows)),
+                "impostor_fused_decisions": int(len(impostor_rows)),
+                "pair_sampling_budget": pair_sampling_budget,
+                "pair_sampling_seed": pair_sampling_seed,
+            }
+        )
+        return fused_scores, labels_pair, diagnostics
+
+    # pair_sampling_mode == "random"
+    row_choices = np.arange(number_of_groups, dtype=np.int64)
+    column_choices = np.arange(number_of_templates, dtype=np.int64)
+
+    selected_rows = []
+    selected_columns = []
+    labels_pair = []
+    for _ in range(pair_sampling_budget):
+        row = int(rng.choice(row_choices))
+        column = int(rng.choice(column_choices))
+        selected_rows.append(row)
+        selected_columns.append(column)
+        labels_pair.append(
+            int(group_identities[row] == template_identities[column])
+        )
+
+    selected_rows = np.asarray(selected_rows, dtype=np.int64)
+    selected_columns = np.asarray(selected_columns, dtype=np.int64)
+    labels_pair = np.asarray(labels_pair, dtype=int)
+    fused_scores = _score_selected(selected_rows, selected_columns)
+
+    diagnostics.update(
+        {
+            "genuine_fused_decisions": int((labels_pair == 1).sum()),
+            "impostor_fused_decisions": int((labels_pair == 0).sum()),
+            "pair_sampling_budget": pair_sampling_budget,
+            "pair_sampling_seed": pair_sampling_seed,
+        }
+    )
+    return fused_scores, labels_pair, diagnostics
+
+
 def _find_optimal_threshold(scores, labels):
     """
     Finds the global threshold where FAR and FRR intersect (EER) 
