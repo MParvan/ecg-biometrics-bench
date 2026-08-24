@@ -427,6 +427,52 @@ python -m scripts.reproduce_tables --table 5 --collect
 
 ---
 
+## 🎯 Beat Alignment
+
+Beat-mode segmentation cuts a fixed window around each detected R-peak, so the
+window is only correct if the detector reports the fiducial point itself.
+Several widely used QRS detectors report the maximum of a smoothed detection
+curve instead, which sits later than the true peak by roughly half the
+smoothing window. For the Pan-Tompkins and Hamilton implementations reachable
+through NeuroKit2 that is 40–70 ms. The offset cancels in interval
+measurements, so it does not affect heart-rate or HRV analysis; it matters when
+a fixed window is cut around the point.
+
+`cut_beats` therefore refines each detection to the largest deflection nearby
+before cutting. `align_window_s` sets how far it looks:
+
+```yaml
+preprocessing_parameters:
+  align_peak: true
+  align_window_s: 0.10   # half-width of the search, in seconds
+```
+
+Two properties are worth knowing:
+
+- **The search runs on the recording, not inside the beat.** `pre_s` and
+  `post_s` describe the segment that is cut once the peak is located, so they
+  place no limit on how far the search may look. Only the ends of the recording
+  do. The order is: detect, refine, then cut around the refined position.
+- **Polarity is decided once per recording.** Taking the largest absolute
+  deviation per beat handles inverted leads, but lets a deep S-wave outrank a
+  modest R-peak on an individual beat. Comparing upward against downward
+  deflection across the whole recording lets the many unambiguous beats settle
+  the question for the ambiguous ones.
+
+Measured against the beat annotations shipped with ECG-ID, MIT-BIH and NSRDB —
+the three supported datasets that carry them, at 500, 360 and 128 Hz — a
+half-width of 0.10 s brings every detector reachable through NeuroKit2 to
+within one to three samples of the annotated peak. The width is a duration
+rather than a fraction of the R-R interval, because the lag is a property of
+each detector's smoothing window, which is defined in seconds.
+
+Detector choice still governs how many beats are found and how many spurious
+detections appear. Refinement substantially reduces how much it governs where
+the beats are cut, on the datasets where that can be measured against
+annotations.
+
+---
+
 ## 🔒 Leakage Controls
 
 The framework refuses configurations that would place the same physical
