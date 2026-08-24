@@ -56,7 +56,7 @@ augmentation_parameters: {}
 use_template: true
 template_fusion_method: mean
 template_size: 1
-probe_fusion_size: 3
+probe_fusion_size: 1
 matching_method: cosine
 max_impostor_pairs: 1000000
 pair_sampling_seed: 42
