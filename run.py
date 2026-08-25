@@ -4158,6 +4158,33 @@ def _build_weight_cache_config(
 
     return complete_config
 
+
+def _build_weight_artifact_context(
+    training_samples,
+    num_classes,
+    resolved_split_seed,
+    reproducibility_state,
+):
+    """Describe runner-known training facts excluded from cache identity."""
+    return {
+        "model_constructor_arguments": {
+            "in_channels": int(
+                _detect_channels(training_samples)
+            ),
+            "num_classes": int(num_classes),
+            "include_top": True,
+        },
+        "resolved_split_seed": int(resolved_split_seed),
+        "reproducibility_state": copy.deepcopy(
+            reproducibility_state
+        ),
+        "training_components": {
+            "optimizer": "torch.optim.Adam",
+            "loss": "torch.nn.CrossEntropyLoss",
+            "scheduler": "framework rollback learning-rate policy",
+        },
+    }
+
 def _get_verification_pair_statistics(
     labels_pair,
     target_far=0.001,
@@ -5435,6 +5462,12 @@ def run_closed_set_identification(x, y, model_class, epochs=150, batch_size=256,
                 model,
                 train_config,
                 uid,
+                artifact_context=_build_weight_artifact_context(
+                    X_tr,
+                    len(classes),
+                    resolved_split_seed,
+                    reproducibility_state,
+                ),
             )
     else:
         optimizer = torch.optim.Adam(model.parameters(), lr=lr); criterion = nn.CrossEntropyLoss()
@@ -6168,6 +6201,12 @@ def run_closed_set_verification(x, y, model_class, epochs=150, batch_size=256, l
                 model,
                 train_config,
                 uid,
+                artifact_context=_build_weight_artifact_context(
+                    X_tr,
+                    len(classes),
+                    resolved_split_seed,
+                    reproducibility_state,
+                ),
             )
     else:
         optimizer = torch.optim.Adam(model.parameters(), lr=lr)
@@ -6869,6 +6908,12 @@ def run_subject_disjoint_identification(x, y, model_class, epochs=150, batch_siz
                 model,
                 train_config,
                 uid,
+                artifact_context=_build_weight_artifact_context(
+                    X_tr,
+                    num_train_classes,
+                    resolved_split_seed,
+                    reproducibility_state,
+                ),
             )
     
     else:
@@ -7649,6 +7694,12 @@ def run_subject_disjoint_verification(x, y, model_class, epochs=150, batch_size=
                 model,
                 train_config,
                 uid,
+                artifact_context=_build_weight_artifact_context(
+                    X_tr,
+                    num_train_classes,
+                    resolved_split_seed,
+                    reproducibility_state,
+                ),
             )
     
     else:
@@ -8514,6 +8565,12 @@ def run_cross_session_identification(x_train, y_train, x_test, y_test, model_cla
                 model,
                 train_config,
                 uid,
+                artifact_context=_build_weight_artifact_context(
+                    X_tr,
+                    len(classes),
+                    resolved_split_seed,
+                    reproducibility_state,
+                ),
             )
     else:
         optimizer = torch.optim.Adam(model.parameters(), lr=lr); criterion = nn.CrossEntropyLoss()
@@ -9309,6 +9366,12 @@ def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class
                 model,
                 train_config,
                 uid,
+                artifact_context=_build_weight_artifact_context(
+                    X_tr,
+                    len(classes),
+                    resolved_split_seed,
+                    reproducibility_state,
+                ),
             )
     else:
         optimizer = torch.optim.Adam(model.parameters(), lr=lr); criterion = nn.CrossEntropyLoss()    
@@ -10042,6 +10105,12 @@ def run_subject_disjoint_cross_session_identification(
                 model,
                 train_config,
                 uid,
+                artifact_context=_build_weight_artifact_context(
+                    X_tr,
+                    num_train_classes,
+                    resolved_split_seed,
+                    reproducibility_state,
+                ),
             )
     else:
         optimizer = torch.optim.Adam(model.parameters(), lr=lr)
@@ -10809,6 +10878,12 @@ def run_subject_disjoint_cross_session_verification(
                 model,
                 train_config,
                 uid,
+                artifact_context=_build_weight_artifact_context(
+                    X_tr,
+                    num_train_classes,
+                    resolved_split_seed,
+                    reproducibility_state,
+                ),
             )
     else:
         optimizer = torch.optim.Adam(model.parameters(), lr=lr)

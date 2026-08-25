@@ -12,10 +12,14 @@ import hashlib
 import importlib.util
 import json
 import os
+import struct
 import subprocess
+from collections.abc import Mapping
 from importlib import metadata
 from pathlib import Path
 from typing import Callable, Iterable, Optional, Sequence, Tuple
+
+import torch
 
 
 DATA_IMPLEMENTATION_MODULES = (
@@ -48,6 +52,85 @@ WEIGHT_DEPENDENCIES = (
 
 class ImplementationSourceError(RuntimeError):
     """Raised when required result-affecting Python source cannot be read."""
+
+
+STATE_DICT_HASH_FORMAT = "ecg-biometrics/canonical-state-dict-sha256"
+_STATE_DICT_HASH_DOMAIN = STATE_DICT_HASH_FORMAT.encode("ascii")
+
+
+def _unsigned_64_bytes(value: int) -> bytes:
+    """Encode one non-negative integer for canonical hash framing."""
+    if not isinstance(value, int) or value < 0:
+        raise ValueError(
+            "Canonical hash frame values must be non-negative integers."
+        )
+    return struct.pack(">Q", value)
+
+
+def _update_length_prefixed(digest, content: bytes) -> None:
+    """Add unambiguous length-prefixed bytes to a hash digest."""
+    digest.update(_unsigned_64_bytes(len(content)))
+    digest.update(content)
+
+
+def canonical_state_dict_sha256(state_dict: Mapping) -> str:
+    """Return a device- and layout-independent SHA-256 for tensor state.
+
+    Entry names, dtypes, shapes, and exact tensor bytes are framed with
+    explicit lengths. Mapping insertion order, device placement, and dense
+    tensor strides are intentionally excluded from the identity.
+    """
+    if not isinstance(state_dict, Mapping):
+        raise TypeError("state_dict must be a mapping of names to tensors.")
+
+    keys = list(state_dict.keys())
+    if any(not isinstance(key, str) for key in keys):
+        raise TypeError("Every state_dict entry name must be a string.")
+
+    digest = hashlib.sha256()
+    _update_length_prefixed(digest, _STATE_DICT_HASH_DOMAIN)
+    digest.update(_unsigned_64_bytes(len(keys)))
+
+    for key in sorted(keys):
+        tensor = state_dict[key]
+        if not torch.is_tensor(tensor):
+            raise TypeError(
+                f"state_dict entry {key!r} must be a tensor, "
+                f"received {type(tensor).__name__}."
+            )
+        if tensor.layout != torch.strided or tensor.is_quantized:
+            raise TypeError(
+                f"state_dict entry {key!r} uses unsupported tensor "
+                f"layout or encoding: layout={tensor.layout}, "
+                f"quantized={tensor.is_quantized}."
+            )
+
+        try:
+            canonical_tensor = (
+                tensor.detach()
+                .to(device="cpu")
+                .contiguous()
+                .clone(memory_format=torch.contiguous_format)
+            )
+        except (RuntimeError, TypeError, ValueError) as error:
+            raise TypeError(
+                f"state_dict entry {key!r} cannot be canonicalized: {error}"
+            ) from error
+
+        key_bytes = key.encode("utf-8")
+        dtype_bytes = str(canonical_tensor.dtype).encode("ascii")
+        shape = tuple(int(dimension) for dimension in canonical_tensor.shape)
+        byte_view = canonical_tensor.reshape(-1).view(torch.uint8)
+        tensor_bytes = byte_view.numpy().tobytes(order="C")
+
+        _update_length_prefixed(digest, key_bytes)
+        _update_length_prefixed(digest, dtype_bytes)
+        digest.update(_unsigned_64_bytes(len(shape)))
+        for dimension in shape:
+            digest.update(_unsigned_64_bytes(dimension))
+        _update_length_prefixed(digest, tensor_bytes)
+
+    return digest.hexdigest()
 
 
 def canonical_json_bytes(value) -> bytes:

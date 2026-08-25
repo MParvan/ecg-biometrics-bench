@@ -4,6 +4,9 @@ import numpy as np
 import random
 import collections
 import copy
+import math
+import re
+from collections.abc import Mapping
 from typing import Optional, Tuple
 from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.preprocessing import normalize
@@ -21,7 +24,9 @@ import json
 import torch
 from torch.utils.data import Dataset, DataLoader,TensorDataset
 from artifact_provenance import (
+    STATE_DICT_HASH_FORMAT,
     canonical_json_bytes,
+    canonical_state_dict_sha256,
     collect_creation_provenance,
 )
 from sklearn.metrics import (
@@ -5308,6 +5313,326 @@ def _generate_config_hash(config_dict):
     config_str = json.dumps(config_dict, sort_keys=True, default=str)
     return hashlib.md5(config_str.encode('utf-8')).hexdigest()[:12]
 
+
+def _file_sha256(path, chunk_size=8 * 1024 * 1024):
+    """Hash exact completed file bytes using bounded-memory binary reads."""
+    digest = hashlib.sha256()
+    with open(path, "rb") as payload_file:
+        while True:
+            chunk = payload_file.read(chunk_size)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _normalize_immutable_metadata(value, field_path="artifact_context"):
+    """Convert supported metadata values without unstable stringification."""
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError(
+                f"{field_path} contains a non-finite floating-point value."
+            )
+        return value
+
+    if isinstance(value, np.generic):
+        return _normalize_immutable_metadata(
+            value.item(),
+            field_path=field_path,
+        )
+
+    if isinstance(value, torch.device):
+        return str(value)
+
+    if isinstance(value, os.PathLike):
+        return os.fspath(value)
+
+    if isinstance(value, Mapping):
+        if any(not isinstance(key, str) for key in value):
+            raise TypeError(
+                f"{field_path} mapping keys must be strings."
+            )
+        normalized = {}
+        for key in sorted(value):
+            normalized[key] = _normalize_immutable_metadata(
+                value[key],
+                field_path=f"{field_path}.{key}",
+            )
+        return normalized
+
+    if isinstance(value, (list, tuple)):
+        return [
+            _normalize_immutable_metadata(
+                item,
+                field_path=f"{field_path}[{index}]",
+            )
+            for index, item in enumerate(value)
+        ]
+
+    raise TypeError(
+        f"{field_path} contains unsupported metadata type "
+        f"{type(value).__name__}."
+    )
+
+
+def _build_weight_artifact_metadata(
+    model,
+    config_dict,
+    uid,
+    state_dict_sha256,
+    payload_sha256,
+    actual_epochs,
+    artifact_context=None,
+):
+    """Build immutable trained-state metadata beside the cache identity."""
+    context = _normalize_immutable_metadata(
+        artifact_context or {},
+    )
+    if not isinstance(context, dict):
+        raise TypeError("artifact_context must be a mapping.")
+    allowed_context_fields = {
+        "model_constructor_arguments",
+        "reproducibility_state",
+        "resolved_split_seed",
+        "training_components",
+    }
+    unknown_fields = set(context) - allowed_context_fields
+    if unknown_fields:
+        raise ValueError(
+            "Unsupported weight artifact context fields: "
+            f"{sorted(unknown_fields)}."
+        )
+
+    model_type = type(model)
+    model_metadata = {
+        "module": model_type.__module__,
+        "class_name": model_type.__name__,
+        "qualified_class_name": model_type.__qualname__,
+    }
+    constructor_arguments = context.get(
+        "model_constructor_arguments"
+    )
+    if constructor_arguments is not None:
+        model_metadata["constructor_arguments"] = constructor_arguments
+
+    training_key_map = {
+        "training_regime": "training_regime",
+        "epochs": "requested_epochs",
+        "batch_size": "batch_size",
+        "lr": "learning_rate",
+        "val_split": "validation_split",
+        "seed": "seed",
+        "augmentation": "augmentation",
+    }
+    training_metadata = {
+        target_key: _normalize_immutable_metadata(
+            config_dict[source_key],
+            field_path=f"cache_identity.{source_key}",
+        )
+        for source_key, target_key in training_key_map.items()
+        if source_key in config_dict
+    }
+    training_metadata["actual_epochs"] = _normalize_immutable_metadata(
+        actual_epochs,
+        field_path="actual_epochs",
+    )
+    if "resolved_split_seed" in context:
+        training_metadata["resolved_split_seed"] = context[
+            "resolved_split_seed"
+        ]
+    if "training_components" in context:
+        training_metadata["components"] = context[
+            "training_components"
+        ]
+
+    reproducibility_metadata = {
+        "requested_mode": _normalize_immutable_metadata(
+            config_dict.get("reproducibility_mode"),
+            field_path="cache_identity.reproducibility_mode",
+        ),
+    }
+    if "reproducibility_state" in context:
+        reproducibility_metadata["effective_state"] = context[
+            "reproducibility_state"
+        ]
+
+    input_metadata = {}
+    if "data_shape" in config_dict:
+        input_metadata["training_data_shape"] = (
+            _normalize_immutable_metadata(
+                config_dict["data_shape"],
+                field_path="cache_identity.data_shape",
+            )
+        )
+
+    artifact_metadata = {
+        "identity": {
+            "weight_uid": uid,
+            "state_dict_hash_format": STATE_DICT_HASH_FORMAT,
+            "state_dict_sha256": state_dict_sha256,
+            "payload_sha256": payload_sha256,
+        },
+        "model": model_metadata,
+        "training": training_metadata,
+        "reproducibility": reproducibility_metadata,
+        "authoritative_fields": {
+            "training_and_data_compatibility": "cache_identity",
+            "creation_provenance": "creation_provenance",
+        },
+    }
+    if input_metadata:
+        artifact_metadata["input"] = input_metadata
+
+    return artifact_metadata
+
+
+_SHA256_HEX_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _validate_mirrored_metadata_value(
+    mirrored_mapping,
+    mirrored_key,
+    authoritative_mapping,
+    authoritative_key,
+    relationship_name,
+):
+    """Reject a missing or contradictory mirror of an available authority."""
+    if authoritative_key not in authoritative_mapping:
+        return
+
+    if not isinstance(mirrored_mapping, dict) or (
+        mirrored_key not in mirrored_mapping
+    ):
+        raise ValueError(
+            f"weight artifact mirror {relationship_name} is missing"
+        )
+
+    try:
+        mirrored_value = _normalize_immutable_metadata(
+            mirrored_mapping[mirrored_key],
+            field_path=f"weight_artifact.{relationship_name}",
+        )
+        authoritative_value = _normalize_immutable_metadata(
+            authoritative_mapping[authoritative_key],
+            field_path=f"cache_metadata.{relationship_name}",
+        )
+        values_match = canonical_json_bytes(
+            mirrored_value
+        ) == canonical_json_bytes(authoritative_value)
+    except (TypeError, ValueError, UnicodeError) as error:
+        raise ValueError(
+            f"weight artifact mirror {relationship_name} is invalid: {error}"
+        ) from error
+
+    if not values_match:
+        raise ValueError(
+            f"weight artifact mirror {relationship_name} contradicts "
+            "authoritative metadata"
+        )
+
+
+def _validate_weight_artifact_metadata(
+    cache_metadata,
+    uid,
+    weight_path=None,
+):
+    """Validate immutable identity fields before payload deserialization."""
+    if not isinstance(cache_metadata, dict):
+        raise TypeError("weight cache metadata must be a mapping")
+
+    artifact_metadata = cache_metadata.get("weight_artifact")
+    if not isinstance(artifact_metadata, dict):
+        raise KeyError("weight_artifact metadata is missing")
+
+    identity = artifact_metadata.get("identity")
+    if not isinstance(identity, dict):
+        raise ValueError("weight_artifact.identity must be a mapping")
+
+    if identity.get("weight_uid") != uid:
+        raise ValueError("weight artifact UID does not match its cache path")
+
+    if identity.get("state_dict_hash_format") != STATE_DICT_HASH_FORMAT:
+        raise ValueError(
+            "weight artifact state_dict hash format is unsupported or "
+            "does not match the canonical hashing implementation"
+        )
+
+    cache_identity = cache_metadata.get("cache_identity")
+    if not isinstance(cache_identity, dict) or (
+        _generate_config_hash(cache_identity) != uid
+    ):
+        raise ValueError(
+            "weight artifact UID does not match its cache identity"
+        )
+
+    training_metadata = artifact_metadata.get("training")
+    reproducibility_metadata = artifact_metadata.get("reproducibility")
+    model_metadata = artifact_metadata.get("model")
+
+    for mirrored_key, authoritative_key in (
+        ("training_regime", "training_regime"),
+        ("requested_epochs", "epochs"),
+        ("batch_size", "batch_size"),
+        ("learning_rate", "lr"),
+        ("validation_split", "val_split"),
+        ("seed", "seed"),
+        ("augmentation", "augmentation"),
+    ):
+        _validate_mirrored_metadata_value(
+            training_metadata,
+            mirrored_key,
+            cache_identity,
+            authoritative_key,
+            f"training.{mirrored_key}",
+        )
+
+    _validate_mirrored_metadata_value(
+        reproducibility_metadata,
+        "requested_mode",
+        cache_identity,
+        "reproducibility_mode",
+        "reproducibility.requested_mode",
+    )
+    _validate_mirrored_metadata_value(
+        training_metadata,
+        "actual_epochs",
+        cache_metadata,
+        "actual_epochs",
+        "training.actual_epochs",
+    )
+    _validate_mirrored_metadata_value(
+        model_metadata,
+        "class_name",
+        cache_identity,
+        "model",
+        "model.class_name",
+    )
+
+    for digest_name in (
+        "state_dict_sha256",
+        "payload_sha256",
+    ):
+        digest_value = identity.get(digest_name)
+        if not isinstance(digest_value, str) or not (
+            _SHA256_HEX_PATTERN.fullmatch(digest_value)
+        ):
+            raise ValueError(
+                f"weight artifact {digest_name} is not a SHA-256 digest"
+            )
+
+    if weight_path is not None:
+        actual_payload_sha256 = _file_sha256(weight_path)
+        if actual_payload_sha256 != identity["payload_sha256"]:
+            raise ValueError(
+                "serialized weight payload SHA-256 does not match metadata"
+            )
+
+    return artifact_metadata
+
+
 def _atomic_write_file(final_path, writer):
     """
     Write a file through a temporary path and atomically replace the target.
@@ -5659,17 +5984,75 @@ class CacheManager:
         if cache_metadata is None:
             return None, uid
 
+        if not isinstance(
+            cache_metadata.get("weight_artifact"),
+            dict,
+        ):
+            print(
+                f"[WARN] Weight cache entry {uid} predates immutable "
+                "trained-state metadata and will be regenerated."
+            )
+            _remove_cache_files(
+                weight_path,
+                metadata_path,
+            )
+            return None, uid
+
+        try:
+            artifact_metadata = _validate_weight_artifact_metadata(
+                cache_metadata,
+                uid,
+                weight_path,
+            )
+            cached_state = torch.load(
+                weight_path,
+                map_location="cpu",
+            )
+
+            actual_state_dict_sha256 = (
+                canonical_state_dict_sha256(cached_state)
+            )
+            expected_state_dict_sha256 = artifact_metadata[
+                "identity"
+            ]["state_dict_sha256"]
+            if (
+                actual_state_dict_sha256
+                != expected_state_dict_sha256
+            ):
+                raise ValueError(
+                    "canonical state_dict SHA-256 does not match metadata"
+                )
+
+        except (
+            OSError,
+            EOFError,
+            RuntimeError,
+            ValueError,
+            TypeError,
+            KeyError,
+            pickle.UnpicklingError,
+        ) as error:
+            print(
+                "[WARN] Weight cache entry "
+                f"{uid} is unreadable, incompatible, or has mismatched "
+                f"immutable metadata and will be regenerated: {error}"
+            )
+
+            _remove_cache_files(
+                weight_path,
+                metadata_path,
+            )
+
+            return None, uid
+
         # Preserve the model's initial state because load_state_dict()
-        # can partially modify a model before reporting an error.
+        # can partially modify a model before reporting an error. Payload and
+        # canonical-state validation above cannot mutate the destination.
         original_model_state = copy.deepcopy(
             model.state_dict()
         )
 
         try:
-            cached_state = torch.load(
-                weight_path,
-                map_location=device,
-            )
 
             model.load_state_dict(
                 cached_state
@@ -5719,7 +6102,76 @@ class CacheManager:
                     "epochs"
                 )
 
+        model.weight_artifact_metadata = copy.deepcopy(
+            cache_metadata
+        )
+
         return model, uid
+
+    def get_weight_artifact_metadata(self, uid):
+        """Load validated immutable metadata without rerunning training."""
+        weight_path = os.path.join(
+            self.weight_dir,
+            f"{uid}.pth",
+        )
+        metadata_path = os.path.join(
+            self.weight_dir,
+            f"{uid}.json",
+        )
+
+        if not os.path.exists(weight_path) or not os.path.exists(
+            metadata_path
+        ):
+            return None
+
+        try:
+            with open(
+                metadata_path,
+                "r",
+                encoding="utf-8",
+            ) as metadata_file:
+                cache_metadata = json.load(metadata_file)
+
+            artifact_metadata = _validate_weight_artifact_metadata(
+                cache_metadata,
+                uid,
+                weight_path,
+            )
+            cached_state = torch.load(
+                weight_path,
+                map_location="cpu",
+            )
+            actual_state_dict_sha256 = (
+                canonical_state_dict_sha256(cached_state)
+            )
+            if actual_state_dict_sha256 != artifact_metadata[
+                "identity"
+            ]["state_dict_sha256"]:
+                raise ValueError(
+                    "canonical state_dict SHA-256 does not match metadata"
+                )
+
+        except (
+            OSError,
+            EOFError,
+            RuntimeError,
+            ValueError,
+            TypeError,
+            KeyError,
+            json.JSONDecodeError,
+            pickle.UnpicklingError,
+        ) as error:
+            print(
+                f"[WARN] Weight artifact metadata for {uid} is invalid "
+                f"and will be regenerated: {error}"
+            )
+            _remove_cache_files(
+                weight_path,
+                metadata_path,
+            )
+            return None
+
+        return copy.deepcopy(cache_metadata)
 
     def save_weight_cache(
         self,
@@ -5727,6 +6179,7 @@ class CacheManager:
         config_dict,
         uid,
         creation_provenance=None,
+        artifact_context=None,
     ):
         """
         Save model weights and training metadata atomically.
@@ -5744,12 +6197,12 @@ class CacheManager:
             f"{uid}.json",
         )
 
-        cache_metadata = _build_cache_metadata(
-            config_dict,
-            creation_provenance=(
-                creation_provenance
-            ),
-        )
+        expected_uid = _generate_config_hash(config_dict)
+        if uid != expected_uid:
+            raise ValueError(
+                f"Weight cache UID {uid!r} does not match the supplied "
+                f"cache identity ({expected_uid!r})."
+            )
 
         actual_epochs = getattr(
             model,
@@ -5765,9 +6218,61 @@ class CacheManager:
             except (TypeError, ValueError):
                 pass
 
-            cache_metadata[
-                "actual_epochs"
-            ] = actual_epochs
+        final_state_dict = model.state_dict()
+        state_dict_sha256 = canonical_state_dict_sha256(
+            final_state_dict
+        )
+
+        cache_metadata = _build_cache_metadata(
+            config_dict,
+            creation_provenance=(
+                creation_provenance
+            ),
+        )
+        if actual_epochs is not None:
+            cache_metadata["actual_epochs"] = actual_epochs
+        cache_metadata["weight_artifact"] = (
+            _build_weight_artifact_metadata(
+                model=model,
+                config_dict=config_dict,
+                uid=uid,
+                state_dict_sha256=state_dict_sha256,
+                payload_sha256="0" * 64,
+                actual_epochs=actual_epochs,
+                artifact_context=artifact_context,
+            )
+        )
+
+        _validate_weight_artifact_metadata(
+            cache_metadata,
+            uid,
+        )
+
+        # Reject unsupported sidecar values before replacing a valid payload.
+        json.dumps(
+            cache_metadata,
+            sort_keys=True,
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+
+        def write_weights(temporary_path):
+            torch.save(
+                final_state_dict,
+                temporary_path,
+            )
+
+        # Publish the completed payload first. If metadata publication is
+        # interrupted, the missing or stale sidecar remains a safe cache miss.
+        _atomic_write_file(
+            weight_path,
+            write_weights,
+        )
+
+        payload_sha256 = _file_sha256(weight_path)
+        cache_metadata["weight_artifact"]["identity"][
+            "payload_sha256"
+        ] = payload_sha256
 
         def write_metadata(temporary_path):
             with open(
@@ -5779,24 +6284,13 @@ class CacheManager:
                     cache_metadata,
                     metadata_file,
                     indent=4,
-                    default=str,
+                    sort_keys=True,
+                    ensure_ascii=False,
+                    allow_nan=False,
                 )
 
-        def write_weights(temporary_path):
-            torch.save(
-                model.state_dict(),
-                temporary_path,
-            )
-
-        # Metadata is written first. The weight file is written last
-        # because its existence indicates that the cache entry is ready.
         _atomic_write_file(
             metadata_path,
             write_metadata,
-        )
-
-        _atomic_write_file(
-            weight_path,
-            write_weights,
         )
 
