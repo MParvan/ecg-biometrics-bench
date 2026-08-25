@@ -532,7 +532,7 @@ class MainCLIRoutingTests(unittest.TestCase):
                     task,
                 )
 
-                timer_mock.assert_called_once_with()
+                timer_mock.assert_called_once_with(device='cpu')
 
                 expected_runner_name = (
                     RUNNER_BY_TASK[task]

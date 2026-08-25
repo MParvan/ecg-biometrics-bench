@@ -14,7 +14,7 @@ from artifact_provenance import build_data_compatibility_identity
 
 # Import Dataset Loaders
 from load_dataset import (
-    load_ecgid_dataset, load_heartprint_dataset, load_ptb_dataset, 
+    load_ecgid_dataset, load_heartprint_dataset, load_ptb_dataset,
     load_cybhi_dataset, load_mitbih_dataset, load_nsrdb_dataset, load_ptbxl_dataset,
     BeatProvenance
 )
@@ -2152,14 +2152,14 @@ def get_parser():
                             ))
     core_group.add_argument('--config', type=str, default=None,
                             help="Path to a YAML file providing experiment defaults. Explicit CLI values take precedence.")
-    
+
     # ----------------------------------------------------
     # DATASET ROUTING & PARAMS
     # ----------------------------------------------------
     data_group = parser.add_argument_group('Dataset & Split Routing')
     data_group.add_argument('--data_split_mode', type=str, default='all-available',
                             help="Dataset parsing logic (e.g., 'single-shot-short-term', 'cross-session').")
-    data_group.add_argument('--train_sessions', type=str, nargs='+', 
+    data_group.add_argument('--train_sessions', type=str, nargs='+',
                             help="Session tags for Training (CYBHi/HeartPrint). E.g., session1")
     data_group.add_argument('--enroll_sessions', type=str, nargs='+',
                             help="Session tags for Enrollment (CYBHi/HeartPrint).")
@@ -2336,6 +2336,16 @@ def get_parser():
     train_group.add_argument('--seed', type=int, default=42, help="Training/general stochastic seed (model initialization, training DataLoader shuffling, augmentation, and verification-pair sampling in the balanced/random modes). When --split_seed is omitted (or YAML null), it also supplies the data-role allocation seed.")
     train_group.add_argument('--n_runs', type=int, default=1, help="Number of repeated runs using consecutive training seeds. The data-role split schedule follows the --split_seed policy.")
     train_group.add_argument('--split_seed', type=int, default=None, help="Seed for randomized data-role allocation. Omit this option (or use YAML null) to follow the per-run training seed; provide a non-negative integer to hold the randomized partition fixed across training seeds.")
+    train_group.add_argument(
+        '--reproducibility_mode',
+        choices=['seeded', 'strict'],
+        default='seeded',
+        help=(
+            "Reproducibility policy: 'seeded' controls framework RNGs; "
+            "'strict' additionally enforces deterministic PyTorch/backend "
+            "execution (default: seeded)."
+        ),
+    )
 
     # ----------------------------------------------------
     # TRAINING-ONLY DATA AUGMENTATION
@@ -2396,7 +2406,7 @@ def get_parser():
     # EVALUATION & TEMPLATE SETTINGS
     # ----------------------------------------------------
     eval_group = parser.add_argument_group('Evaluation & Biometric Settings')
-    eval_group.add_argument('--use_template', action='store_true', 
+    eval_group.add_argument('--use_template', action='store_true',
                             help="Enable Template Matching (strips Softmax). Required for Tasks 3, 4, 7, 8.")
     eval_group.add_argument(
         '--template_fusion_method',
@@ -2562,7 +2572,7 @@ def get_parser():
                            help="Absolute minimum quality score to survive (0.0 to 1.0).")
     sqi_group.add_argument('--sqi_keep_pct', type=float, default=0.8,
                            help="Percentage of the best beats to keep per subject (default: 0.8 = 80%%).")
-    
+
     # ----------------------------------------------------
     # LOGGING & MISC
     # ----------------------------------------------------
@@ -2619,6 +2629,16 @@ def get_parser():
 def main():
     args, parser = parse_experiment_arguments()
 
+    # Strict CUDA setup must precede timer/profiling availability queries and
+    # every other operation that may initialize CUDA. Direct runner APIs apply
+    # this same preparation independently.
+    args.reproducibility_mode = (
+        utils._prepare_reproducibility_backend(
+            args.reproducibility_mode,
+            args.device,
+        )
+    )
+
     # ==========================================
     # 0. EFFECTIVE CONFIGURATION
     # ==========================================
@@ -2630,8 +2650,8 @@ def main():
 
     # Measure the complete pipeline, including data loading,
     # training, evaluation, and saved-result generation.
-    run.start_experiment_timer()
-    
+    run.start_experiment_timer(device=args.device)
+
     # ==========================================
     # 1. MODEL SELECTION
     # ==========================================
@@ -2648,7 +2668,7 @@ def main():
     )
 
     print(f"\n[INFO] Initializing {args.dataset.upper()} Dataset...")
-    
+
     if args.dataset == 'ecgid': loader = load_ecgid_dataset(**loader_kwargs)
     elif args.dataset == 'ptb': loader = load_ptb_dataset(**loader_kwargs)
     elif args.dataset == 'mitbih': loader = load_mitbih_dataset(**loader_kwargs)
@@ -2702,7 +2722,7 @@ def main():
         cache = CacheManager(
             base_dir=args.cache_dir
         )
-        
+
         # Tasks 1 to 4: Intra-Session
         if args.task in [1, 2, 3, 4]:
             data_config = build_data_cache_config(
@@ -2715,7 +2735,7 @@ def main():
                 cache.get_data_cache,
                 data_config,
             )
-            
+
             cached_provenance = None
             if cached_data and "x" in cached_data and "y" in cached_data:
                 cached_provenance = BeatProvenance.from_cache_dict(
@@ -2935,7 +2955,7 @@ def main():
             if x.shape[0] == 0:
                 print("[ERROR] No data returned from loader. Check your session configs.")
                 sys.exit(1)
-                
+
         # Tasks 5 to 8: Cross-Session
         elif args.task in [5, 6, 7, 8]:
             (
@@ -3035,6 +3055,7 @@ def main():
         'val_split': args.val_split,
         'seed': args.seed,
         'split_seed': args.split_seed,
+        'reproducibility_mode': args.reproducibility_mode,
         'n_runs': args.n_runs,
         'device': args.device,
         'visualize': args.visualize,
@@ -3079,8 +3100,8 @@ def main():
         # TASK 1: Closed-Set Identification
         if args.task == 1:
             run_closed_set_identification(
-                x, y, 
-                test_split=args.test_split, 
+                x, y,
+                test_split=args.test_split,
                 probe_fusion_size=args.probe_fusion_size,
                 sqi_scores=args.sqi_method,
                 provenance=provenance,
@@ -3090,7 +3111,7 @@ def main():
         # TASK 2: Verification
         elif args.task == 2:
             run_closed_set_verification(
-                x, y, 
+                x, y,
                 test_split=args.test_split,
                 pair_sampling_budget=args.pair_sampling_budget,
                 pair_sampling_mode=args.pair_sampling_mode,
@@ -3107,7 +3128,7 @@ def main():
         # TASK 3: Subject-Disjoint Identification
         elif args.task == 3:
             run_subject_disjoint_identification(
-                x, y, 
+                x, y,
                 test_split=args.test_split,
                 probe_fusion_size=args.probe_fusion_size,
                 sqi_scores=args.sqi_method,
@@ -3118,7 +3139,7 @@ def main():
         # TASK 4: Subject-Disjoint Verification
         elif args.task == 4:
             run_subject_disjoint_verification(
-                x, y, 
+                x, y,
                 test_split=args.test_split,
                 pair_sampling_budget=args.pair_sampling_budget,
                 pair_sampling_mode=args.pair_sampling_mode,

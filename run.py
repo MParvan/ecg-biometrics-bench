@@ -48,7 +48,7 @@ from scipy.interpolate import interp1d
 from scipy import stats
 
 from utils import (
-    _apply_score_fusion, _generate_fused_verification_pairs, _source_order_indices, _make_loader, _encode_labels, _get_device, _set_seed,
+    _apply_score_fusion, _generate_fused_verification_pairs, _source_order_indices, _make_loader, _encode_labels,
     _select_multi_templates, _reduce_template_scores_to_identities, _generate_multi_template_verification_pairs,
     _apply_outlier_filter, _compute_sqi, _compute_score_matrix,
     _get_embeddings, _create_templates, _generate_pairs, _resolve_pair_sampling_arguments,
@@ -59,6 +59,7 @@ from utils import (
     _run_training_loop, _run_train_loop_unseen_subjects, _train_epoch, _detect_channels,
     DEFAULT_CACHE_DIR, DEFAULT_RESULTS_DIR, resolve_artifact_path,
     _build_loader_cache_identity, _fingerprint_array_collection,
+    _prepare_reproducibility_backend, _setup_reproducibility,
 )
 
 from load_dataset import summarize_partition_log
@@ -91,6 +92,24 @@ def _get_installed_package_version(distribution_name):
         return "not installed"
 
 
+_ACTIVE_PROFILING_DEVICE_TYPE = "auto"
+
+def _set_active_profiling_device_type(device):
+    global _ACTIVE_PROFILING_DEVICE_TYPE
+    if device is None or device == "auto":
+        _ACTIVE_PROFILING_DEVICE_TYPE = "auto"
+    else:
+        try:
+            _ACTIVE_PROFILING_DEVICE_TYPE = torch.device(device).type
+        except Exception:
+            _ACTIVE_PROFILING_DEVICE_TYPE = "auto"
+
+def _should_query_cuda():
+    if _ACTIVE_PROFILING_DEVICE_TYPE == "cpu":
+        return False
+    return torch.cuda.is_available()
+
+
 def _collect_software_environment():
     """
     Collect the software and hardware environment used by an experiment.
@@ -99,47 +118,43 @@ def _collect_software_environment():
         "Python": platform.python_version(),
         "Operating System": platform.platform(),
         "PyTorch": str(torch.__version__),
-        "CUDA Available": bool(torch.cuda.is_available()),
-        "CUDA Runtime": (
-            str(torch.version.cuda)
-            if torch.version.cuda is not None
-            else "not available"
-        ),
         "NumPy": _get_installed_package_version("numpy"),
         "SciPy": _get_installed_package_version("scipy"),
-        "scikit-learn": _get_installed_package_version(
-            "scikit-learn"
-        ),
+        "scikit-learn": _get_installed_package_version("scikit-learn"),
         "pandas": _get_installed_package_version("pandas"),
-        "NeuroKit2": _get_installed_package_version(
-            "neurokit2"
-        ),
+        "NeuroKit2": _get_installed_package_version("neurokit2"),
         "WFDB": _get_installed_package_version("wfdb"),
         "PyYAML": _get_installed_package_version("PyYAML"),
     }
 
-    if torch.cuda.is_available():
+    if _should_query_cuda():
+        environment["CUDA Available"] = True
+        environment["CUDA Runtime"] = (
+            str(torch.version.cuda)
+            if torch.version.cuda is not None
+            else "not available"
+        )
         try:
-            environment["CUDA Device"] = (
-                torch.cuda.get_device_name(0)
-            )
+            environment["CUDA Device"] = torch.cuda.get_device_name(0)
         except Exception:
             environment["CUDA Device"] = "unavailable"
+    else:
+        environment["CUDA Available"] = None
+        environment["CUDA Runtime"] = None
+        environment["CUDA Device"] = None
 
     return environment
+
 
 # =============================================================================
 # COMPUTATIONAL PROFILE
 # =============================================================================
 
 _EXPERIMENT_START_TIME = None
+_ENTRYPOINT_PROFILE_PENDING_RUNNER = False
 
-_RUNTIME_STAGE_TOTALS = collections.defaultdict(
-    float
-)
-_RUNTIME_STAGE_COUNTS = collections.defaultdict(
-    int
-)
+_RUNTIME_STAGE_TOTALS = collections.defaultdict(float)
+_RUNTIME_STAGE_COUNTS = collections.defaultdict(int)
 _RUNTIME_RUN_TIMES = []
 
 _RUNTIME_STAGE_ORDER = (
@@ -171,12 +186,8 @@ def _reset_runtime_profile():
 def _synchronize_cuda():
     """
     Synchronize pending CUDA operations before a timing boundary.
-
-    CUDA execution is asynchronous, so synchronization is required for
-    meaningful wall-clock measurements. Synchronization failures are ignored
-    to ensure profiling cannot interrupt an experiment.
     """
-    if not torch.cuda.is_available():
+    if not _should_query_cuda():
         return
 
     try:
@@ -185,24 +196,58 @@ def _synchronize_cuda():
         pass
 
 
-def start_experiment_timer():
+def _initialize_runtime_profile(device=None):
     """
-    Start wall-clock, stage, and peak-memory profiling for one experiment.
-
-    The timer is started by the command-line entry point before dataset
-    loading, so total duration covers data preparation, training, evaluation,
-    and result generation up to creation of the experiment log.
+    Initialize a fresh wall-clock, stage, and peak-memory profile.
     """
     global _EXPERIMENT_START_TIME
 
+    _set_active_profiling_device_type(device)
     _reset_runtime_profile()
     _EXPERIMENT_START_TIME = time.perf_counter()
 
-    if torch.cuda.is_available():
+    if _should_query_cuda():
         try:
             torch.cuda.reset_peak_memory_stats()
         except Exception:
             pass
+
+
+def start_experiment_timer(device=None):
+    """Start a profile that the next top-level public runner will adopt."""
+    global _ENTRYPOINT_PROFILE_PENDING_RUNNER
+
+    _initialize_runtime_profile(device)
+    _ENTRYPOINT_PROFILE_PENDING_RUNNER = True
+
+
+def _activate_top_level_runtime_profile(
+    reproducibility_mode,
+    device,
+    recursive_run=False,
+):
+    """Prepare reproducibility and establish one profile per top-level run."""
+    global _ENTRYPOINT_PROFILE_PENDING_RUNNER
+
+    mode = _prepare_reproducibility_backend(
+        reproducibility_mode,
+        device,
+    )
+
+    if recursive_run:
+        return mode
+
+    if _ENTRYPOINT_PROFILE_PENDING_RUNNER:
+        # The CLI timer already includes dataset preparation and must not be
+        # reset when its selected runner starts.
+        _ENTRYPOINT_PROFILE_PENDING_RUNNER = False
+        _set_active_profiling_device_type(device)
+    else:
+        # A direct public API call owns a fresh profile, even if globals from
+        # an earlier completed experiment remain populated in this process.
+        _initialize_runtime_profile(device)
+
+    return mode
 
 
 def _start_runtime_stage():
@@ -522,7 +567,7 @@ def _collect_runtime_profile():
             np.max(run_durations)
         )
 
-    if torch.cuda.is_available():
+    if _should_query_cuda():
         try:
             peak_memory_bytes = (
                 torch.cuda.max_memory_allocated()
@@ -538,6 +583,10 @@ def _collect_runtime_profile():
             profile[
                 "Peak CUDA Memory (MiB)"
             ] = "unavailable"
+    else:
+        profile[
+            "Peak CUDA Memory (MiB)"
+        ] = None
 
     return profile
 
@@ -3926,6 +3975,16 @@ def _prepare_multi_run_arguments(local_arguments):
     """
     call_args = dict(local_arguments)
 
+    call_args[
+        "reproducibility_mode"
+    ] = _prepare_reproducibility_backend(
+        call_args.get(
+            "reproducibility_mode",
+            "seeded",
+        ),
+        call_args.get("device"),
+    )
+
     internal_keys = {
         "data_stats",
         "hyperparams",
@@ -4878,7 +4937,8 @@ def run_closed_set_identification(x, y, model_class, epochs=150, batch_size=256,
                                   intelligent_weight_loading=True,
                                   augmentation_config=None, split_seed=None, provenance=None,
         enrollment_template_mode='fusion', num_templates_per_identity=None,
-        template_selection_method=None, template_score_aggregation=None):
+        template_selection_method=None, template_score_aggregation=None,
+        reproducibility_mode="seeded"):
     """
     Standard Closed-Set Identification Pipeline (Intra-session).
     Determines "Who is this person?" from a known pool of subjects seen during training.
@@ -4920,11 +4980,18 @@ def run_closed_set_identification(x, y, model_class, epochs=150, batch_size=256,
         loader (object): Dataset loader instance (used for extracting metadata for logging).
         n_runs (int): Number of repeated runs using consecutive training seeds. The data-role split schedule follows the split_seed policy (it follows the training seeds when split_seed is None, and stays fixed when an explicit split_seed is given).
         _return_stats (bool): Internal flag used to pass data back during multi-seed recursion.
+        reproducibility_mode (str): Reproducibility policy ('seeded' or 'strict').
 
     Returns:
         tuple: (Rank-1 Accuracy, Rank-5 Accuracy)
                If n_runs > 1, returns tuples of (Mean, Std_Dev) for both metrics.
     """
+
+    reproducibility_mode = _activate_top_level_runtime_profile(
+        reproducibility_mode,
+        device,
+        recursive_run=_return_stats,
+    )
 
     (
         enrollment_template_mode,
@@ -5095,7 +5162,14 @@ def run_closed_set_identification(x, y, model_class, epochs=150, batch_size=256,
         hyperparams["template_selection_method"] = template_selection_method
         hyperparams["template_score_aggregation"] = template_score_aggregation
 
-    _set_seed(seed); device = _get_device(device)
+    device, reproducibility_state = _setup_reproducibility(
+        seed=seed,
+        device=device,
+        reproducibility_mode=reproducibility_mode,
+    )
+    _set_active_profiling_device_type(device)
+    hyperparams["reproducibility_mode"] = reproducibility_mode
+    hyperparams["reproducibility_state"] = reproducibility_state
     resolved_split_seed = seed if split_seed is None else split_seed
     partition_stage_started = _start_runtime_stage()
     task_title = "Closed-Set Identification"
@@ -5327,6 +5401,7 @@ def run_closed_set_identification(x, y, model_class, epochs=150, batch_size=256,
         "classes": len(classes),
         "data_shape": X_tr.shape,
         "augmentation": augmentation_config,
+        "reproducibility_mode": reproducibility_mode,
         }
 
         validation_arrays = _collect_validation_arrays(
@@ -5569,7 +5644,8 @@ def run_closed_set_verification(x, y, model_class, epochs=150, batch_size=256, l
         pair_sampling_seed=42,
         probe_fusion_size=1,
         enrollment_template_mode='fusion', num_templates_per_identity=None,
-        template_selection_method=None, template_score_aggregation=None):
+        template_selection_method=None, template_score_aggregation=None,
+        reproducibility_mode="seeded"):
     """
     Standard Closed-Set Verification Pipeline (Intra-session).
     Determines "Is this person who they claim to be?" (1:1 matching) for subjects known to the model.
@@ -5613,11 +5689,18 @@ def run_closed_set_verification(x, y, model_class, epochs=150, batch_size=256, l
         loader (object): Dataset loader instance (used for extracting metadata for logging).
         n_runs (int): Number of repeated runs using consecutive training seeds. The data-role split schedule follows the split_seed policy (it follows the training seeds when split_seed is None, and stays fixed when an explicit split_seed is given).
         _return_stats (bool): Internal flag used to pass data back during multi-seed recursion.
+        reproducibility_mode (str): Reproducibility policy ('seeded' or 'strict').
 
     Returns:
         tuple: (EER, AUC, d-prime, TAR @ 0.1% FAR)
                If n_runs > 1, returns tuples of (Mean, Std_Dev) for all four metrics.
     """
+
+    reproducibility_mode = _activate_top_level_runtime_profile(
+        reproducibility_mode,
+        device,
+        recursive_run=_return_stats,
+    )
 
     (
         enrollment_template_mode,
@@ -5821,7 +5904,14 @@ def run_closed_set_verification(x, y, model_class, epochs=150, batch_size=256, l
         hyperparams["template_selection_method"] = template_selection_method
         hyperparams["template_score_aggregation"] = template_score_aggregation
 
-    _set_seed(seed); device = _get_device(device)
+    device, reproducibility_state = _setup_reproducibility(
+        seed=seed,
+        device=device,
+        reproducibility_mode=reproducibility_mode,
+    )
+    _set_active_profiling_device_type(device)
+    hyperparams["reproducibility_mode"] = reproducibility_mode
+    hyperparams["reproducibility_state"] = reproducibility_state
     resolved_split_seed = seed if split_seed is None else split_seed
     partition_stage_started = _start_runtime_stage()
     task_title = "Closed-Set Verification"
@@ -6044,6 +6134,7 @@ def run_closed_set_verification(x, y, model_class, epochs=150, batch_size=256, l
             "val_split": val_split, "seed": seed, "outlier_train": outlier_filtering_on_train, 
             "sqi_thresh": sqi_threshold, "classes": len(classes), "data_shape": X_tr.shape,
             "augmentation": augmentation_config,
+            "reproducibility_mode": reproducibility_mode,
         }
 
         validation_arrays = _collect_validation_arrays(
@@ -6290,7 +6381,8 @@ def run_subject_disjoint_identification(x, y, model_class, epochs=150, batch_siz
                                         intelligent_weight_loading=True,
                                         augmentation_config=None, split_seed=None, provenance=None,
         enrollment_template_mode='fusion', num_templates_per_identity=None,
-        template_selection_method=None, template_score_aggregation=None):
+        template_selection_method=None, template_score_aggregation=None,
+        reproducibility_mode="seeded"):
     """
     Subject-Disjoint Identification Pipeline.
     Evaluates identification performance on subjects entirely UNSEEN during the training phase.
@@ -6330,11 +6422,18 @@ def run_subject_disjoint_identification(x, y, model_class, epochs=150, batch_siz
         loader (object): Dataset loader instance (used for extracting metadata for logging).
         n_runs (int): Number of repeated runs using consecutive training seeds. The data-role split schedule follows the split_seed policy (it follows the training seeds when split_seed is None, and stays fixed when an explicit split_seed is given).
         _return_stats (bool): Internal flag used to pass data back during multi-seed recursion.
+        reproducibility_mode (str): Reproducibility policy ('seeded' or 'strict').
 
     Returns:
         tuple: (Rank-1 Accuracy, Rank-5 Accuracy)
                If n_runs > 1, returns tuples of (Mean, Std_Dev) for both metrics.
     """   
+
+    reproducibility_mode = _activate_top_level_runtime_profile(
+        reproducibility_mode,
+        device,
+        recursive_run=_return_stats,
+    )
 
     # --- ENFORCE OUR AGREED TERMINOLOGY ---
     if not use_template:
@@ -6506,7 +6605,14 @@ def run_subject_disjoint_identification(x, y, model_class, epochs=150, batch_siz
         hyperparams["template_selection_method"] = template_selection_method
         hyperparams["template_score_aggregation"] = template_score_aggregation
 
-    _set_seed(seed); device = _get_device(device)
+    device, reproducibility_state = _setup_reproducibility(
+        seed=seed,
+        device=device,
+        reproducibility_mode=reproducibility_mode,
+    )
+    _set_active_profiling_device_type(device)
+    hyperparams["reproducibility_mode"] = reproducibility_mode
+    hyperparams["reproducibility_state"] = reproducibility_state
     resolved_split_seed = seed if split_seed is None else split_seed
     partition_stage_started = _start_runtime_stage()
     task_title = "Subject-Disjoint Identification"
@@ -6724,6 +6830,7 @@ def run_subject_disjoint_identification(x, y, model_class, epochs=150, batch_siz
             "val_split": val_split, "seed": seed, "outlier_train": outlier_filtering_on_train, 
             "sqi_thresh": sqi_threshold, "classes": num_train_classes, "data_shape": X_tr.shape,
             "augmentation": augmentation_config,
+            "reproducibility_mode": reproducibility_mode,
             "matching_method": matching_method  # Affects early stopping EER!
         }
 
@@ -7008,7 +7115,8 @@ def run_subject_disjoint_verification(x, y, model_class, epochs=150, batch_size=
         pair_sampling_seed=42,
         probe_fusion_size=1,
         enrollment_template_mode='fusion', num_templates_per_identity=None,
-        template_selection_method=None, template_score_aggregation=None):
+        template_selection_method=None, template_score_aggregation=None,
+        reproducibility_mode="seeded"):
     """
     Subject-Disjoint Verification Pipeline (Subject-Disjoint 1:1 Matching).
     Tests the system's ability to verify the identity of completely new users.
@@ -7052,11 +7160,18 @@ def run_subject_disjoint_verification(x, y, model_class, epochs=150, batch_size=
         loader (object): Dataset loader instance (used for extracting metadata for logging).
         n_runs (int): Number of repeated runs using consecutive training seeds. The data-role split schedule follows the split_seed policy (it follows the training seeds when split_seed is None, and stays fixed when an explicit split_seed is given).
         _return_stats (bool): Internal flag used to pass data back during multi-seed recursion.
+        reproducibility_mode (str): Reproducibility policy ('seeded' or 'strict').
 
     Returns:
         tuple: (EER, AUC, d-prime, TAR @ 0.1% FAR)
                If n_runs > 1, returns tuples of (Mean, Std_Dev) for all four metrics.
     """
+
+    reproducibility_mode = _activate_top_level_runtime_profile(
+        reproducibility_mode,
+        device,
+        recursive_run=_return_stats,
+    )
 
     (
         enrollment_template_mode,
@@ -7264,10 +7379,17 @@ def run_subject_disjoint_verification(x, y, model_class, epochs=150, batch_size=
         hyperparams["template_selection_method"] = template_selection_method
         hyperparams["template_score_aggregation"] = template_score_aggregation
 
-    _set_seed(seed); device = _get_device(device)
+    device, reproducibility_state = _setup_reproducibility(
+        seed=seed,
+        device=device,
+        reproducibility_mode=reproducibility_mode,
+    )
+    _set_active_profiling_device_type(device)
+    hyperparams["reproducibility_mode"] = reproducibility_mode
+    hyperparams["reproducibility_state"] = reproducibility_state
     resolved_split_seed = seed if split_seed is None else split_seed
     partition_stage_started = _start_runtime_stage()
-    task_title = "Subject-Disjoint Verification"        
+    task_title = "Subject-Disjoint Verification"
     mode_str = f"Template ({template_fusion_method}, First {template_size})" if use_template else "Cloud Pairs (Test Only)"
     print(f"\n[TASK] {task_title} | Mode: {mode_str} | Match: {matching_method}")
 
@@ -7488,6 +7610,7 @@ def run_subject_disjoint_verification(x, y, model_class, epochs=150, batch_size=
             "val_split": val_split, "seed": seed, "outlier_train": outlier_filtering_on_train, 
             "sqi_thresh": sqi_threshold, "classes": num_train_classes, "data_shape": X_tr.shape,
             "augmentation": augmentation_config,
+            "reproducibility_mode": reproducibility_mode,
             "matching_method": matching_method  # Affects early stopping EER!
         }
 
@@ -7902,7 +8025,8 @@ def run_cross_session_identification(x_train, y_train, x_test, y_test, model_cla
                                      augmentation_config=None, split_seed=None, provenance_s1=None, provenance_s2=None,
                                      x_enroll=None, y_enroll=None, provenance_enroll=None,
         enrollment_template_mode='fusion', num_templates_per_identity=None,
-        template_selection_method=None, template_score_aggregation=None):
+        template_selection_method=None, template_score_aggregation=None,
+        reproducibility_mode="seeded"):
     """
     Cross-session identification with protocol-defined data roles.
 
@@ -7948,11 +8072,18 @@ def run_cross_session_identification(x_train, y_train, x_test, y_test, model_cla
         loader (object): Dataset loader instance (used for extracting metadata for logging).
         n_runs (int): Number of repeated runs using consecutive training seeds. The data-role split schedule follows the split_seed policy (it follows the training seeds when split_seed is None, and stays fixed when an explicit split_seed is given).
         _return_stats (bool): Internal flag used to pass data back during multi-seed recursion.
+        reproducibility_mode (str): Reproducibility policy ('seeded' or 'strict').
 
     Returns:
         tuple: (Rank-1 Accuracy, Rank-5 Accuracy)
                If n_runs > 1, returns tuples of (Mean, Std_Dev) for both metrics.
     """
+
+    reproducibility_mode = _activate_top_level_runtime_profile(
+        reproducibility_mode,
+        device,
+        recursive_run=_return_stats,
+    )
 
     (
         enrollment_template_mode,
@@ -8103,7 +8234,14 @@ def run_cross_session_identification(x_train, y_train, x_test, y_test, model_cla
         hyperparams["template_selection_method"] = template_selection_method
         hyperparams["template_score_aggregation"] = template_score_aggregation
 
-    _set_seed(seed); device = _get_device(device)
+    device, reproducibility_state = _setup_reproducibility(
+        seed=seed,
+        device=device,
+        reproducibility_mode=reproducibility_mode,
+    )
+    _set_active_profiling_device_type(device)
+    hyperparams["reproducibility_mode"] = reproducibility_mode
+    hyperparams["reproducibility_state"] = reproducibility_state
     resolved_split_seed = seed if split_seed is None else split_seed
     partition_stage_started = _start_runtime_stage()
     task_title = "Cross-Session Identification"
@@ -8341,6 +8479,7 @@ def run_cross_session_identification(x_train, y_train, x_test, y_test, model_cla
             "val_split": val_split, "seed": seed, "outlier_train": outlier_filtering_on_train, 
             "sqi_thresh": sqi_threshold, "classes": len(classes), "data_shape": X_tr.shape,
             "augmentation": augmentation_config,
+            "reproducibility_mode": reproducibility_mode,
         }
 
         validation_arrays = _collect_validation_arrays(
@@ -8600,7 +8739,8 @@ def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class
         pair_sampling_seed=42,
         probe_fusion_size=1,
         enrollment_template_mode='fusion', num_templates_per_identity=None,
-        template_selection_method=None, template_score_aggregation=None):
+        template_selection_method=None, template_score_aggregation=None,
+        reproducibility_mode="seeded"):
     """
     Cross-session verification with protocol-defined data roles.
 
@@ -8647,11 +8787,18 @@ def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class
         loader (object): Dataset loader instance (used for extracting metadata for logging).
         n_runs (int): Number of repeated runs using consecutive training seeds. The data-role split schedule follows the split_seed policy (it follows the training seeds when split_seed is None, and stays fixed when an explicit split_seed is given).
         _return_stats (bool): Internal flag used to pass data back during multi-seed recursion.
+        reproducibility_mode (str): Reproducibility policy ('seeded' or 'strict').
 
     Returns:
         tuple: (EER, AUC, d-prime, TAR @ 0.1% FAR)
                If n_runs > 1, returns tuples of (Mean, Std_Dev) for all four metrics.
     """
+
+    reproducibility_mode = _activate_top_level_runtime_profile(
+        reproducibility_mode,
+        device,
+        recursive_run=_return_stats,
+    )
 
     (
         enrollment_template_mode,
@@ -8848,7 +8995,14 @@ def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class
         hyperparams["template_selection_method"] = template_selection_method
         hyperparams["template_score_aggregation"] = template_score_aggregation
 
-    _set_seed(seed); device = _get_device(device)
+    device, reproducibility_state = _setup_reproducibility(
+        seed=seed,
+        device=device,
+        reproducibility_mode=reproducibility_mode,
+    )
+    _set_active_profiling_device_type(device)
+    hyperparams["reproducibility_mode"] = reproducibility_mode
+    hyperparams["reproducibility_state"] = reproducibility_state
     resolved_split_seed = seed if split_seed is None else split_seed
     partition_stage_started = _start_runtime_stage()
     task_title = "Cross-Session Verification"
@@ -9120,6 +9274,7 @@ def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class
             "val_split": val_split, "seed": seed, "outlier_train": outlier_filtering_on_train, 
             "sqi_thresh": sqi_threshold, "classes": len(classes), "data_shape": X_tr.shape,
             "augmentation": augmentation_config,
+            "reproducibility_mode": reproducibility_mode,
         }
 
         validation_arrays = _collect_validation_arrays(
@@ -9381,7 +9536,8 @@ def run_subject_disjoint_cross_session_identification(
         augmentation_config=None, split_seed=None, provenance_s1=None, provenance_s2=None,
         x_enroll=None, y_enroll=None, provenance_enroll=None,
         enrollment_template_mode='fusion', num_templates_per_identity=None,
-        template_selection_method=None, template_score_aggregation=None):
+        template_selection_method=None, template_score_aggregation=None,
+        reproducibility_mode="seeded"):
     """
     Subject-disjoint cross-session identification.
     1. Fits a feature extractor using the training role for Subject Group A.
@@ -9425,11 +9581,17 @@ def run_subject_disjoint_cross_session_identification(
         loader (object): Dataset loader instance (used for extracting metadata for logging).
         n_runs (int): Number of repeated runs using consecutive training seeds. The data-role split schedule follows the split_seed policy (it follows the training seeds when split_seed is None, and stays fixed when an explicit split_seed is given).
         _return_stats (bool): Internal flag used to pass data back during multi-seed recursion.
+        reproducibility_mode (str): Reproducibility policy ('seeded' or 'strict').
 
     Returns:
         tuple: (Rank-1 Accuracy, Rank-5 Accuracy)
                If n_runs > 1, returns tuples of (Mean, Std_Dev) for both metrics.
     """
+    reproducibility_mode = _activate_top_level_runtime_profile(
+        reproducibility_mode,
+        device,
+        recursive_run=_return_stats,
+    )
     
     (
         enrollment_template_mode,
@@ -9583,7 +9745,14 @@ def run_subject_disjoint_cross_session_identification(
         hyperparams["template_selection_method"] = template_selection_method
         hyperparams["template_score_aggregation"] = template_score_aggregation
 
-    _set_seed(seed); device = _get_device(device)
+    device, reproducibility_state = _setup_reproducibility(
+        seed=seed,
+        device=device,
+        reproducibility_mode=reproducibility_mode,
+    )
+    _set_active_profiling_device_type(device)
+    hyperparams["reproducibility_mode"] = reproducibility_mode
+    hyperparams["reproducibility_state"] = reproducibility_state
     resolved_split_seed = seed if split_seed is None else split_seed
     partition_stage_started = _start_runtime_stage()
     task_title = "Subject-Disjoint Cross-Session ID"
@@ -9833,6 +10002,7 @@ def run_subject_disjoint_cross_session_identification(
             "val_split": val_split, "seed": seed, "outlier_train": outlier_filtering_on_train, 
             "sqi_thresh": sqi_threshold, "classes": num_train_classes, "data_shape": X_tr.shape,
             "augmentation": augmentation_config,
+            "reproducibility_mode": reproducibility_mode,
             "matching_method": matching_method # Affects early stopping EER!
         }
 
@@ -10074,7 +10244,8 @@ def run_subject_disjoint_cross_session_verification(
         pair_sampling_seed=42,
         probe_fusion_size=1,
         enrollment_template_mode='fusion', num_templates_per_identity=None,
-        template_selection_method=None, template_score_aggregation=None):
+        template_selection_method=None, template_score_aggregation=None,
+        reproducibility_mode="seeded"):
     """
     Subject-disjoint cross-session verification.
 
@@ -10123,11 +10294,18 @@ def run_subject_disjoint_cross_session_verification(
         loader (object): Dataset loader instance (used for extracting metadata for logging).
         n_runs (int): Number of repeated runs using consecutive training seeds. The data-role split schedule follows the split_seed policy (it follows the training seeds when split_seed is None, and stays fixed when an explicit split_seed is given).
         _return_stats (bool): Internal flag used to pass data back during multi-seed recursion.
+        reproducibility_mode (str): Reproducibility policy ('seeded' or 'strict').
 
     Returns:
         tuple: (EER, AUC, d-prime, TAR @ 0.1% FAR)
                If n_runs > 1, returns tuples of (Mean, Std_Dev) for all four metrics.
     """
+
+    reproducibility_mode = _activate_top_level_runtime_profile(
+        reproducibility_mode,
+        device,
+        recursive_run=_return_stats,
+    )
 
     (
         enrollment_template_mode,
@@ -10327,7 +10505,14 @@ def run_subject_disjoint_cross_session_verification(
         hyperparams["template_selection_method"] = template_selection_method
         hyperparams["template_score_aggregation"] = template_score_aggregation
 
-    _set_seed(seed); device = _get_device(device)
+    device, reproducibility_state = _setup_reproducibility(
+        seed=seed,
+        device=device,
+        reproducibility_mode=reproducibility_mode,
+    )
+    _set_active_profiling_device_type(device)
+    hyperparams["reproducibility_mode"] = reproducibility_mode
+    hyperparams["reproducibility_state"] = reproducibility_state
     resolved_split_seed = seed if split_seed is None else split_seed
     partition_stage_started = _start_runtime_stage()
     task_title = "Subject-Disjoint Cross-Session Verification"
@@ -10584,6 +10769,7 @@ def run_subject_disjoint_cross_session_verification(
             "val_split": val_split, "seed": seed, "outlier_train": outlier_filtering_on_train, 
             "sqi_thresh": sqi_threshold, "classes": num_train_classes, "data_shape": X_tr.shape,
             "augmentation": augmentation_config,
+            "reproducibility_mode": reproducibility_mode,
             "matching_method": matching_method # Affects early stopping EER!
         }
 

@@ -12,6 +12,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 import run
+import utils
 
 
 class TinyECGModel(nn.Module):
@@ -439,9 +440,9 @@ class MultiRunSmokeTests(unittest.TestCase):
         Execute one two-seed experiment while prohibiting cache and log use.
         """
         with patch.object(
-            run,
+            utils,
             "_set_seed",
-            wraps=run._set_seed,
+            wraps=utils._set_seed,
         ) as seed_mock, patch(
             "utils.CacheManager",
             side_effect=AssertionError(
@@ -457,8 +458,8 @@ class MultiRunSmokeTests(unittest.TestCase):
         self.assertEqual(
             seed_mock.call_args_list,
             [
-                call(40),
-                call(41),
+                unittest.mock.call(40, device_type='cpu'),
+                unittest.mock.call(41, device_type='cpu'),
             ],
         )
 

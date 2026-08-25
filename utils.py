@@ -33,12 +33,249 @@ from sklearn.metrics import (
 # =============================================================================
 # 1. UTILITIES & SETUP
 # =============================================================================
-def _set_seed(seed: int = 42):
-    """Ensures reproducibility across Numpy, Random, and PyTorch."""
+_REPRODUCIBILITY_MODES = (
+    "seeded",
+    "strict",
+)
+
+_STRICT_CUBLAS_WORKSPACE_CONFIG = ":4096:8"
+_SUPPORTED_CUBLAS_WORKSPACE_CONFIGS = {
+    ":4096:8",
+    ":16:8",
+}
+
+
+def _normalize_reproducibility_mode(mode):
+    """Validate and normalize the public reproducibility policy."""
+    if mode not in _REPRODUCIBILITY_MODES:
+        raise ValueError(
+            "reproducibility_mode must be one of "
+            f"{list(_REPRODUCIBILITY_MODES)}, received {mode!r}."
+        )
+    return mode
+
+
+def _requested_device_type(device):
+    """Return a device type without querying or initializing an accelerator."""
+    if device is None or device == "auto":
+        return "auto"
+
+    try:
+        return torch.device(device).type
+    except (TypeError, RuntimeError) as error:
+        raise ValueError(
+            f"Invalid computation device {device!r}: {error}"
+        ) from error
+
+
+def _prepare_reproducibility_backend(
+    reproducibility_mode="seeded",
+    device=None,
+):
+    """Perform strict CUDA environment setup before any CUDA query.
+
+    Explicit CPU strict mode deliberately avoids every CUDA API. Auto and
+    explicit CUDA requests establish the cuBLAS workspace policy before
+    checking CUDA availability or resolving a device.
+    """
+    mode = _normalize_reproducibility_mode(
+        reproducibility_mode
+    )
+    requested_device_type = _requested_device_type(
+        device
+    )
+
+    if mode != "strict" or requested_device_type not in {
+        "auto",
+        "cuda",
+    }:
+        return mode
+
+    configured_workspace = os.environ.get(
+        "CUBLAS_WORKSPACE_CONFIG"
+    )
+
+    if configured_workspace in (
+        _SUPPORTED_CUBLAS_WORKSPACE_CONFIGS
+    ):
+        return mode
+
+    if torch.cuda.is_initialized():
+        raise RuntimeError(
+            "Strict CUDA reproducibility was requested after CUDA was "
+            "already initialized without a supported "
+            "CUBLAS_WORKSPACE_CONFIG. Start a fresh process and set "
+            "CUBLAS_WORKSPACE_CONFIG to ':4096:8' or ':16:8' before "
+            "CUDA initialization."
+        )
+
+    os.environ[
+        "CUBLAS_WORKSPACE_CONFIG"
+    ] = _STRICT_CUBLAS_WORKSPACE_CONFIG
+    return mode
+
+
+def _set_seed(seed: int = 42, device_type="cpu"):
+    """Seed Python, NumPy, PyTorch CPU, and the selected CUDA backend."""
     random.seed(seed)
     np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available(): torch.cuda.manual_seed_all(seed)
+    torch.default_generator.manual_seed(seed)
+
+    if device_type == "cuda":
+        torch.cuda.manual_seed_all(seed)
+
+
+def _configure_reproducibility_backend(
+    reproducibility_mode,
+    device_type,
+):
+    """Apply or restore process-global PyTorch determinism settings."""
+    strict = reproducibility_mode == "strict"
+
+    torch.use_deterministic_algorithms(
+        strict,
+        warn_only=False,
+    )
+
+    if device_type == "cuda":
+        if strict:
+            workspace = os.environ.get(
+                "CUBLAS_WORKSPACE_CONFIG"
+            )
+            if workspace not in _SUPPORTED_CUBLAS_WORKSPACE_CONFIGS:
+                raise RuntimeError(
+                    "Strict CUDA reproducibility requires "
+                    "CUBLAS_WORKSPACE_CONFIG=':4096:8' or ':16:8' "
+                    "before CUDA initialization."
+                )
+
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
+        else:
+            # Restore the framework's ordinary seeded/default backend policy so a
+            # seeded run never inherits process-global settings from a strict run.
+            torch.backends.cudnn.deterministic = False
+            torch.backends.cudnn.benchmark = False
+
+    deterministic_enabled = (
+        torch.are_deterministic_algorithms_enabled()
+    )
+    warn_only_enabled = (
+        torch.is_deterministic_algorithms_warn_only_enabled()
+    )
+
+    if strict and (
+        not deterministic_enabled
+        or warn_only_enabled
+    ):
+        raise RuntimeError(
+            "Strict reproducibility could not enable enforced PyTorch "
+            "deterministic algorithms."
+        )
+
+    if not strict and deterministic_enabled:
+        raise RuntimeError(
+            "Seeded reproducibility could not restore non-strict PyTorch "
+            "algorithm settings."
+        )
+
+
+def _collect_reproducibility_state(
+    reproducibility_mode,
+    device,
+    requested_device=None,
+):
+    """Return the canonical requested and effective backend runtime state."""
+    mode = _normalize_reproducibility_mode(
+        reproducibility_mode
+    )
+    device_type = torch.device(device).type
+
+    if device_type == "cuda":
+        try:
+            device_name = torch.cuda.get_device_name(
+                device
+            )
+        except Exception:
+            device_name = "unavailable"
+
+        cudnn_deterministic = bool(
+            torch.backends.cudnn.deterministic
+        )
+        cudnn_benchmark = bool(
+            torch.backends.cudnn.benchmark
+        )
+        cublas_workspace_config = os.environ.get(
+            "CUBLAS_WORKSPACE_CONFIG"
+        )
+        try:
+            cudnn_version = torch.backends.cudnn.version()
+        except Exception:
+            cudnn_version = "unavailable"
+
+        torch_cuda_version = (
+            str(torch.version.cuda)
+            if torch.version.cuda is not None
+            else "unavailable"
+        )
+    else:
+        device_name = str(device_type)
+        cudnn_deterministic = None
+        cudnn_benchmark = None
+        cublas_workspace_config = None
+        cudnn_version = None
+        torch_cuda_version = None
+
+    return {
+        "requested_mode": mode,
+        "effective_mode": mode,
+        "requested_device": "auto" if requested_device is None else requested_device,
+        "device_type": device_type,
+        "device_name": device_name,
+        "deterministic_algorithms_enabled": bool(
+            torch.are_deterministic_algorithms_enabled()
+        ),
+        "cudnn_deterministic": cudnn_deterministic,
+        "cudnn_benchmark": cudnn_benchmark,
+        "cublas_workspace_config": cublas_workspace_config,
+        "torch_version": str(torch.__version__),
+        "torch_cuda_version": torch_cuda_version,
+        "cudnn_version": cudnn_version,
+    }
+
+
+def _setup_reproducibility(
+    seed=42,
+    device=None,
+    reproducibility_mode="seeded",
+):
+    """Prepare the backend, resolve the device, enforce policy, and seed RNGs."""
+    mode = _prepare_reproducibility_backend(
+        reproducibility_mode,
+        device,
+    )
+    resolved_device = _get_device(
+        device
+    )
+    device_type = torch.device(
+        resolved_device
+    ).type
+
+    _configure_reproducibility_backend(
+        mode,
+        device_type,
+    )
+    _set_seed(
+        seed,
+        device_type=device_type,
+    )
+
+    state = _collect_reproducibility_state(
+        mode,
+        resolved_device,
+        requested_device=device,
+    )
+    return resolved_device, state
 
 def _get_device(device: Optional[str] = None) -> str:
     """Auto-selects CUDA if available, unless specified otherwise."""
