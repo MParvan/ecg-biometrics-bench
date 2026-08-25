@@ -2,6 +2,7 @@ import os
 import sys
 import pytest
 from contextlib import contextmanager
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
@@ -114,7 +115,7 @@ class MockModel:
         return self
 
 
-def _run_representative_single_cpu():
+def _run_representative_single_cpu(cache_dir):
     x = np.random.default_rng(42).random((10, 64))
     y = np.tile(np.arange(2), 5)
 
@@ -147,6 +148,7 @@ def _run_representative_single_cpu():
             epochs=1,
             device="cpu",
             test_split=0.5,
+            loader=SimpleNamespace(cache_dir=cache_dir),
         )
 
 
@@ -258,7 +260,7 @@ def test_collect_reproducibility_state_cpu(mock_enabled):
     assert state["torch_cuda_version"] is None
     assert state["cudnn_version"] is None
 
-def test_direct_single_cpu_avoids_cuda_and_starts_fresh_profile():
+def test_direct_single_cpu_avoids_cuda_and_starts_fresh_profile(tmp_path):
     run._ENTRYPOINT_PROFILE_PENDING_RUNNER = False
     run._EXPERIMENT_START_TIME = -1.0
     run._ACTIVE_PROFILING_DEVICE_TYPE = "auto"
@@ -269,7 +271,7 @@ def test_direct_single_cpu_avoids_cuda_and_starts_fresh_profile():
     )
 
     with _assert_no_cuda_calls():
-        _run_representative_single_cpu()
+        _run_representative_single_cpu(tmp_path / "cache")
 
     assert run._EXPERIMENT_START_TIME != -1.0
     assert "stale stage" not in run._RUNTIME_STAGE_TOTALS
@@ -322,14 +324,14 @@ def test_direct_multi_run_cpu_sets_profile_before_outer_timing():
     assert run._ACTIVE_PROFILING_DEVICE_TYPE == "cpu"
 
 
-def test_cli_started_profile_is_adopted_without_reset():
+def test_cli_started_profile_is_adopted_without_reset(tmp_path):
     run.start_experiment_timer(device="cpu")
     cli_start_time = run._EXPERIMENT_START_TIME
     run._RUNTIME_STAGE_TOTALS["Data Preparation (inclusive)"] = 12.5
     run._RUNTIME_STAGE_COUNTS["Data Preparation (inclusive)"] = 1
 
     with _assert_no_cuda_calls():
-        _run_representative_single_cpu()
+        _run_representative_single_cpu(tmp_path / "cache")
 
     assert run._EXPERIMENT_START_TIME == cli_start_time
     assert run._RUNTIME_STAGE_TOTALS[
