@@ -65,6 +65,26 @@ def make_args():
 
 
 class DataCacheConfigurationTests(unittest.TestCase):
+    def test_cache_configuration_contains_data_compatibility_identity(self):
+        config = build_data_cache_config(
+            make_args(),
+            DummyLoader(),
+            task_type="cross_session",
+        )
+
+        implementation = config["implementation_identity"]
+        dependencies = config["dependency_identity"]
+        self.assertEqual(
+            set(implementation["components"]),
+            {"load_dataset", "preprocessing", "filtering"},
+        )
+        self.assertEqual(len(implementation["aggregate_sha256"]), 64)
+        self.assertEqual(
+            set(dependencies["distributions"]),
+            {"numpy", "scipy", "neurokit2", "wfdb", "pandas"},
+        )
+        self.assertEqual(len(dependencies["aggregate_sha256"]), 64)
+
     def test_cache_configuration_contains_all_routing_fields(self):
         config = build_data_cache_config(
             make_args(),

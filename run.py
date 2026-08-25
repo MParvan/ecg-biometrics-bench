@@ -39,6 +39,7 @@ import subprocess
 import platform
 import sys
 from importlib import metadata
+from artifact_provenance import build_weight_compatibility_identity
 
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import roc_curve, auc
@@ -4081,6 +4082,20 @@ def _build_weight_cache_config(
     complete_config[
         "loader_identity"
     ] = loader_identity
+
+    compatibility_identity = (
+        build_weight_compatibility_identity()
+    )
+    complete_config[
+        "implementation_identity"
+    ] = compatibility_identity[
+        "implementation"
+    ]
+    complete_config[
+        "dependency_identity"
+    ] = compatibility_identity[
+        "dependencies"
+    ]
 
     return complete_config
 

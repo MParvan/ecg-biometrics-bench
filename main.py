@@ -10,6 +10,7 @@ from numbers import Integral, Real
 from pathlib import Path
 import run
 import utils
+from artifact_provenance import build_data_compatibility_identity
 
 # Import Dataset Loaders
 from load_dataset import (
@@ -1993,6 +1994,10 @@ def build_data_cache_config(
     ):
         enroll_sessions = None
 
+    compatibility_identity = (
+        build_data_compatibility_identity()
+    )
+
     return {
         "dataset": args.dataset,
         "loader_class": (
@@ -2050,6 +2055,16 @@ def build_data_cache_config(
         "loader_settings": (
             loader_identity[
                 "settings"
+            ]
+        ),
+        "implementation_identity": (
+            compatibility_identity[
+                "implementation"
+            ]
+        ),
+        "dependency_identity": (
+            compatibility_identity[
+                "dependencies"
             ]
         ),
     }

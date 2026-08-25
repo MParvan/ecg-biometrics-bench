@@ -138,8 +138,16 @@ class WeightCacheEpochMetadataTests(
                 metadata["epochs"],
                 50,
             )
+            self.assertEqual(
+                metadata["cache_identity"],
+                config,
+            )
+            self.assertIn(
+                "creation_provenance",
+                metadata,
+            )
 
-    def test_legacy_metadata_uses_configured_epochs(self):
+    def test_legacy_metadata_without_authoritative_identity_is_a_miss(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             cache = CacheManager(
                 base_dir=temporary_directory
@@ -185,7 +193,7 @@ class WeightCacheEpochMetadataTests(
                 encoding="utf-8",
             )
 
-            restored_model, _ = (
+            restored_model, restored_uid = (
                 cache.get_weight_cache(
                     config,
                     nn.Linear(3, 2),
@@ -193,10 +201,8 @@ class WeightCacheEpochMetadataTests(
                 )
             )
 
-            self.assertEqual(
-                restored_model.actual_epochs,
-                25,
-            )
+            self.assertIsNone(restored_model)
+            self.assertEqual(restored_uid, uid)
 
     def test_runners_do_not_overwrite_cached_epoch_metadata(self):
         run_source = Path(

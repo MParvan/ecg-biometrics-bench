@@ -62,6 +62,40 @@ def make_training_config():
 
 
 class WeightCacheConfigurationTests(unittest.TestCase):
+    def test_cache_configuration_contains_weight_compatibility_identity(self):
+        config = _build_weight_cache_config(
+            DummyLoader(),
+            make_training_config(),
+        )
+
+        implementation = config["implementation_identity"]
+        dependencies = config["dependency_identity"]
+        self.assertEqual(
+            set(implementation["data_implementation"]["components"]),
+            {"load_dataset", "preprocessing", "filtering"},
+        )
+        self.assertEqual(
+            set(
+                implementation[
+                    "weight_training_implementation"
+                ]["components"]
+            ),
+            {"models", "run", "utils", "data_augmentation"},
+        )
+        self.assertEqual(len(implementation["aggregate_sha256"]), 64)
+        self.assertEqual(
+            set(dependencies["data_dependencies"]["distributions"]),
+            {"numpy", "scipy", "neurokit2", "wfdb", "pandas"},
+        )
+        self.assertEqual(
+            set(
+                dependencies[
+                    "weight_training_dependencies"
+                ]["distributions"]
+            ),
+            {"torch", "torchvision", "scikit-learn"},
+        )
+
     def test_loader_identity_is_added(self):
         config = _build_weight_cache_config(
             DummyLoader(),

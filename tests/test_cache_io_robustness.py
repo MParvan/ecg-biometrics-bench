@@ -3,6 +3,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 import torch
@@ -94,6 +95,26 @@ class CacheIORobustnessTests(unittest.TestCase):
                 arrays,
                 configuration,
                 uid,
+                creation_provenance={
+                    "git": {"status": "test"}
+                },
+            )
+
+            metadata_path = (
+                Path(temporary_directory)
+                / "data"
+                / f"{uid}.json"
+            )
+            metadata = json.loads(
+                metadata_path.read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                metadata["cache_identity"],
+                configuration,
+            )
+            self.assertEqual(
+                metadata["creation_provenance"],
+                {"git": {"status": "test"}},
             )
 
             loaded, loaded_uid = (
@@ -160,7 +181,9 @@ class CacheIORobustnessTests(unittest.TestCase):
                 b"not a valid npz archive"
             )
             metadata_path.write_text(
-                json.dumps(configuration),
+                json.dumps(
+                    {"cache_identity": configuration}
+                ),
                 encoding="utf-8",
             )
 
@@ -225,7 +248,9 @@ class CacheIORobustnessTests(unittest.TestCase):
                 b"not a valid PyTorch checkpoint"
             )
             metadata_path.write_text(
-                json.dumps(configuration),
+                json.dumps(
+                    {"cache_identity": configuration}
+                ),
                 encoding="utf-8",
             )
 
@@ -257,6 +282,94 @@ class CacheIORobustnessTests(unittest.TestCase):
             self.assertFalse(
                 metadata_path.exists()
             )
+
+    def test_data_metadata_mismatch_is_a_miss_without_opening_payload(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            cache = CacheManager(base_dir=temporary_directory)
+            configuration = {"dataset": "synthetic", "split": "train"}
+            _, uid = cache.get_data_cache(configuration)
+            data_path = Path(cache.data_dir) / f"{uid}.npz"
+            metadata_path = Path(cache.data_dir) / f"{uid}.json"
+            data_path.write_bytes(b"payload must not be opened")
+            metadata_path.write_text(
+                json.dumps(
+                    {"cache_identity": {**configuration, "split": "other"}}
+                ),
+                encoding="utf-8",
+            )
+
+            with mock.patch("utils.np.load") as payload_loader:
+                loaded, loaded_uid = cache.get_data_cache(configuration)
+
+            self.assertIsNone(loaded)
+            self.assertEqual(loaded_uid, uid)
+            payload_loader.assert_not_called()
+            self.assertTrue(data_path.exists())
+            self.assertTrue(metadata_path.exists())
+
+    def test_missing_authoritative_data_identity_is_a_legacy_miss(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            cache = CacheManager(base_dir=temporary_directory)
+            configuration = {"dataset": "synthetic", "split": "train"}
+            _, uid = cache.get_data_cache(configuration)
+            data_path = Path(cache.data_dir) / f"{uid}.npz"
+            metadata_path = Path(cache.data_dir) / f"{uid}.json"
+            data_path.write_bytes(b"legacy payload")
+            metadata_path.write_text(
+                json.dumps(configuration),
+                encoding="utf-8",
+            )
+
+            with mock.patch("utils.np.load") as payload_loader:
+                loaded, loaded_uid = cache.get_data_cache(configuration)
+
+            self.assertIsNone(loaded)
+            self.assertEqual(loaded_uid, uid)
+            payload_loader.assert_not_called()
+            self.assertTrue(data_path.exists())
+            self.assertTrue(metadata_path.exists())
+
+    def test_weight_metadata_mismatch_is_a_miss_without_loading_payload(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            cache = CacheManager(base_dir=temporary_directory)
+            configuration = {
+                "training_regime": "synthetic",
+                "model": "Linear",
+                "epochs": 10,
+            }
+            model = nn.Linear(3, 2)
+            _, uid = cache.get_weight_cache(
+                configuration,
+                model,
+                device="cpu",
+            )
+            weight_path = Path(cache.weight_dir) / f"{uid}.pth"
+            metadata_path = Path(cache.weight_dir) / f"{uid}.json"
+            weight_path.write_bytes(b"payload must not be opened")
+            metadata_path.write_text(
+                json.dumps(
+                    {
+                        "cache_identity": {
+                            **configuration,
+                            "epochs": 11,
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with mock.patch("utils.torch.load") as payload_loader:
+                loaded, loaded_uid = cache.get_weight_cache(
+                    configuration,
+                    model,
+                    device="cpu",
+                )
+
+            self.assertIsNone(loaded)
+            self.assertEqual(loaded_uid, uid)
+            payload_loader.assert_not_called()
+            self.assertTrue(weight_path.exists())
+            self.assertTrue(metadata_path.exists())
 
 
 if __name__ == "__main__":

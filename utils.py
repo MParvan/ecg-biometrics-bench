@@ -20,6 +20,10 @@ import json
 
 import torch
 from torch.utils.data import Dataset, DataLoader,TensorDataset
+from artifact_provenance import (
+    canonical_json_bytes,
+    collect_creation_provenance,
+)
 from sklearn.metrics import (
     auc,
     det_curve,
@@ -5122,6 +5126,114 @@ def _remove_cache_files(*paths):
                 f"'{path}': {error}"
             )
 
+
+def _build_cache_metadata(
+    cache_identity,
+    creation_provenance=None,
+):
+    """Build a sidecar with separate compatibility and creation metadata."""
+    authoritative_identity = copy.deepcopy(
+        cache_identity
+    )
+
+    if creation_provenance is None:
+        creation_provenance = (
+            collect_creation_provenance()
+        )
+
+    # Retain the historical top-level configuration fields for downstream
+    # readers, but treat only cache_identity as authoritative on cache load.
+    cache_metadata = copy.deepcopy(
+        cache_identity
+    )
+    cache_metadata[
+        "cache_identity"
+    ] = authoritative_identity
+    cache_metadata[
+        "creation_provenance"
+    ] = copy.deepcopy(
+        creation_provenance
+    )
+    return cache_metadata
+
+
+def _cache_identities_match(
+    expected_identity,
+    stored_identity,
+):
+    """Compare identities after their exact JSON sidecar representation."""
+    try:
+        return canonical_json_bytes(
+            expected_identity
+        ) == canonical_json_bytes(
+            stored_identity
+        )
+    except (TypeError, ValueError, UnicodeError):
+        return False
+
+
+def _load_authoritative_cache_metadata(
+    metadata_path,
+    payload_path,
+    expected_identity,
+    uid,
+    cache_kind,
+):
+    """Read and validate a sidecar before any cache payload is opened."""
+    if not os.path.exists(metadata_path):
+        print(
+            f"[WARN] {cache_kind} cache entry {uid} has no "
+            "authoritative metadata and will be regenerated."
+        )
+        return None
+
+    try:
+        with open(
+            metadata_path,
+            "r",
+            encoding="utf-8",
+        ) as metadata_file:
+            cache_metadata = json.load(
+                metadata_file
+            )
+    except (
+        OSError,
+        json.JSONDecodeError,
+        TypeError,
+        ValueError,
+    ) as error:
+        print(
+            f"[WARN] {cache_kind} cache metadata for {uid} "
+            f"is unreadable and will be regenerated: {error}"
+        )
+        _remove_cache_files(
+            payload_path,
+            metadata_path,
+        )
+        return None
+
+    if not isinstance(cache_metadata, dict) or (
+        "cache_identity" not in cache_metadata
+    ):
+        print(
+            f"[WARN] {cache_kind} cache entry {uid} uses legacy "
+            "metadata without an authoritative cache_identity and "
+            "will be regenerated."
+        )
+        return None
+
+    if not _cache_identities_match(
+        expected_identity,
+        cache_metadata["cache_identity"],
+    ):
+        print(
+            f"[WARN] {cache_kind} cache entry {uid} has mismatched "
+            "authoritative metadata and will be regenerated."
+        )
+        return None
+
+    return cache_metadata
+
 class CacheManager:
     def __init__(self, base_dir=DEFAULT_CACHE_DIR):
         self.base_dir = resolve_artifact_path(
@@ -5160,6 +5272,19 @@ class CacheManager:
         )
 
         if not os.path.exists(data_path):
+            return None, uid
+
+        cache_metadata = (
+            _load_authoritative_cache_metadata(
+                metadata_path,
+                data_path,
+                config_dict,
+                uid,
+                "Data",
+            )
+        )
+
+        if cache_metadata is None:
             return None, uid
 
         try:
@@ -5201,6 +5326,7 @@ class CacheManager:
         arrays_dict,
         config_dict,
         uid,
+        creation_provenance=None,
     ):
         """
         Save data-cache arrays and metadata using atomic file replacement.
@@ -5215,6 +5341,13 @@ class CacheManager:
             f"{uid}.json",
         )
 
+        cache_metadata = _build_cache_metadata(
+            config_dict,
+            creation_provenance=(
+                creation_provenance
+            ),
+        )
+
         def write_metadata(temporary_path):
             with open(
                 temporary_path,
@@ -5222,7 +5355,7 @@ class CacheManager:
                 encoding="utf-8",
             ) as metadata_file:
                 json.dump(
-                    config_dict,
+                    cache_metadata,
                     metadata_file,
                     indent=4,
                     default=str,
@@ -5276,6 +5409,19 @@ class CacheManager:
         if not os.path.exists(weight_path):
             return None, uid
 
+        cache_metadata = (
+            _load_authoritative_cache_metadata(
+                metadata_path,
+                weight_path,
+                config_dict,
+                uid,
+                "Weight",
+            )
+        )
+
+        if cache_metadata is None:
+            return None, uid
+
         # Preserve the model's initial state because load_state_dict()
         # can partially modify a model before reporting an error.
         original_model_state = copy.deepcopy(
@@ -5317,39 +5463,14 @@ class CacheManager:
 
             return None, uid
 
-        # Use the configured maximum epoch count as a fallback for older
-        # cache entries that do not contain actual_epochs metadata.
+        # Use the configured maximum epoch count when actual_epochs is absent.
         actual_epochs = config_dict.get(
             "epochs"
         )
-
-        if os.path.exists(metadata_path):
-            try:
-                with open(
-                    metadata_path,
-                    "r",
-                    encoding="utf-8",
-                ) as metadata_file:
-                    cache_metadata = json.load(
-                        metadata_file
-                    )
-
-                actual_epochs = cache_metadata.get(
-                    "actual_epochs",
-                    actual_epochs,
-                )
-
-            except (
-                OSError,
-                json.JSONDecodeError,
-                TypeError,
-                ValueError,
-            ) as error:
-                print(
-                    "[WARN] Could not read weight-cache "
-                    f"metadata for hash {uid}: {error}. "
-                    "Using the configured epoch count."
-                )
+        actual_epochs = cache_metadata.get(
+            "actual_epochs",
+            actual_epochs,
+        )
 
         if actual_epochs is not None:
             try:
@@ -5368,6 +5489,7 @@ class CacheManager:
         model,
         config_dict,
         uid,
+        creation_provenance=None,
     ):
         """
         Save model weights and training metadata atomically.
@@ -5385,8 +5507,11 @@ class CacheManager:
             f"{uid}.json",
         )
 
-        cache_metadata = dict(
-            config_dict
+        cache_metadata = _build_cache_metadata(
+            config_dict,
+            creation_provenance=(
+                creation_provenance
+            ),
         )
 
         actual_epochs = getattr(
