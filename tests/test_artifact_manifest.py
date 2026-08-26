@@ -201,7 +201,8 @@ class CoverageTests(unittest.TestCase):
 
     def test_all_configurations_are_listed(self):
         coverage = manifest_tool.collect_configuration_coverage(
-            self.entries
+            self.entries,
+            publication_mode=False,
         )
 
         self.assertEqual(len(coverage), 150)
@@ -212,7 +213,8 @@ class CoverageTests(unittest.TestCase):
             entry.configuration["results_dir"] = str(self.root)
 
         coverage = manifest_tool.collect_configuration_coverage(
-            self.entries
+            self.entries,
+            publication_mode=False,
         )
 
         self.assertTrue(
@@ -242,7 +244,8 @@ class CoverageTests(unittest.TestCase):
         )
 
         coverage = manifest_tool.collect_configuration_coverage(
-            [entry]
+            [entry],
+            publication_mode=False,
         )
 
         self.assertTrue(coverage[0]["executed"])

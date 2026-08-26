@@ -41,6 +41,7 @@ Usage:
 
 import argparse
 import csv
+import json
 import math
 import sys
 from collections import OrderedDict
@@ -64,9 +65,13 @@ from scripts.reproduce_tables import (  # noqa: E402
     PROTOCOL_LABELS,
     PROTOCOL_ORDER,
     SETTING_LABELS,
+    collect_configuration_record,
     discover_configurations,
     filter_configurations,
-    read_latest_record,
+)
+from experiment_provenance import (  # noqa: E402
+    ResultCollectionError,
+    build_experiment_implementation_identity,
 )
 
 # Categorical slots assigned by evaluation setting, in fixed order. Validated
@@ -223,7 +228,14 @@ def _extract_seed_metric(record, metric):
     return seed_values
 
 
-def collect_series(entries, metric):
+def collect_series(
+    entries,
+    metric,
+    *,
+    campaign_id=None,
+    publication_mode=True,
+    include_provenance=False,
+):
     """
     Collect per-seed metric values for every (protocol, setting) combination.
 
@@ -247,6 +259,12 @@ def collect_series(entries, metric):
         for setting in SETTING_COLORS
     )
     missing = []
+    result_provenance = OrderedDict()
+    implementation_identity = (
+        build_experiment_implementation_identity()
+        if publication_mode
+        else None
+    )
 
     for entry in entries:
         if entry.task_type != task_type:
@@ -255,10 +273,18 @@ def collect_series(entries, metric):
         if entry.setting not in series:
             continue
 
-        log_path = entry.structured_log_path()
-        record = (
-            read_latest_record(log_path) if log_path else None
-        )
+        try:
+            collected = collect_configuration_record(
+                entry,
+                campaign_id=campaign_id,
+                publication_mode=publication_mode,
+                implementation_identity=implementation_identity,
+            )
+        except (ResultCollectionError, FileNotFoundError):
+            missing.append(entry.path.name)
+            continue
+
+        record = collected["record"]
 
         seed_values = _extract_seed_metric(record, metric)
 
@@ -267,7 +293,16 @@ def collect_series(entries, metric):
             continue
 
         series[entry.setting][entry.protocol] = seed_values
+        result_provenance[
+            f"{entry.setting}/{entry.protocol}/{entry.task_type}"
+        ] = (
+            collected["locator"]
+            if collected["locator"] is not None
+            else {"legacy_exploratory": True}
+        )
 
+    if include_provenance:
+        return series, missing, result_provenance
     return series, missing
 
 
@@ -1088,6 +1123,20 @@ def build_parser():
         ),
         help="Directory containing the reproduction configurations.",
     )
+    parser.add_argument(
+        "--campaign-id",
+        type=str,
+        default=None,
+        help="Require results from this campaign identifier.",
+    )
+    parser.add_argument(
+        "--allow-exploratory-results",
+        action="store_true",
+        help=(
+            "Explicitly permit legacy latest-record inputs. Generated "
+            "figures are then not publication-provenance verified."
+        ),
+    )
 
     return parser
 
@@ -1112,9 +1161,12 @@ def main(argv=None):
         datasets=[arguments.dataset],
     )
 
-    series, missing = collect_series(
+    series, missing, result_provenance = collect_series(
         entries,
         arguments.metric,
+        campaign_id=arguments.campaign_id,
+        publication_mode=not arguments.allow_exploratory_results,
+        include_provenance=True,
     )
 
     if not any(series.values()):
@@ -1127,6 +1179,12 @@ def main(argv=None):
         )
 
     if missing:
+        if not arguments.allow_exploratory_results:
+            raise SystemExit(
+                f"Refusing to render a publication figure: "
+                f"{len(missing)} intended configuration(s) do not have "
+                "an exact, provenance-verified result record."
+            )
         print(
             f"[WARN] {len(missing)} configuration(s) have no results yet "
             "and are omitted from the figure."
@@ -1138,6 +1196,32 @@ def main(argv=None):
     )
 
     output_dir = Path(arguments.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    safe_metric_name = "".join(
+        character if character.isalnum() else "_"
+        for character in arguments.metric
+    ).strip("_")
+    provenance_path = output_dir / (
+        f"{arguments.dataset}_{safe_metric_name}_"
+        "result_provenance.json"
+    )
+    provenance_path.write_text(
+        json.dumps(
+            {
+                "campaign_id": arguments.campaign_id,
+                "publication_provenance_verified": (
+                    not arguments.allow_exploratory_results
+                ),
+                "records": result_provenance,
+            },
+            sort_keys=True,
+            indent=2,
+            allow_nan=False,
+        )
+        + "\n",
+        encoding="utf-8",
+        newline="\n",
+    )
     statistics = []
 
     if arguments.figure == "degradation":

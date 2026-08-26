@@ -334,7 +334,7 @@ class TableAssemblyTests(unittest.TestCase):
         entries = driver.discover_configurations(
             self.config_root
         )
-        rows = driver.collect_rows(entries)
+        rows = driver.collect_rows(entries, publication_mode=False)
 
         self.assertEqual(len(rows), 1)
 
@@ -378,7 +378,7 @@ class TableAssemblyTests(unittest.TestCase):
         entries = driver.discover_configurations(
             self.config_root
         )
-        rows = driver.collect_rows(entries)
+        rows = driver.collect_rows(entries, publication_mode=False)
         row = next(iter(rows.values()))
 
         self.assertTrue(row["missing"])
@@ -414,7 +414,7 @@ class TableAssemblyTests(unittest.TestCase):
         entries = driver.discover_configurations(
             self.config_root
         )
-        rows = driver.collect_rows(entries)
+        rows = driver.collect_rows(entries, publication_mode=False)
         row = next(iter(rows.values()))
 
         self.assertEqual(
@@ -432,7 +432,7 @@ class TableAssemblyTests(unittest.TestCase):
         entries = driver.discover_configurations(
             self.config_root
         )
-        rows = driver.collect_rows(entries)
+        rows = driver.collect_rows(entries, publication_mode=False)
 
         markdown = driver.render_markdown(rows, 6)
 

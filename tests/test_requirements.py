@@ -86,6 +86,7 @@ def framework_source_files():
 
 LOCAL_MODULES = {
     "artifact_provenance",
+    "experiment_provenance",
     "main",
     "run",
     "utils",

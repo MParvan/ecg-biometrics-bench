@@ -10,12 +10,14 @@ Example manifest:
 
 reference:
   path: results/baseline.jsonl
-  record_index: -1
+  scientific_configuration_sha256: <configuration digest>
+  implementation_source_sha256: <implementation digest>
   label: baseline
 
 comparisons:
   - path: results/augmentation.jsonl
-    record_index: -1
+    scientific_configuration_sha256: <configuration digest>
+    implementation_source_sha256: <implementation digest>
     label: gaussian_augmentation
 
 metrics:
@@ -44,6 +46,8 @@ from pathlib import Path
 import numpy as np
 import yaml
 from scipy import stats
+
+from experiment_provenance import select_exact_result_record
 
 
 def _json_safe(value):
@@ -112,15 +116,26 @@ def _json_safe(value):
 
 def read_jsonl_record(
     path,
-    record_index=-1,
+    record_index=None,
+    *,
+    allow_exploratory_index=False,
 ):
     """
     Read one record from a JSON Lines experiment file.
 
-    Negative indices follow normal Python indexing, so ``-1`` selects the
-    latest non-empty record.
+    Positional selection is retained only for explicitly exploratory use.
     """
     path = Path(path)
+
+    if record_index is None:
+        raise ValueError(
+            "Exploratory JSONL reads require an explicit record index."
+        )
+    if int(record_index) < 0 and not allow_exploratory_index:
+        raise ValueError(
+            "Negative/latest record selection requires explicit "
+            "exploratory mode."
+        )
 
     if not path.is_file():
         raise FileNotFoundError(
@@ -901,18 +916,23 @@ def _record_descriptor(
     path,
     record_index,
     label,
+    locator=None,
 ):
     """
     Return concise provenance for one selected experiment record.
     """
     return {
         "label": str(label),
-        "path": str(
-            Path(path)
+        "record_locator": (
+            locator
+            if locator is not None
+            else {
+                "legacy_exploratory": True,
+                "relative_path": Path(path).name,
+                "record_index": int(record_index),
+            }
         ),
-        "record_index": int(
-            record_index
-        ),
+        "record_index": int(record_index),
         "experiment_time": record.get(
             "experiment_time"
         ),
@@ -1058,6 +1078,7 @@ def _resolve_experiment_spec(
     spec,
     base_directory,
     default_label,
+    publication_mode,
 ):
     """
     Resolve one manifest experiment specification.
@@ -1089,12 +1110,6 @@ def _resolve_experiment_spec(
 
     path = path.resolve()
 
-    record_index = int(
-        spec.get(
-            "record_index",
-            -1,
-        )
-    )
     label = str(
         spec.get(
             "label",
@@ -1102,16 +1117,51 @@ def _resolve_experiment_spec(
         )
     )
 
-    record = read_jsonl_record(
-        path,
-        record_index=record_index,
-    )
+    if publication_mode:
+        required_fields = (
+            "scientific_configuration_sha256",
+            "implementation_source_sha256",
+        )
+        missing = [field for field in required_fields if field not in spec]
+        if missing:
+            raise ValueError(
+                "Publication experiment specification is missing: "
+                + ", ".join(missing)
+            )
+        selected = select_exact_result_record(
+            path,
+            result_root=base_directory,
+            expected_scientific_sha256=str(
+                spec["scientific_configuration_sha256"]
+            ),
+            expected_implementation={
+                "source_sha256": str(
+                    spec["implementation_source_sha256"]
+                ),
+                "git": {"commit": spec.get("git_commit")},
+            },
+            required_campaign_id=spec.get("campaign_id"),
+            publication_mode=True,
+            expected_smoke_run=False,
+        )
+        record = selected["record"]
+        locator = selected["locator"]
+        record_index = locator["line_number"]
+    else:
+        record_index = int(spec.get("record_index", -1))
+        record = read_jsonl_record(
+            path,
+            record_index=record_index,
+            allow_exploratory_index=True,
+        )
+        locator = None
 
     descriptor = _record_descriptor(
         record,
         path,
         record_index,
         label,
+        locator=locator,
     )
 
     return (
@@ -1182,6 +1232,9 @@ def analyse_manifest(
             0.95,
         )
     )
+    publication_mode = not bool(
+        manifest.get("allow_exploratory_results", False)
+    )
 
     (
         reference_record,
@@ -1190,6 +1243,7 @@ def analyse_manifest(
         manifest["reference"],
         base_directory,
         default_label="reference",
+        publication_mode=publication_mode,
     )
 
     comparison_results = []
@@ -1207,6 +1261,7 @@ def analyse_manifest(
             default_label=(
                 f"comparison_{comparison_index}"
             ),
+            publication_mode=publication_mode,
         )
 
         comparison_results.append(
@@ -1359,14 +1414,18 @@ def _flatten_comparison_rows(
                             "label"
                         ]
                     ),
-                    "reference_path": (
-                        reference["path"]
-                    ),
-                    "comparison_path": (
-                        comparison_descriptor[
-                            "path"
-                        ]
-                    ),
+                        "reference_path": (
+                            reference[
+                                "record_locator"
+                            ]["relative_path"]
+                        ),
+                        "comparison_path": (
+                            comparison_descriptor[
+                                "record_locator"
+                            ][
+                                "relative_path"
+                            ]
+                        ),
                     "reference_record_index": (
                         reference[
                             "record_index"

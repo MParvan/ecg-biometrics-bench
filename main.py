@@ -11,6 +11,10 @@ from pathlib import Path
 import run
 import utils
 from artifact_provenance import build_data_compatibility_identity
+from experiment_provenance import (
+    CanonicalConfigurationError,
+    build_scientific_configuration_identity,
+)
 
 # Import Dataset Loaders
 from load_dataset import (
@@ -2131,7 +2135,8 @@ def get_parser():
     core_group.add_argument('--dataset', type=str, default=None,
                             choices=['ecgid', 'ptb', 'mitbih', 'nsrdb', 'ptbxl', 'heartprint', 'cybhi'],
                             help="Target database to load.")
-    core_group.add_argument('--task', type=int, default=None, choices=[1, 2, 3, 4, 5, 6, 7, 8],
+    core_group.add_argument('--task', type=int, default=None,
+                            choices=sorted(run.PUBLIC_TASK_RUNNERS),
                             help="Biometric Evaluation Task Number (1 to 8).")
     core_group.add_argument('--model', type=str, default='deepecg',
                             choices=sorted(MODEL_REGISTRY),
@@ -2623,6 +2628,23 @@ def get_parser():
             "resolved from the repository."
         ),
     )
+    misc_group.add_argument(
+        '--campaign_id',
+        type=str,
+        default=None,
+        help=(
+            "Optional administrative campaign identifier recorded "
+            "separately from scientific configuration identity."
+        ),
+    )
+    misc_group.add_argument(
+        '--smoke_run',
+        action='store_true',
+        help=(
+            "Mark the execution as a reduced smoke/test run in result "
+            "provenance."
+        ),
+    )
 
     return parser
 
@@ -2647,6 +2669,18 @@ def main():
             args
         )
     )
+
+    # Fail fast on a configuration that could not become a canonical
+    # scientific identity (an unclassified field, or a non-finite/
+    # unsupported value reachable only through a JSON-mapping argument)
+    # before any data loading or training, rather than discovering it only
+    # once a completed run reaches result logging.
+    try:
+        build_scientific_configuration_identity(
+            effective_configuration
+        )
+    except CanonicalConfigurationError as error:
+        parser.error(str(error))
 
     # Measure the complete pipeline, including data loading,
     # training, evaluation, and saved-result generation.
@@ -2686,6 +2720,10 @@ def main():
     loader.effective_experiment_configuration = (
         effective_configuration
     )
+    loader.result_provenance_context = {
+        "campaign_id": args.campaign_id,
+        "smoke_run": args.smoke_run,
+    }
 
     cross_session_uses_enrollment = False
     cross_session_enrollment_reuses_training = False

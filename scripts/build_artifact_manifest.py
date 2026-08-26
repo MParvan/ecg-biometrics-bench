@@ -40,8 +40,12 @@ from scripts.reproduce_tables import (  # noqa: E402
     PROTOCOL_LABELS,
     SETTING_LABELS,
     TASK_LOG_NAMES,
+    collect_configuration_record,
     discover_configurations,
-    read_latest_record,
+)
+from experiment_provenance import (  # noqa: E402
+    ResultCollectionError,
+    build_experiment_implementation_identity,
 )
 
 CHECKSUM_CHUNK_SIZE = 8 * 1024 * 1024
@@ -211,17 +215,38 @@ def collect_dataset_cache_artifacts(cache_dir, compute_checksums=True):
     return artifacts
 
 
-def collect_configuration_coverage(entries):
+def collect_configuration_coverage(
+    entries,
+    *,
+    campaign_id=None,
+    publication_mode=True,
+):
     """
     Report which shipped configurations have produced a result record.
     """
     coverage = []
+    implementation_identity = (
+        build_experiment_implementation_identity()
+        if publication_mode
+        else None
+    )
 
     for entry in entries:
         log_path = entry.structured_log_path()
-        record = (
-            read_latest_record(log_path) if log_path else None
-        )
+        collection_error = None
+        locator = None
+        try:
+            collected = collect_configuration_record(
+                entry,
+                campaign_id=campaign_id,
+                publication_mode=publication_mode,
+                implementation_identity=implementation_identity,
+            )
+            record = collected["record"]
+            locator = collected["locator"]
+        except (ResultCollectionError, FileNotFoundError) as error:
+            record = None
+            collection_error = str(error)
 
         seeds = []
         run_count = 0
@@ -256,8 +281,21 @@ def collect_configuration_coverage(entries):
                     ),
                     ("executed", record is not None),
                     (
+                        "publication_provenance_verified",
+                        bool(record is not None and publication_mode),
+                    ),
+                    ("collection_error", collection_error),
+                    (
                         "result_log",
-                        str(log_path) if log_path else None,
+                        (
+                            locator["relative_path"]
+                            if locator is not None
+                            else (
+                                log_path.name
+                                if log_path is not None
+                                else None
+                            )
+                        ),
                     ),
                     (
                         "experiment_time",
@@ -269,6 +307,7 @@ def collect_configuration_coverage(entries):
                     ),
                     ("runs", run_count),
                     ("seeds", seeds),
+                    ("result_locator", locator),
                 ]
             )
         )
@@ -515,6 +554,20 @@ def build_parser():
             "the manifest can no longer verify a download."
         ),
     )
+    parser.add_argument(
+        "--campaign-id",
+        type=str,
+        default=None,
+        help="Require result records from this campaign identifier.",
+    )
+    parser.add_argument(
+        "--allow-exploratory-results",
+        action="store_true",
+        help=(
+            "Explicitly allow legacy latest-record coverage. Such entries "
+            "are marked as not publication-provenance verified."
+        ),
+    )
 
     return parser
 
@@ -560,7 +613,11 @@ def main(argv=None):
                 / f"task{entry.task:02d}_{entry.task_type}"
             )
 
-    coverage = collect_configuration_coverage(entries)
+    coverage = collect_configuration_coverage(
+        entries,
+        campaign_id=arguments.campaign_id,
+        publication_mode=not arguments.allow_exploratory_results,
+    )
 
     manifest = OrderedDict(
         [
@@ -572,7 +629,7 @@ def main(argv=None):
                     coverage,
                 ),
             ),
-            ("cache_directory", str(cache_dir)),
+            ("cache_directory", cache_dir.name),
             ("checksums_computed", compute_checksums),
             ("configuration_coverage", coverage),
             ("trained_weights", weight_artifacts),
@@ -589,6 +646,20 @@ def main(argv=None):
         f"{summary['preprocessed_array_files']} array file(s), "
         f"{summary['total_artifact_gigabytes']} GiB total."
     )
+
+    collection_failures = [
+        row
+        for row in coverage
+        if row.get("collection_error") is not None
+    ]
+
+    if collection_failures and not arguments.allow_exploratory_results:
+        print(
+            "[ERROR] Refusing to write a publication artifact manifest: "
+            f"{len(collection_failures)} intended configuration(s) lack "
+            "an exact, provenance-verified result record."
+        )
+        return 1
 
     if arguments.output_json:
         output_path = Path(arguments.output_json)

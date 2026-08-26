@@ -12,6 +12,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 import main
+import run
 from models import DeepECG, ResNet1D
 
 
@@ -647,6 +648,50 @@ class MainCLIRoutingTests(unittest.TestCase):
                     task,
                     keyword_arguments,
                 )
+
+    def test_accepted_and_routed_task_ids_are_tied_to_public_task_runners(self):
+        # The --task choices set and the tasks main.py actually routes to a
+        # runner must both trace to the single authoritative inventory,
+        # run.PUBLIC_TASK_RUNNERS, rather than an independently maintained
+        # literal. Otherwise a task added to one could silently drift from
+        # the other: a task accepted by the parser but never routed (falls
+        # through the if/elif chain with no matching branch), or a task
+        # routed by a branch that the parser would never actually admit.
+        task_action = next(
+            action
+            for action in main.get_parser()._actions
+            if action.dest == "task"
+        )
+        self.assertEqual(
+            set(task_action.choices),
+            set(run.PUBLIC_TASK_RUNNERS),
+        )
+
+        # A task ID outside the inventory is rejected before any dispatch.
+        with self.assertRaises(SystemExit):
+            main.get_parser().parse_args(
+                [
+                    "--dataset",
+                    "ecgid",
+                    "--task",
+                    str(max(run.PUBLIC_TASK_RUNNERS) + 1),
+                ]
+            )
+
+        # Every task ID actually in the inventory is routed, through the
+        # real main.main() dispatch, to exactly its own registered runner.
+        for task, runner in sorted(run.PUBLIC_TASK_RUNNERS.items()):
+            with self.subTest(task=task):
+                execution = self.run_main_with_mocked_runners(task)
+                runner_mocks = execution["runner_mocks"]
+                expected_name = runner.__name__
+
+                runner_mocks[expected_name].assert_called_once()
+
+                for name, runner_mock in runner_mocks.items():
+                    if name == expected_name:
+                        continue
+                    runner_mock.assert_not_called()
 
     def test_yaml_defaults_and_cli_overrides_reach_selected_runner(self):
         loader = SyntheticLoader()

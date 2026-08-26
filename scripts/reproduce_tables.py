@@ -28,6 +28,8 @@ Typical use:
 import argparse
 import csv
 import json
+import contextlib
+import io
 import re
 import subprocess
 import sys
@@ -36,6 +38,16 @@ from collections import OrderedDict
 from pathlib import Path
 
 import yaml
+
+from experiment_provenance import (
+    ResultCollectionError,
+    build_experiment_implementation_identity,
+    build_scientific_configuration_identity,
+    capture_result_log_snapshot,
+    collect_appended_result,
+    read_legacy_latest_record,
+    select_exact_result_record,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
@@ -220,7 +232,7 @@ class ConfigurationEntry:
     def results_dir(self):
         return self.configuration.get("results_dir")
 
-    def structured_log_path(self):
+    def structured_log_path(self, results_dir=None, dataset=None):
         """
         Locate the JSONL record this configuration writes.
 
@@ -228,7 +240,7 @@ class ConfigurationEntry:
         name to the configured results directory, then names the file after
         the task.
         """
-        results_dir = self.results_dir
+        results_dir = self.results_dir if results_dir is None else results_dir
 
         if not results_dir:
             return None
@@ -244,16 +256,8 @@ class ConfigurationEntry:
             return None
 
         # The dataset subdirectory is derived from the loader's root_dir.
-        candidate = base / self.dataset / f"{log_name}.jsonl"
-
-        if candidate.exists():
-            return candidate
-
-        # Fall back to a search so that a renamed dataset directory or a
-        # relocated artifact tree is still discovered.
-        matches = sorted(base.rglob(f"{log_name}.jsonl"))
-
-        return matches[-1] if matches else None
+        dataset = self.dataset if dataset is None else str(dataset)
+        return base / dataset / f"{log_name}.jsonl"
 
 
 def discover_configurations(config_root=CONFIG_ROOT):
@@ -334,7 +338,12 @@ def sort_key(entry):
     )
 
 
-def build_command(entry, smoke=False, extra_arguments=None):
+def build_command(
+    entry,
+    smoke=False,
+    extra_arguments=None,
+    campaign_id=None,
+):
     """
     Build the command line that reproduces one configuration.
     """
@@ -348,6 +357,10 @@ def build_command(entry, smoke=False, extra_arguments=None):
     if smoke:
         for name, value in SMOKE_OVERRIDES.items():
             command.extend([f"--{name}", str(value)])
+        command.append("--smoke_run")
+
+    if campaign_id is not None:
+        command.extend(["--campaign_id", str(campaign_id)])
 
     if extra_arguments:
         command.extend(extra_arguments)
@@ -355,19 +368,115 @@ def build_command(entry, smoke=False, extra_arguments=None):
     return command
 
 
+def _resolve_execution_expectation(
+    entry,
+    *,
+    smoke=False,
+    extra_arguments=None,
+    campaign_id=None,
+    implementation_identity=None,
+):
+    """Resolve the same effective configuration the launched CLI will use."""
+    import main as experiment_main
+
+    command = build_command(
+        entry,
+        smoke=smoke,
+        extra_arguments=extra_arguments,
+        campaign_id=campaign_id,
+    )
+    with contextlib.redirect_stdout(io.StringIO()):
+        arguments, _ = experiment_main.parse_experiment_arguments(
+            command[2:]
+        )
+    effective_configuration = experiment_main.build_effective_configuration(
+        arguments
+    )
+    scientific_identity = build_scientific_configuration_identity(
+        effective_configuration
+    )
+    log_path = entry.structured_log_path(
+        results_dir=arguments.results_dir,
+        dataset=arguments.dataset,
+    )
+    results_root = Path(arguments.results_dir)
+    if not results_root.is_absolute():
+        results_root = (PROJECT_ROOT / results_root).resolve()
+    if implementation_identity is None:
+        implementation_identity = build_experiment_implementation_identity()
+    return {
+        "command": command,
+        "effective_configuration": effective_configuration,
+        "scientific_identity": scientific_identity,
+        "implementation_identity": implementation_identity,
+        "log_path": log_path,
+        "results_root": results_root,
+    }
+
+
+def collect_configuration_record(
+    entry,
+    *,
+    campaign_id=None,
+    publication_mode=True,
+    smoke=False,
+    extra_arguments=None,
+    implementation_identity=None,
+):
+    """Select the one exact result belonging to a shipped configuration."""
+    if not publication_mode:
+        log_path = entry.structured_log_path()
+        record = read_legacy_latest_record(log_path)
+        if record is None:
+            raise ResultCollectionError(
+                f"No exploratory result record exists: {log_path}"
+            )
+        return {
+            "record": record,
+            "locator": None,
+        }
+
+    expectation = _resolve_execution_expectation(
+        entry,
+        smoke=smoke,
+        extra_arguments=extra_arguments,
+        campaign_id=campaign_id,
+        implementation_identity=implementation_identity,
+    )
+    return select_exact_result_record(
+        expectation["log_path"],
+        result_root=expectation["results_root"],
+        expected_scientific_sha256=(
+            expectation["scientific_identity"]["sha256"]
+        ),
+        expected_implementation=expectation["implementation_identity"],
+        required_campaign_id=campaign_id,
+        publication_mode=True,
+        expected_smoke_run=smoke,
+    )
+
+
 def run_configurations(entries, smoke=False, extra_arguments=None,
-                       continue_on_error=False):
+                       continue_on_error=False, campaign_id=None,
+                       return_collected=False):
     """
     Execute the selected configurations sequentially.
     """
     failures = []
+    collected_results = []
+
+    implementation_identity = build_experiment_implementation_identity()
 
     for index, entry in enumerate(entries, start=1):
-        command = build_command(
+        expectation = _resolve_execution_expectation(
             entry,
             smoke=smoke,
             extra_arguments=extra_arguments,
+            campaign_id=campaign_id,
+            implementation_identity=implementation_identity,
         )
+        command = expectation["command"]
+        snapshot = capture_result_log_snapshot(expectation["log_path"])
 
         print("=" * 72)
         print(f"[{index}/{len(entries)}] {entry.path.name}")
@@ -381,7 +490,37 @@ def run_configurations(entries, smoke=False, extra_arguments=None,
         elapsed = time.time() - started_at
 
         if completed.returncode == 0:
-            print(f"[OK] finished in {elapsed:.1f}s\n")
+            try:
+                collected = collect_appended_result(
+                    expectation["log_path"],
+                    snapshot,
+                    result_root=expectation["results_root"],
+                    expected_scientific_sha256=(
+                        expectation["scientific_identity"]["sha256"]
+                    ),
+                    expected_implementation=implementation_identity,
+                    required_campaign_id=campaign_id,
+                    publication_mode=not smoke,
+                    expected_smoke_run=smoke,
+                )
+            except ResultCollectionError as error:
+                failures.append((entry.path.name, "result provenance"))
+                print(f"[FAIL] {error}\n")
+                if not continue_on_error:
+                    break
+                continue
+
+            print(
+                f"[OK] finished in {elapsed:.1f}s; "
+                f"record {collected['locator']['relative_path']}:"
+                f"{collected['locator']['line_number']}\n"
+            )
+            collected_results.append(
+                {
+                    "configuration": entry.path.name,
+                    **collected,
+                }
+            )
             continue
 
         failures.append(
@@ -395,28 +534,9 @@ def run_configurations(entries, smoke=False, extra_arguments=None,
         if not continue_on_error:
             break
 
+    if return_collected:
+        return failures, collected_results
     return failures
-
-
-def read_latest_record(log_path):
-    """
-    Return the last structured experiment record written to a JSONL log.
-    """
-    latest = None
-
-    with log_path.open("r", encoding="utf-8") as log_file:
-        for line in log_file:
-            line = line.strip()
-
-            if not line:
-                continue
-
-            try:
-                latest = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-
-    return latest
 
 
 def format_metric(value):
@@ -441,7 +561,14 @@ def format_metric(value):
     return str(value)
 
 
-def collect_rows(entries):
+def collect_rows(
+    entries,
+    *,
+    campaign_id=None,
+    publication_mode=True,
+    smoke=False,
+    implementation_identity=None,
+):
     """
     Pair identification and verification runs into result table rows.
     """
@@ -469,13 +596,21 @@ def collect_rows(entries):
             )
             continue
 
-        record = read_latest_record(log_path)
-
-        if not record:
+        try:
+            collected = collect_configuration_record(
+                entry,
+                campaign_id=campaign_id,
+                publication_mode=publication_mode,
+                smoke=smoke,
+                implementation_identity=implementation_identity,
+            )
+        except (ResultCollectionError, FileNotFoundError) as error:
             row["missing"].append(
-                f"{entry.task_type}: empty result log {log_path}"
+                f"{entry.task_type}: {error}"
             )
             continue
+
+        record = collected["record"]
 
         results = record.get("results", {})
         expected_metrics = (
@@ -488,7 +623,14 @@ def collect_rows(entries):
             if metric_name in results:
                 row["metrics"][metric_name] = results[metric_name]
 
-        row["sources"][entry.task_type] = str(log_path)
+        row["sources"][entry.task_type] = (
+            collected["locator"]
+            if collected["locator"] is not None
+            else {
+                "legacy_exploratory": True,
+                "relative_path": log_path.name,
+            }
+        )
 
     return rows
 
@@ -703,6 +845,20 @@ def build_parser():
         ),
     )
     parser.add_argument(
+        "--campaign-id",
+        type=str,
+        default=None,
+        help="Require and record this administrative campaign identifier.",
+    )
+    parser.add_argument(
+        "--allow-exploratory-results",
+        action="store_true",
+        help=(
+            "Explicitly allow legacy latest-record reads. Such records are "
+            "not publication eligible."
+        ),
+    )
+    parser.add_argument(
         "--continue-on-error",
         action="store_true",
         help="Keep going after a configuration fails.",
@@ -764,6 +920,7 @@ def main(argv=None):
                 entry,
                 smoke=arguments.smoke,
                 extra_arguments=arguments.extra_arguments,
+                campaign_id=arguments.campaign_id,
             )
             print(" ".join(command))
 
@@ -778,11 +935,13 @@ def main(argv=None):
                 "not the reported ones; it verifies the plan only.\n"
             )
 
-        failures = run_configurations(
+        failures, collected_results = run_configurations(
             entries,
             smoke=arguments.smoke,
             extra_arguments=arguments.extra_arguments,
             continue_on_error=arguments.continue_on_error,
+            campaign_id=arguments.campaign_id,
+            return_collected=True,
         )
 
         if failures:
@@ -793,7 +952,12 @@ def main(argv=None):
             print()
 
     if arguments.collect:
-        rows = collect_rows(entries)
+        rows = collect_rows(
+            entries,
+            campaign_id=arguments.campaign_id,
+            publication_mode=not arguments.allow_exploratory_results,
+            smoke=arguments.smoke,
+        )
 
         incomplete = [
             row for row in rows.values() if row["missing"]
@@ -825,7 +989,12 @@ def main(argv=None):
                     print(f"    {reason}")
             print()
 
-        if arguments.output_dir:
+        may_write_outputs = (
+            not incomplete
+            or arguments.allow_exploratory_results
+        )
+
+        if arguments.output_dir and may_write_outputs:
             output_dir = Path(arguments.output_dir)
             output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -840,7 +1009,38 @@ def main(argv=None):
                 encoding="utf-8",
             )
 
+            provenance_path = (
+                output_dir
+                / "paper_tables_result_provenance.json"
+            )
+            provenance_path.write_text(
+                json.dumps(
+                    {
+                        "campaign_id": arguments.campaign_id,
+                        "publication_provenance_verified": (
+                            not arguments.allow_exploratory_results
+                        ),
+                        "rows": {
+                            "/".join(map(str, row_key)): row["sources"]
+                            for row_key, row in rows.items()
+                        },
+                    },
+                    sort_keys=True,
+                    indent=2,
+                    allow_nan=False,
+                )
+                + "\n",
+                encoding="utf-8",
+                newline="\n",
+            )
+
             print(f"[INFO] Tables written to {output_dir}")
+        elif arguments.output_dir:
+            print(
+                "[ERROR] Refusing to write publication tables because "
+                "one or more intended rows lack exact, "
+                "provenance-verified result records."
+            )
 
     return exit_status
 

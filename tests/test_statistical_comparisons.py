@@ -91,6 +91,7 @@ class StatisticalComparisonTests(
             record = sc.read_jsonl_record(
                 path,
                 record_index=-1,
+                allow_exploratory_index=True,
             )
 
             self.assertEqual(
@@ -637,6 +638,7 @@ metrics:
   - AUC
 
 confidence_level: 0.95
+allow_exploratory_results: true
 """.lstrip(),
                 encoding="utf-8",
                 newline="\n",

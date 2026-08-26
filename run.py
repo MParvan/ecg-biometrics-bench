@@ -44,6 +44,10 @@ from artifact_provenance import (
     build_weight_compatibility_identity,
     canonical_state_dict_sha256,
 )
+from experiment_provenance import (
+    build_experiment_implementation_identity,
+    build_result_record_provenance,
+)
 
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import roc_curve, auc
@@ -911,6 +915,7 @@ def _build_structured_experiment_record(
     per_run_results=None,
     evaluation_artifacts=None,
     per_run_evaluation_artifacts=None,
+    canonical_provenance=None,
 ):
     """
     Build one self-contained machine-readable experiment record.
@@ -999,6 +1004,11 @@ def _build_structured_experiment_record(
             )
             for key, value in metrics_dict.items()
         },
+        "canonical_provenance": (
+            _to_json_compatible(
+                canonical_provenance
+            )
+        ),
     }
 
     if (
@@ -1752,6 +1762,76 @@ def _log_experiment_results(
     source_revision = _collect_source_revision()
     runtime_profile = _collect_runtime_profile()
 
+    authoritative_configuration = getattr(
+        loader,
+        "effective_experiment_configuration",
+        None,
+    )
+    configuration_authoritative = isinstance(
+        authoritative_configuration,
+        Mapping,
+    )
+    if not configuration_authoritative:
+        fallback_hyperparameters = {
+            key: value
+            for key, value in hyperparams.items()
+            if not any(
+                marker in str(key).lower()
+                for marker in (
+                    "cache",
+                    "directory",
+                    "output",
+                    "path",
+                    "time",
+                )
+            )
+        }
+        fallback_dataset_settings = {
+            key: value
+            for key, value in dataset_kwargs.items()
+            if not any(
+                marker in str(key).lower()
+                for marker in (
+                    "cache",
+                    "directory",
+                    "output",
+                    "path",
+                    "results_dir",
+                    "time",
+                )
+            )
+        }
+        authoritative_configuration = {
+            "task": str(task_name),
+            "dataset": str(dataset_name),
+            "model_hyperparameters": _to_json_compatible(
+                fallback_hyperparameters
+            ),
+            "dataset_and_preprocessing_settings": _to_json_compatible(
+                fallback_dataset_settings
+            ),
+        }
+
+    provenance_context = getattr(
+        loader,
+        "result_provenance_context",
+        {},
+    )
+    if not isinstance(provenance_context, Mapping):
+        provenance_context = {}
+
+    canonical_provenance = build_result_record_provenance(
+        effective_configuration=authoritative_configuration,
+        configuration_authoritative=configuration_authoritative,
+        implementation_identity=(
+            build_experiment_implementation_identity()
+        ),
+        campaign_id=provenance_context.get("campaign_id"),
+        smoke_run=provenance_context.get("smoke_run", False),
+        hyperparameters=hyperparams,
+        per_run_results=per_run_results,
+    )
+
     (
         compact_evaluation_artifacts,
         compact_per_run_evaluation_artifacts,
@@ -1892,6 +1972,7 @@ def _log_experiment_results(
             per_run_evaluation_artifacts=(
                 compact_per_run_evaluation_artifacts
             ),
+            canonical_provenance=canonical_provenance,
         )
     )
 
@@ -11452,3 +11533,19 @@ def run_subject_disjoint_cross_session_verification(
 
 
 # =============================================================================
+# PUBLIC TASK RUNNER INVENTORY
+# =============================================================================
+# The authoritative task-number -> runner mapping. Provenance classification
+# tests build their coverage from this table instead of a separately
+# maintained list, so adding, removing, or renaming a public task runner is
+# a single, deliberate edit here rather than several silently-drifting ones.
+PUBLIC_TASK_RUNNERS = {
+    1: run_closed_set_identification,
+    2: run_closed_set_verification,
+    3: run_subject_disjoint_identification,
+    4: run_subject_disjoint_verification,
+    5: run_cross_session_identification,
+    6: run_cross_session_verification,
+    7: run_subject_disjoint_cross_session_identification,
+    8: run_subject_disjoint_cross_session_verification,
+}
