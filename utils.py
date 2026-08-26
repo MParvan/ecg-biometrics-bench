@@ -49,6 +49,29 @@ _SUPPORTED_CUBLAS_WORKSPACE_CONFIGS = {
     ":16:8",
 }
 
+_INTRA_SESSION_PARTITION_TASKS = frozenset({1, 2, 3, 4})
+
+
+def _validate_merged_representation_partitioning(
+    task,
+    num_beats_to_merge,
+    beat_merge_stride,
+):
+    """Reject merged rows that can share beats across intra-session roles."""
+    if (
+        task in _INTRA_SESSION_PARTITION_TASKS
+        and num_beats_to_merge > 1
+        and beat_merge_stride < num_beats_to_merge
+    ):
+        raise ValueError(
+            f"Task {task} cannot use overlapping merged representations: "
+            f"num_beats_to_merge={num_beats_to_merge} and "
+            f"beat_merge_stride={beat_merge_stride} allow adjacent "
+            "representations to share raw beats across evaluation "
+            "partitions. For Tasks 1-4, set beat_merge_stride equal to "
+            "num_beats_to_merge, or set num_beats_to_merge=1."
+        )
+
 
 def _normalize_reproducibility_mode(mode):
     """Validate and normalize the public reproducibility policy."""

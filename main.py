@@ -768,6 +768,15 @@ def validate_experiment_arguments(args, parser):
             "silently discard beats between consecutive samples."
         )
 
+    try:
+        utils._validate_merged_representation_partitioning(
+            args.task,
+            args.num_beats_to_merge,
+            args.beat_merge_stride,
+        )
+    except ValueError as error:
+        parser.error(str(error))
+
     require_integer("seed")
 
     if args.template_size is not None:

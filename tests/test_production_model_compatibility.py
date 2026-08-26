@@ -9,23 +9,13 @@ import torch.nn as nn
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
+import main
 import run
-from models import (
-    DeepECG,
-    ECGTransformer,
-    HybridCNNLSTM,
-    RNN_ECG,
-    ResNet1D,
+
+
+PRODUCTION_MODELS = tuple(
+    main.MODEL_REGISTRY.values()
 )
-
-
-PRODUCTION_MODELS = [
-    DeepECG,
-    ResNet1D,
-    RNN_ECG,
-    HybridCNNLSTM,
-    ECGTransformer,
-]
 
 
 def make_synthetic_ecg_dataset(
@@ -248,6 +238,76 @@ class ProductionModelCompatibilityTests(
                         embeddings
                     ).all()
                 )
+
+    def test_all_registered_models_support_concatenated_beat_input(self):
+        """Every CLI model must train and embed a real concatenated window."""
+        self.assertEqual(
+            tuple(main.MODEL_REGISTRY),
+            (
+                "deepecg",
+                "resnet1d",
+                "rnn",
+                "hybrid",
+                "transformer",
+                "ecgxtractor",
+                "mobilenet_gru",
+                "multiscale_cnn",
+                "separable_resnet",
+            ),
+        )
+
+        batch_size = 2
+        number_of_classes = 3
+        single_beat_length = 64
+        merge_width = 3
+        concatenated_length = single_beat_length * merge_width
+        input_tensor = torch.randn(
+            batch_size,
+            1,
+            concatenated_length,
+        )
+        target_labels = torch.tensor([0, 1], dtype=torch.long)
+
+        for model_name, model_class in main.MODEL_REGISTRY.items():
+            with self.subTest(model=model_name):
+                torch.manual_seed(43)
+                model = model_class(
+                    in_channels=1,
+                    num_classes=number_of_classes,
+                    include_top=True,
+                )
+                model.train()
+
+                logits = model(input_tensor)
+                self.assertEqual(
+                    tuple(logits.shape),
+                    (batch_size, number_of_classes),
+                )
+
+                loss = nn.CrossEntropyLoss()(logits, target_labels)
+                self.assertTrue(torch.isfinite(loss))
+                model.zero_grad(set_to_none=True)
+                loss.backward()
+
+                gradients = [
+                    parameter.grad
+                    for parameter in model.parameters()
+                    if parameter.requires_grad and parameter.grad is not None
+                ]
+                self.assertTrue(gradients)
+                self.assertTrue(
+                    all(torch.isfinite(gradient).all() for gradient in gradients)
+                )
+
+                model.include_top = False
+                model.eval()
+                with torch.no_grad():
+                    embeddings = model(input_tensor)
+
+                self.assertEqual(embeddings.ndim, 2)
+                self.assertEqual(embeddings.shape[0], batch_size)
+                self.assertGreater(embeddings.shape[1], 0)
+                self.assertTrue(torch.isfinite(embeddings).all())
 
     def test_models_support_univariate_framework_input(self):
         """

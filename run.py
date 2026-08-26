@@ -68,6 +68,7 @@ from utils import (
     DEFAULT_CACHE_DIR, DEFAULT_RESULTS_DIR, resolve_artifact_path,
     _build_loader_cache_identity, _fingerprint_array_collection,
     _prepare_reproducibility_backend, _setup_reproducibility,
+    _validate_merged_representation_partitioning,
 )
 
 from load_dataset import summarize_partition_log
@@ -256,6 +257,31 @@ def _activate_top_level_runtime_profile(
         _initialize_runtime_profile(device)
 
     return mode
+
+
+def _validate_runner_merged_representation_partitioning(task, loader):
+    """Apply the merge-overlap guard when a runner receives loader metadata."""
+    if loader is None:
+        return
+
+    num_beats_to_merge = getattr(loader, "num_beats", None)
+
+    if num_beats_to_merge is None:
+        num_beats_to_merge = getattr(
+            loader,
+            "num_beats_to_merge",
+            None,
+        )
+
+    if num_beats_to_merge is None:
+        return
+
+    beat_merge_stride = getattr(loader, "beat_merge_stride", 1)
+    _validate_merged_representation_partitioning(
+        task,
+        num_beats_to_merge,
+        beat_merge_stride,
+    )
 
 
 def _start_runtime_stage():
@@ -5353,6 +5379,7 @@ def run_closed_set_identification(x, y, model_class, epochs=150, batch_size=256,
                If n_runs > 1, returns tuples of (Mean, Std_Dev) for both metrics.
     """
 
+    _validate_runner_merged_representation_partitioning(1, loader)
     reproducibility_mode = _activate_top_level_runtime_profile(
         reproducibility_mode,
         device,
@@ -6082,6 +6109,7 @@ def run_closed_set_verification(x, y, model_class, epochs=150, batch_size=256, l
                If n_runs > 1, returns tuples of (Mean, Std_Dev) for all four metrics.
     """
 
+    _validate_runner_merged_representation_partitioning(2, loader)
     reproducibility_mode = _activate_top_level_runtime_profile(
         reproducibility_mode,
         device,
@@ -6832,6 +6860,7 @@ def run_subject_disjoint_identification(x, y, model_class, epochs=150, batch_siz
                If n_runs > 1, returns tuples of (Mean, Std_Dev) for both metrics.
     """   
 
+    _validate_runner_merged_representation_partitioning(3, loader)
     reproducibility_mode = _activate_top_level_runtime_profile(
         reproducibility_mode,
         device,
@@ -7591,6 +7620,7 @@ def run_subject_disjoint_verification(x, y, model_class, epochs=150, batch_size=
                If n_runs > 1, returns tuples of (Mean, Std_Dev) for all four metrics.
     """
 
+    _validate_runner_merged_representation_partitioning(4, loader)
     reproducibility_mode = _activate_top_level_runtime_profile(
         reproducibility_mode,
         device,
