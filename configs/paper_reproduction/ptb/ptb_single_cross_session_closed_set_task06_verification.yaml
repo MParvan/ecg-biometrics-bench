@@ -55,6 +55,10 @@ matching_method: cosine
 max_impostor_pairs: 1000000
 pair_sampling_seed: 42
 pair_sampling_mode: all_genuine
+target_fars:
+  - 0.1
+  - 0.01
+  - 0.0001
 use_deployment_evaluation: false
 outlier_filtering_on_train: false
 outlier_filtering_on_test: false

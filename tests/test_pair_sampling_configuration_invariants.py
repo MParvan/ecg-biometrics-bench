@@ -17,6 +17,8 @@ import yaml
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
+import utils
+
 CONFIG_ROOT = PROJECT_ROOT / "configs"
 
 VERIFICATION_TASKS = {
@@ -41,6 +43,12 @@ PAIR_KEYS = {
     "max_impostor_pairs",
     "pair_sampling_seed",
 }
+
+PINNED_ADDITIONAL_TARGET_FARS = [
+    0.1,
+    0.01,
+    0.0001,
+]
 
 EXPECTED_TASK_COUNTS = {
     1: 9,
@@ -198,6 +206,42 @@ class PairSamplingConfigurationInvariants(
         self.assertEqual(
             checked,
             124,
+        )
+
+    def test_verification_configs_pin_additional_target_fars(self):
+        verification_checked = 0
+        identification_checked = 0
+
+        for path, config in self.configurations:
+            task = config.get("task")
+
+            if task in VERIFICATION_TASKS:
+                verification_checked += 1
+                self.assertEqual(
+                    config.get("target_fars"),
+                    PINNED_ADDITIONAL_TARGET_FARS,
+                    path.name,
+                )
+                self.assertNotIn(
+                    utils._MANDATORY_VERIFICATION_FAR,
+                    config["target_fars"],
+                    path.name,
+                )
+            elif task in IDENTIFICATION_TASKS:
+                identification_checked += 1
+                self.assertNotIn(
+                    "target_fars",
+                    config,
+                    path.name,
+                )
+
+        self.assertEqual(verification_checked, 124)
+        self.assertEqual(identification_checked, 110)
+        self.assertEqual(
+            utils._resolve_target_fars(
+                PINNED_ADDITIONAL_TARGET_FARS
+            ),
+            [0.0001, 0.001, 0.01, 0.1],
         )
 
     def test_identification_configs_omit_pair_sampling_settings(self):
