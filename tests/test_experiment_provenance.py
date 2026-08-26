@@ -336,7 +336,7 @@ def test_legacy_configuration_aliases_share_canonical_identity(tmp_path):
                 "dataset": "ecgid",
                 "task": 2,
                 "pair_sampling_mode": "balanced",
-                "pair_sampling_budget": 321,
+                "pair_sampling_budget": 320,
             }
         ),
         encoding="utf-8",
@@ -347,7 +347,7 @@ def test_legacy_configuration_aliases_share_canonical_identity(tmp_path):
                 "dataset": "ecgid",
                 "task": 2,
                 "sampling_mode": "balanced",
-                "num_pairs": 321,
+                "num_pairs": 320,
             }
         ),
         encoding="utf-8",

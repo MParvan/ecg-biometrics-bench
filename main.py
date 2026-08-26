@@ -2504,8 +2504,11 @@ def get_parser():
         type=int,
         default=None,
         help=(
-            "Requested comparison budget for balanced and random "
-            "verification sampling. Defaults to 10000 for those modes."
+            "Exact number of verification decisions evaluated by balanced "
+            "and random sampling. Balanced budgets must be even. Sampling "
+            "uses replacement only when the requested count exceeds the "
+            "relevant distinct candidate universe. Defaults to 10000 for "
+            "those modes."
         ),
     )
     eval_group.add_argument(

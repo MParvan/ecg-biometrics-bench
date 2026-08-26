@@ -49,6 +49,13 @@ _SUPPORTED_CUBLAS_WORKSPACE_CONFIGS = {
     ":16:8",
 }
 
+_PAIR_SAMPLING_MODES = frozenset(
+    {"all", "all_genuine", "balanced", "random"}
+)
+_EXACT_BUDGET_PAIR_SAMPLING_MODES = frozenset(
+    {"balanced", "random"}
+)
+
 _INTRA_SESSION_PARTITION_TASKS = frozenset({1, 2, 3, 4})
 
 
@@ -71,6 +78,54 @@ def _validate_merged_representation_partitioning(
             "partitions. For Tasks 1-4, set beat_merge_stride equal to "
             "num_beats_to_merge, or set num_beats_to_merge=1."
         )
+
+
+def _validate_pair_sampling_mode(pair_sampling_mode):
+    """Validate one verification pair-sampling mode."""
+    if pair_sampling_mode not in _PAIR_SAMPLING_MODES:
+        raise ValueError(
+            "Unknown verification pair sampling mode: "
+            f"{pair_sampling_mode!r}."
+        )
+    return pair_sampling_mode
+
+
+def _validate_exact_pair_sampling_budget(
+    pair_sampling_mode,
+    pair_sampling_budget,
+):
+    """Validate the decision budget used by stochastic sampling modes."""
+    if pair_sampling_mode not in _EXACT_BUDGET_PAIR_SAMPLING_MODES:
+        return None
+
+    if pair_sampling_budget is None:
+        raise ValueError(
+            f"pair_sampling_mode={pair_sampling_mode!r} requires a "
+            "positive pair_sampling_budget."
+        )
+
+    if (
+        isinstance(pair_sampling_budget, (bool, np.bool_))
+        or not isinstance(pair_sampling_budget, (int, np.integer))
+        or int(pair_sampling_budget) < 1
+    ):
+        raise ValueError(
+            "pair_sampling_budget must be a positive integer."
+        )
+
+    pair_sampling_budget = int(pair_sampling_budget)
+
+    if (
+        pair_sampling_mode == "balanced"
+        and pair_sampling_budget % 2 != 0
+    ):
+        raise ValueError(
+            "pair_sampling_budget must be even when "
+            "pair_sampling_mode='balanced' so exactly half of the "
+            "verification decisions are genuine and half are impostor."
+        )
+
+    return pair_sampling_budget
 
 
 def _normalize_reproducibility_mode(mode):
@@ -1201,9 +1256,13 @@ def _generate_fused_verification_pairs(
         uniformly sample impostor group-template decisions without replacement
         up to ``max_impostor_pairs``.
       - ``"balanced"``: sample equal numbers of genuine and impostor fused
-        decisions using ``pair_sampling_budget``.
+        decisions using the exact, even ``pair_sampling_budget``.
       - ``"random"``: draw ``pair_sampling_budget`` fused decisions uniformly
         at random from the group-by-template Cartesian.
+
+    Stochastic modes sample without replacement while their requested count
+    fits the relevant candidate universe and use replacement only when needed
+    to preserve the exact requested decision count.
 
     Each fused score is the arithmetic mean of the beat-template similarities
     of its ``group_size`` constituent observations, in the same
@@ -1231,12 +1290,7 @@ def _generate_fused_verification_pairs(
             "Fall back to the standard verification path for group_size == 1."
         )
 
-    valid_modes = {"all", "all_genuine", "balanced", "random"}
-    if pair_sampling_mode not in valid_modes:
-        raise ValueError(
-            "Unknown verification pair sampling mode for fused decisions: "
-            f"{pair_sampling_mode!r}."
-        )
+    _validate_pair_sampling_mode(pair_sampling_mode)
 
     probe_embeddings = np.asarray(probe_embeddings)
     probe_labels = np.asarray(probe_labels)
@@ -1262,17 +1316,10 @@ def _generate_fused_verification_pairs(
     group_size = int(group_size)
     max_impostor_pairs = int(max_impostor_pairs)
 
-    if pair_sampling_mode in {"balanced", "random"}:
-        if pair_sampling_budget is None:
-            raise ValueError(
-                f"pair_sampling_mode={pair_sampling_mode!r} requires a "
-                "positive pair_sampling_budget."
-            )
-        if int(pair_sampling_budget) < 1:
-            raise ValueError(
-                "pair_sampling_budget must be a positive integer."
-            )
-        pair_sampling_budget = int(pair_sampling_budget)
+    pair_sampling_budget = _validate_exact_pair_sampling_budget(
+        pair_sampling_mode,
+        pair_sampling_budget,
+    )
 
     grouping = _build_probe_groups(probe_labels, probe_provenance, group_size)
     groups = grouping["groups"]
@@ -1283,7 +1330,10 @@ def _generate_fused_verification_pairs(
     number_of_groups = int(len(groups))
     number_of_templates = int(len(template_identities))
 
-    if number_of_groups == 0 or number_of_templates == 0:
+    if (
+        number_of_groups == 0
+        or number_of_templates == 0
+    ) and pair_sampling_mode not in _EXACT_BUDGET_PAIR_SAMPLING_MODES:
         diagnostics.setdefault("genuine_fused_decisions", 0)
         diagnostics.setdefault("impostor_fused_decisions", 0)
         return (
@@ -1420,107 +1470,39 @@ def _generate_fused_verification_pairs(
         return fused_scores, labels_pair, diagnostics
 
     # ------------------------------------------------------------------
-    # Stochastic modes: mirror the existing _generate_pairs semantics at the
-    # fused-decision level using the shared _verification_pair_rng.
+    # Stochastic modes sample conceptual decision ranks. Distinct decisions
+    # are used while the requested budget fits the universe; replacement is
+    # introduced only when needed to preserve the exact decision count.
     # ------------------------------------------------------------------
     rng = _verification_pair_rng(pair_sampling_seed)
 
     if pair_sampling_mode == "balanced":
-        groups_by_identity = collections.defaultdict(list)
-        for row_index, identity in enumerate(group_identities):
-            groups_by_identity[identity].append(row_index)
-
-        template_identity_set = set(template_column_by_identity)
-        common_identities = [
-            identity
-            for identity in groups_by_identity
-            if identity in template_identity_set
-        ]
-
-        if len(common_identities) < 2:
-            diagnostics.update(
-                {
-                    "genuine_fused_decisions": 0,
-                    "impostor_fused_decisions": 0,
-                    "pair_sampling_budget": pair_sampling_budget,
-                    "pair_sampling_seed": pair_sampling_seed,
-                }
-            )
-            return (
-                np.empty(0, dtype=float),
-                np.empty(0, dtype=int),
-                diagnostics,
-            )
-
-        genuine_rows = []
-        genuine_columns = []
-        for _ in range(pair_sampling_budget // 2):
-            identity = rng.choice(common_identities)
-            row = int(rng.choice(groups_by_identity[identity]))
-            column = template_column_by_identity[identity]
-            genuine_rows.append(row)
-            genuine_columns.append(column)
-
-        all_group_identities = list(groups_by_identity.keys())
-        all_template_identities = list(template_column_by_identity.keys())
-
-        impostor_rows = []
-        impostor_columns = []
-        for _ in range(pair_sampling_budget // 2):
-            identity_a = rng.choice(all_group_identities)
-            possible_b = [
-                identity
-                for identity in all_template_identities
-                if identity != identity_a
-            ]
-            if not possible_b:
-                continue
-            identity_b = rng.choice(possible_b)
-            row = int(rng.choice(groups_by_identity[identity_a]))
-            column = template_column_by_identity[identity_b]
-            impostor_rows.append(row)
-            impostor_columns.append(column)
-
-        selected_rows = np.asarray(
-            genuine_rows + impostor_rows, dtype=np.int64
+        (
+            selected_rows,
+            selected_columns,
+            labels_pair,
+            _,
+            _,
+        ) = _sample_balanced_pair_indices(
+            group_identities,
+            template_identities,
+            pair_sampling_budget,
+            rng,
+            match_two_sets=True,
         )
-        selected_columns = np.asarray(
-            genuine_columns + impostor_columns, dtype=np.int64
+    else:
+        selected_rows, selected_columns, _ = _sample_random_pair_indices(
+            number_of_groups,
+            number_of_templates,
+            pair_sampling_budget,
+            rng,
+            match_two_sets=True,
         )
-        labels_pair = np.asarray(
-            [1] * len(genuine_rows) + [0] * len(impostor_rows), dtype=int
-        )
-        fused_scores = _score_selected(selected_rows, selected_columns)
+        labels_pair = (
+            group_identities[selected_rows]
+            == template_identities[selected_columns]
+        ).astype(int)
 
-        diagnostics.update(
-            {
-                "genuine_fused_decisions": int(len(genuine_rows)),
-                "impostor_fused_decisions": int(len(impostor_rows)),
-                "pair_sampling_budget": pair_sampling_budget,
-                "pair_sampling_seed": pair_sampling_seed,
-            }
-        )
-        return fused_scores, labels_pair, diagnostics
-
-    # pair_sampling_mode == "random"
-    row_choices = np.arange(number_of_groups, dtype=np.int64)
-    column_choices = np.arange(number_of_templates, dtype=np.int64)
-
-    selected_rows = []
-    selected_columns = []
-    labels_pair = []
-    for _ in range(pair_sampling_budget):
-        row = int(rng.choice(row_choices))
-        column = int(rng.choice(column_choices))
-        selected_rows.append(row)
-        selected_columns.append(column)
-        labels_pair.append(
-            int(group_identities[row] == template_identities[column])
-        )
-
-    selected_rows = np.asarray(selected_rows, dtype=np.int64)
-    selected_columns = np.asarray(selected_columns, dtype=np.int64)
-    labels_pair = np.asarray(labels_pair, dtype=int)
     fused_scores = _score_selected(selected_rows, selected_columns)
 
     diagnostics.update(
@@ -1579,11 +1561,14 @@ def _generate_multi_template_verification_pairs(
       - ``"all_genuine"``: every genuine decision (exactly one per probe
         group) plus impostor decisions sampled uniformly without replacement
         up to ``max_impostor_pairs``.
-      - ``"balanced"``: budget//2 genuine and budget//2 impostor decisions,
-        drawn with replacement, mirroring the mature two-set balanced
-        semantics.
-      - ``"random"``: ``pair_sampling_budget`` decisions drawn uniformly at
-        random with replacement.
+      - ``"balanced"``: exactly budget/2 genuine and budget/2 impostor
+        decisions.
+      - ``"random"``: exactly ``pair_sampling_budget`` decisions drawn
+        uniformly from the identity-decision universe.
+
+    Stochastic modes sample without replacement while the requested count
+    fits the relevant candidate universe and use replacement only when needed
+    to preserve the exact requested decision count.
 
     Only ``template_score_aggregation = "max"`` is implemented.
 
@@ -1614,12 +1599,7 @@ def _generate_multi_template_verification_pairs(
         )
     num_templates_per_identity = int(num_templates_per_identity)
 
-    valid_modes = {"all", "all_genuine", "balanced", "random"}
-    if pair_sampling_mode not in valid_modes:
-        raise ValueError(
-            "Unknown verification pair sampling mode for multi-template "
-            f"decisions: {pair_sampling_mode!r}."
-        )
+    _validate_pair_sampling_mode(pair_sampling_mode)
 
     probe_embeddings = np.asarray(probe_embeddings)
     probe_labels = np.asarray(probe_labels)
@@ -1637,17 +1617,10 @@ def _generate_multi_template_verification_pairs(
     probe_fusion_size = int(probe_fusion_size)
     max_impostor_pairs = int(max_impostor_pairs)
 
-    if pair_sampling_mode in {"balanced", "random"}:
-        if pair_sampling_budget is None:
-            raise ValueError(
-                f"pair_sampling_mode={pair_sampling_mode!r} requires a "
-                "positive pair_sampling_budget."
-            )
-        if int(pair_sampling_budget) < 1:
-            raise ValueError(
-                "pair_sampling_budget must be a positive integer."
-            )
-        pair_sampling_budget = int(pair_sampling_budget)
+    pair_sampling_budget = _validate_exact_pair_sampling_budget(
+        pair_sampling_mode,
+        pair_sampling_budget,
+    )
 
     enrolled_identity_ids, template_row_counts = np.unique(
         template_identities, return_counts=True
@@ -1732,7 +1705,10 @@ def _generate_multi_template_verification_pairs(
             f"enrolled target identity: {missing_targets}."
         )
 
-    if number_of_groups == 0:
+    if (
+        number_of_groups == 0
+        and pair_sampling_mode not in _EXACT_BUDGET_PAIR_SAMPLING_MODES
+    ):
         diagnostics["genuine_fused_decisions"] = 0
         diagnostics["impostor_fused_decisions"] = 0
         return (
@@ -1880,107 +1856,39 @@ def _generate_multi_template_verification_pairs(
         return final_scores, labels_pair, diagnostics
 
     # ------------------------------------------------------------------
-    # Stochastic modes: mirror the mature _generate_pairs semantics at the
-    # identity-decision level.
+    # Stochastic modes operate on probe-group by enrolled-identity decision
+    # ranks, never on elementary template rows.
     # ------------------------------------------------------------------
     rng = _verification_pair_rng(pair_sampling_seed)
 
     if pair_sampling_mode == "balanced":
-        groups_by_identity = collections.defaultdict(list)
-        for row_index, identity in enumerate(group_identities):
-            groups_by_identity[identity].append(row_index)
-
-        common_identities = [
-            identity
-            for identity in groups_by_identity
-            if identity in identity_index_by_value
-        ]
-
-        if len(common_identities) < 2:
-            diagnostics.update(
-                {
-                    "genuine_fused_decisions": 0,
-                    "impostor_fused_decisions": 0,
-                    "pair_sampling_budget": pair_sampling_budget,
-                    "pair_sampling_seed": pair_sampling_seed,
-                }
+        (
+            selected_rows,
+            selected_identity_idx,
+            labels_pair,
+            _,
+            _,
+        ) = _sample_balanced_pair_indices(
+            group_identities,
+            enrolled_identity_ids,
+            pair_sampling_budget,
+            rng,
+            match_two_sets=True,
+        )
+    else:
+        selected_rows, selected_identity_idx, _ = (
+            _sample_random_pair_indices(
+                number_of_groups,
+                number_of_identities,
+                pair_sampling_budget,
+                rng,
+                match_two_sets=True,
             )
-            return (
-                np.empty(0, dtype=float),
-                np.empty(0, dtype=int),
-                diagnostics,
-            )
-
-        genuine_rows = []
-        genuine_identity_idx = []
-        for _ in range(pair_sampling_budget // 2):
-            identity = rng.choice(common_identities)
-            row = int(rng.choice(groups_by_identity[identity]))
-            genuine_rows.append(row)
-            genuine_identity_idx.append(identity_index_by_value[identity])
-
-        all_group_identities = list(groups_by_identity.keys())
-        all_enrolled_identities = list(identity_index_by_value.keys())
-
-        impostor_rows = []
-        impostor_identity_idx = []
-        for _ in range(pair_sampling_budget // 2):
-            identity_a = rng.choice(all_group_identities)
-            possible_b = [
-                identity
-                for identity in all_enrolled_identities
-                if identity != identity_a
-            ]
-            if not possible_b:
-                continue
-            identity_b = rng.choice(possible_b)
-            row = int(rng.choice(groups_by_identity[identity_a]))
-            impostor_rows.append(row)
-            impostor_identity_idx.append(identity_index_by_value[identity_b])
-
-        selected_rows = np.asarray(
-            genuine_rows + impostor_rows, dtype=np.int64
         )
-        selected_identity_idx = np.asarray(
-            genuine_identity_idx + impostor_identity_idx, dtype=np.int64
-        )
-        labels_pair = np.asarray(
-            [1] * len(genuine_rows) + [0] * len(impostor_rows), dtype=int
-        )
-
-        final_scores = _score_selected_decisions(
-            selected_rows, selected_identity_idx
-        )
-
-        diagnostics.update(
-            {
-                "genuine_fused_decisions": int(len(genuine_rows)),
-                "impostor_fused_decisions": int(len(impostor_rows)),
-                "pair_sampling_budget": pair_sampling_budget,
-                "pair_sampling_seed": pair_sampling_seed,
-            }
-        )
-        return final_scores, labels_pair, diagnostics
-
-    # pair_sampling_mode == "random"
-    row_choices = np.arange(number_of_groups, dtype=np.int64)
-    identity_choices = np.arange(number_of_identities, dtype=np.int64)
-
-    selected_rows = []
-    selected_identity_idx = []
-    labels_pair = []
-    for _ in range(pair_sampling_budget):
-        row = int(rng.choice(row_choices))
-        identity_idx = int(rng.choice(identity_choices))
-        selected_rows.append(row)
-        selected_identity_idx.append(identity_idx)
-        labels_pair.append(
-            int(group_identities[row] == enrolled_identity_ids[identity_idx])
-        )
-
-    selected_rows = np.asarray(selected_rows, dtype=np.int64)
-    selected_identity_idx = np.asarray(selected_identity_idx, dtype=np.int64)
-    labels_pair = np.asarray(labels_pair, dtype=int)
+        labels_pair = (
+            group_identities[selected_rows]
+            == enrolled_identity_ids[selected_identity_idx]
+        ).astype(int)
 
     final_scores = _score_selected_decisions(
         selected_rows, selected_identity_idx
@@ -3418,16 +3326,30 @@ def _sample_unique_integer_ranks(
 
     selected = set()
 
+    integer_sampler = getattr(
+        rng,
+        "integers",
+        None,
+    )
+
     for upper_bound in range(
         population_size - sample_size,
         population_size,
     ):
-        draw = int(
-            rng.integers(
-                0,
-                upper_bound + 1,
+        if integer_sampler is None:
+            draw = int(
+                rng.randint(
+                    0,
+                    upper_bound + 1,
+                )
             )
-        )
+        else:
+            draw = int(
+                integer_sampler(
+                    0,
+                    upper_bound + 1,
+                )
+            )
 
         if draw in selected:
             selected.add(
@@ -3450,6 +3372,414 @@ def _sample_unique_integer_ranks(
             dtype=np.int64,
             count=sample_size,
         )
+    )
+
+
+def _sample_exact_integer_ranks(
+    population_size,
+    sample_size,
+    rng,
+):
+    """Sample exactly ``sample_size`` uniform conceptual ranks."""
+    population_size = int(population_size)
+    sample_size = int(sample_size)
+
+    if population_size < 1:
+        raise ValueError(
+            "The valid verification comparison universe is empty."
+        )
+
+    if sample_size < 1:
+        raise ValueError(
+            "pair_sampling_budget must be a positive integer."
+        )
+
+    if sample_size <= population_size:
+        return (
+            _sample_unique_integer_ranks(
+                population_size,
+                sample_size,
+                rng,
+            ),
+            False,
+        )
+
+    integer_sampler = getattr(
+        rng,
+        "integers",
+        None,
+    )
+
+    if integer_sampler is None:
+        sampled_ranks = rng.randint(
+            0,
+            population_size,
+            size=sample_size,
+        )
+    else:
+        sampled_ranks = integer_sampler(
+            0,
+            population_size,
+            size=sample_size,
+        )
+
+    return (
+        np.asarray(sampled_ranks, dtype=np.int64),
+        True,
+    )
+
+
+def _upper_triangle_rank_to_pair(rank, item_count):
+    """Map one conceptual upper-triangle rank to an exact ``i < j`` pair."""
+    if (
+        isinstance(item_count, (bool, np.bool_))
+        or not isinstance(item_count, (int, np.integer))
+        or int(item_count) < 2
+    ):
+        raise ValueError(
+            "item_count must be an integer greater than or equal to 2."
+        )
+
+    if (
+        isinstance(rank, (bool, np.bool_))
+        or not isinstance(rank, (int, np.integer))
+    ):
+        raise ValueError("rank must be an integer.")
+
+    item_count = int(item_count)
+    rank = int(rank)
+    universe_size = item_count * (item_count - 1) // 2
+
+    if not 0 <= rank < universe_size:
+        raise ValueError(
+            f"rank must satisfy 0 <= rank < {universe_size}."
+        )
+
+    low = 0
+    high = item_count - 2
+
+    while low < high:
+        middle = (low + high) // 2
+        completed_rows = middle + 1
+        row_end = (
+            completed_rows
+            * (2 * item_count - completed_rows - 1)
+            // 2
+        )
+
+        if rank < row_end:
+            high = middle
+        else:
+            low = middle + 1
+
+    row = low
+    row_start = row * (2 * item_count - row - 1) // 2
+    column = row + 1 + (rank - row_start)
+    return row, column
+
+
+def _upper_triangle_ranks_to_pairs(ranks, item_count):
+    """Vector-shaped wrapper around the integer-safe rank mapper."""
+    ranks = np.asarray(ranks)
+
+    if ranks.ndim != 1:
+        raise ValueError("ranks must be one-dimensional.")
+
+    rows = np.empty(len(ranks), dtype=np.int64)
+    columns = np.empty(len(ranks), dtype=np.int64)
+
+    for position, rank in enumerate(ranks):
+        rows[position], columns[position] = _upper_triangle_rank_to_pair(
+            int(rank),
+            item_count,
+        )
+
+    return rows, columns
+
+
+def _cartesian_ranks_to_pairs(ranks, column_count):
+    """Map conceptual Cartesian ranks with quotient/remainder arithmetic."""
+    ranks = np.asarray(ranks, dtype=np.int64)
+
+    if ranks.ndim != 1:
+        raise ValueError("ranks must be one-dimensional.")
+
+    if (
+        isinstance(column_count, (bool, np.bool_))
+        or not isinstance(column_count, (int, np.integer))
+        or int(column_count) < 1
+    ):
+        raise ValueError("column_count must be a positive integer.")
+
+    column_count = int(column_count)
+    return (
+        ranks // column_count,
+        ranks % column_count,
+    )
+
+
+def _group_integer_positions(values):
+    """Yield one value and its original positions after a single stable sort."""
+    values = np.asarray(values, dtype=np.int64)
+
+    if values.ndim != 1:
+        raise ValueError("values must be one-dimensional.")
+
+    if len(values) == 0:
+        return
+
+    order = np.argsort(values, kind="stable")
+    sorted_values = values[order]
+    group_starts = np.concatenate(
+        (
+            np.asarray([0], dtype=np.int64),
+            np.flatnonzero(sorted_values[1:] != sorted_values[:-1]) + 1,
+        )
+    )
+    group_ends = np.concatenate(
+        (group_starts[1:], np.asarray([len(values)], dtype=np.int64))
+    )
+
+    for start, end in zip(group_starts, group_ends):
+        start = int(start)
+        end = int(end)
+        yield int(sorted_values[start]), order[start:end]
+
+
+def _sample_random_pair_indices(
+    row_count,
+    column_count,
+    pair_sampling_budget,
+    rng,
+    *,
+    match_two_sets,
+):
+    """Sample exact random decisions without materializing their universe."""
+    row_count = int(row_count)
+    column_count = int(column_count)
+
+    if match_two_sets:
+        universe_size = row_count * column_count
+    else:
+        universe_size = row_count * (row_count - 1) // 2
+
+    sampled_ranks, replacement_used = _sample_exact_integer_ranks(
+        universe_size,
+        pair_sampling_budget,
+        rng,
+    )
+
+    if match_two_sets:
+        rows, columns = _cartesian_ranks_to_pairs(
+            sampled_ranks,
+            column_count,
+        )
+    else:
+        rows, columns = _upper_triangle_ranks_to_pairs(
+            sampled_ranks,
+            row_count,
+        )
+
+    return rows, columns, replacement_used
+
+
+def _sample_genuine_pair_indices(
+    labels1,
+    labels2,
+    sample_size,
+    rng,
+    *,
+    match_two_sets,
+):
+    """Uniformly sample exact genuine decisions from compact label groups."""
+    groups1 = _group_verification_indices_by_label(labels1)
+    groups2 = _group_verification_indices_by_label(labels2)
+    entries = []
+    cumulative_ends = []
+    total_candidates = 0
+
+    for label, rows in groups1.items():
+        columns = groups2.get(label)
+
+        if columns is None:
+            continue
+
+        if match_two_sets:
+            candidate_count = len(rows) * len(columns)
+        else:
+            candidate_count = len(rows) * (len(rows) - 1) // 2
+
+        if candidate_count == 0:
+            continue
+
+        entries.append((rows, columns, candidate_count))
+        total_candidates += candidate_count
+        cumulative_ends.append(total_candidates)
+
+    if total_candidates == 0:
+        raise ValueError(
+            "Balanced verification sampling requires at least one valid "
+            "genuine comparison."
+        )
+
+    sampled_ranks, replacement_used = _sample_exact_integer_ranks(
+        total_candidates,
+        sample_size,
+        rng,
+    )
+    cumulative_ends = np.asarray(cumulative_ends, dtype=np.int64)
+    entry_indices = np.searchsorted(
+        cumulative_ends,
+        sampled_ranks,
+        side="right",
+    )
+    entry_starts = np.zeros_like(cumulative_ends)
+    entry_starts[1:] = cumulative_ends[:-1]
+    local_ranks = sampled_ranks - entry_starts[entry_indices]
+    selected_rows = np.empty(sample_size, dtype=np.int64)
+    selected_columns = np.empty(sample_size, dtype=np.int64)
+
+    for entry_index, positions in _group_integer_positions(entry_indices):
+        rows, columns, _ = entries[entry_index]
+        offsets = local_ranks[positions]
+
+        if match_two_sets:
+            row_offsets, column_offsets = _cartesian_ranks_to_pairs(
+                offsets,
+                len(columns),
+            )
+        else:
+            row_offsets, column_offsets = _upper_triangle_ranks_to_pairs(
+                offsets,
+                len(rows),
+            )
+
+        selected_rows[positions] = rows[row_offsets]
+        selected_columns[positions] = columns[column_offsets]
+
+    return selected_rows, selected_columns, replacement_used
+
+
+def _sample_impostor_pair_indices_exact(
+    labels1,
+    labels2,
+    sample_size,
+    rng,
+    *,
+    match_two_sets,
+):
+    """Uniformly sample exact impostor decisions from a compact rank space."""
+    labels1 = np.asarray(labels1)
+    labels2 = np.asarray(labels2)
+    row_count = len(labels1)
+    column_count = len(labels2)
+    column_groups = _group_verification_indices_by_label(labels2)
+    row_candidate_counts = np.zeros(row_count, dtype=np.int64)
+
+    if match_two_sets:
+        for row_index, label in enumerate(labels1):
+            same_identity = column_groups.get(label)
+            row_candidate_counts[row_index] = column_count - (
+                0 if same_identity is None else len(same_identity)
+            )
+    else:
+        identity_counts = {
+            label: len(indices)
+            for label, indices in column_groups.items()
+        }
+        seen_counts = collections.defaultdict(int)
+
+        for row_index, label in enumerate(labels1):
+            later_samples = row_count - row_index - 1
+            later_same_identity = (
+                identity_counts[label] - seen_counts[label] - 1
+            )
+            row_candidate_counts[row_index] = (
+                later_samples - later_same_identity
+            )
+            seen_counts[label] += 1
+
+    row_ends = np.cumsum(row_candidate_counts, dtype=np.int64)
+    total_candidates = int(row_ends[-1]) if row_ends.size else 0
+
+    if total_candidates == 0:
+        raise ValueError(
+            "Balanced verification sampling requires at least one valid "
+            "impostor comparison."
+        )
+
+    sampled_ranks, replacement_used = _sample_exact_integer_ranks(
+        total_candidates,
+        sample_size,
+        rng,
+    )
+    selected_rows = np.searchsorted(
+        row_ends,
+        sampled_ranks,
+        side="right",
+    ).astype(np.int64, copy=False)
+    row_starts = np.zeros_like(row_ends)
+    row_starts[1:] = row_ends[:-1]
+    local_offsets = sampled_ranks - row_starts[selected_rows]
+    selected_columns = np.empty(sample_size, dtype=np.int64)
+    empty_forbidden = np.empty(0, dtype=np.int64)
+
+    for row_index, positions in _group_integer_positions(selected_rows):
+        forbidden = column_groups.get(
+            labels1[row_index],
+            empty_forbidden,
+        )
+        lower_bound = 0 if match_two_sets else row_index + 1
+        selected_columns[positions] = _map_offsets_excluding_indices(
+            local_offsets[positions],
+            forbidden,
+            lower_bound=lower_bound,
+            upper_bound=column_count,
+        )
+
+    return selected_rows, selected_columns, replacement_used
+
+
+def _sample_balanced_pair_indices(
+    labels1,
+    labels2,
+    pair_sampling_budget,
+    rng,
+    *,
+    match_two_sets,
+):
+    """Return an exact half-genuine, half-impostor decision sequence."""
+    half_budget = pair_sampling_budget // 2
+    genuine_rows, genuine_columns, genuine_replacement = (
+        _sample_genuine_pair_indices(
+            labels1,
+            labels2,
+            half_budget,
+            rng,
+            match_two_sets=match_two_sets,
+        )
+    )
+    impostor_rows, impostor_columns, impostor_replacement = (
+        _sample_impostor_pair_indices_exact(
+            labels1,
+            labels2,
+            half_budget,
+            rng,
+            match_two_sets=match_two_sets,
+        )
+    )
+
+    return (
+        np.concatenate((genuine_rows, impostor_rows)),
+        np.concatenate((genuine_columns, impostor_columns)),
+        np.concatenate(
+            (
+                np.ones(half_budget, dtype=int),
+                np.zeros(half_budget, dtype=int),
+            )
+        ),
+        genuine_replacement,
+        impostor_replacement,
     )
 
 
@@ -3981,18 +4311,7 @@ def _resolve_pair_sampling_arguments(
                 "through pair_sampling_mode and sampling_mode."
             )
 
-    valid_modes = {
-        "all",
-        "all_genuine",
-        "balanced",
-        "random",
-    }
-
-    if resolved_mode not in valid_modes:
-        raise ValueError(
-            "Unknown verification pair sampling mode: "
-            f"{resolved_mode!r}."
-        )
+    _validate_pair_sampling_mode(resolved_mode)
 
     if pair_sampling_budget is None:
         resolved_budget = (
@@ -4013,15 +4332,14 @@ def _resolve_pair_sampling_arguments(
                 "through pair_sampling_budget and num_pairs."
             )
 
-    if (
-        isinstance(
+    if resolved_mode in _EXACT_BUDGET_PAIR_SAMPLING_MODES:
+        resolved_budget = _validate_exact_pair_sampling_budget(
+            resolved_mode,
             resolved_budget,
-            (bool, np.bool_),
         )
-        or not isinstance(
-            resolved_budget,
-            (int, np.integer),
-        )
+    elif (
+        isinstance(resolved_budget, (bool, np.bool_))
+        or not isinstance(resolved_budget, (int, np.integer))
         or int(resolved_budget) < 1
     ):
         raise ValueError(
@@ -4491,14 +4809,16 @@ def _generate_pairs(
       - all: evaluate the complete comparison space.
       - all_genuine: evaluate every genuine comparison and uniformly sample
         impostor comparisons without replacement up to max_impostor_pairs.
-      - balanced: sample equal genuine and impostor classes using the pair
-        sampling budget.
-      - random: draw comparison attempts at random using the pair sampling
-        budget.
+      - balanced: evaluate exactly the even pair-sampling budget, split equally
+        between genuine and impostor decisions.
+      - random: evaluate exactly the pair-sampling budget, sampled uniformly
+        from the valid conceptual comparison universe.
 
     In one-set evaluation, comparisons are unordered and self-comparisons are
     excluded. In two-set evaluation, each probe-by-enrollment Cartesian cell
-    is a distinct comparison.
+    is a distinct comparison. Stochastic sampling is without replacement when
+    the requested count fits its universe and uses replacement only when the
+    exact requested count exceeds that universe.
     """
     (
         resolved_mode,
@@ -4557,6 +4877,10 @@ def _generate_pairs(
         len(labels1) == 0
         or len(labels2) == 0
     ):
+        if resolved_mode in _EXACT_BUDGET_PAIR_SAMPLING_MODES:
+            raise ValueError(
+                "The valid verification comparison universe is empty."
+            )
         return (
             np.array([]),
             np.array([]),
@@ -4697,211 +5021,39 @@ def _generate_pairs(
     )
 
     if resolved_mode == "balanced":
-        s1_idx = collections.defaultdict(
-            list
+        (
+            selected_rows,
+            selected_columns,
+            labels_pair,
+            _,
+            _,
+        ) = _sample_balanced_pair_indices(
+            labels1,
+            labels2,
+            resolved_budget,
+            rng,
+            match_two_sets=match_two_sets,
         )
-
-        s2_idx = collections.defaultdict(
-            list
+    else:
+        selected_rows, selected_columns, _ = _sample_random_pair_indices(
+            len(labels1),
+            len(labels2),
+            resolved_budget,
+            rng,
+            match_two_sets=match_two_sets,
         )
+        labels_pair = (
+            labels1[selected_rows]
+            == labels2[selected_columns]
+        ).astype(int)
 
-        for index, label in enumerate(
-            labels1
-        ):
-            s1_idx[label].append(
-                index
-            )
-
-        for index, label in enumerate(
-            labels2
-        ):
-            s2_idx[label].append(
-                index
-            )
-
-        common_subjects = [
-            subject
-            for subject in s1_idx
-            if subject in s2_idx
-        ]
-
-        if len(common_subjects) < 2:
-            return (
-                np.array([]),
-                np.array([]),
-            )
-
-        if match_two_sets:
-            genuine_subjects = (
-                common_subjects
-            )
-        else:
-            genuine_subjects = [
-                subject
-                for subject
-                in common_subjects
-                if len(
-                    s1_idx[subject]
-                ) >= 2
-            ]
-
-        if not genuine_subjects:
-            return (
-                np.array([]),
-                np.array([]),
-            )
-
-        for _ in range(
-            resolved_budget // 2
-        ):
-            subject = rng.choice(
-                genuine_subjects
-            )
-
-            if match_two_sets:
-                idx1 = int(
-                    rng.choice(
-                        s1_idx[subject]
-                    )
-                )
-
-                idx2 = int(
-                    rng.choice(
-                        s2_idx[subject]
-                    )
-                )
-            else:
-                candidate_indices = (
-                    np.asarray(
-                        s1_idx[subject]
-                    )
-                )
-
-                idx1, idx2 = (
-                    rng.choice(
-                        candidate_indices,
-                        size=2,
-                        replace=False,
-                    )
-                )
-
-                idx1 = int(idx1)
-                idx2 = int(idx2)
-
-            score = _compute_pair_score(
-                embeddings1[idx1],
-                embeddings2[idx2],
-                method=matching_method,
-            )
-
-            scores.append(
-                score
-            )
-
-            labels_pair.append(
-                1
-            )
-
-        all_s1 = list(
-            s1_idx.keys()
-        )
-
-        all_s2 = list(
-            s2_idx.keys()
-        )
-
-        for _ in range(
-            resolved_budget // 2
-        ):
-            subject_a = rng.choice(
-                all_s1
-            )
-
-            possible_b = [
-                subject
-                for subject in all_s2
-                if subject != subject_a
-            ]
-
-            if not possible_b:
-                continue
-
-            subject_b = rng.choice(
-                possible_b
-            )
-
-            idx1 = int(
-                rng.choice(
-                    s1_idx[subject_a]
-                )
-            )
-
-            idx2 = int(
-                rng.choice(
-                    s2_idx[subject_b]
-                )
-            )
-
-            score = _compute_pair_score(
-                embeddings1[idx1],
-                embeddings2[idx2],
-                method=matching_method,
-            )
-
-            scores.append(
-                score
-            )
-
-            labels_pair.append(
-                0
-            )
-
-    elif resolved_mode == "random":
-        indices1 = np.arange(
-            len(labels1)
-        )
-
-        indices2 = np.arange(
-            len(labels2)
-        )
-
-        for _ in range(
-            resolved_budget
-        ):
-            idx1 = int(
-                rng.choice(
-                    indices1
-                )
-            )
-
-            idx2 = int(
-                rng.choice(
-                    indices2
-                )
-            )
-
-            if (
-                not match_two_sets
-                and idx1 == idx2
-            ):
-                continue
-
-            score = _compute_pair_score(
-                embeddings1[idx1],
-                embeddings2[idx2],
-                method=matching_method,
-            )
-
-            scores.append(
-                score
-            )
-
-            labels_pair.append(
-                int(
-                    labels1[idx1]
-                    == labels2[idx2]
-                )
-            )
+    scores = _score_selected_pair_indices(
+        embeddings1,
+        embeddings2,
+        selected_rows,
+        selected_columns,
+        matching_method=matching_method,
+    )
 
     return (
         np.asarray(scores),

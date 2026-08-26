@@ -59,7 +59,7 @@ class PairSamplingCLIConfigurationTests(
                     "--sampling_mode",
                     "balanced",
                     "--num_pairs",
-                    "123",
+                    "124",
                 ]
             )
         )
@@ -71,7 +71,7 @@ class PairSamplingCLIConfigurationTests(
 
         self.assertEqual(
             arguments.pair_sampling_budget,
-            123,
+            124,
         )
 
         self.assertIsNone(
@@ -121,7 +121,7 @@ class PairSamplingCLIConfigurationTests(
             "dataset": "ecgid",
             "task": 2,
             "sampling_mode": "balanced",
-            "num_pairs": 321,
+            "num_pairs": 322,
         }
 
         with tempfile.TemporaryDirectory() as directory:
@@ -153,7 +153,7 @@ class PairSamplingCLIConfigurationTests(
 
         self.assertEqual(
             arguments.pair_sampling_budget,
-            321,
+            322,
         )
 
         effective = (
@@ -173,7 +173,7 @@ class PairSamplingCLIConfigurationTests(
             effective[
                 "pair_sampling_budget"
             ],
-            321,
+            322,
         )
 
         self.assertNotIn(
