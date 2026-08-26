@@ -2205,9 +2205,11 @@ def _get_embeddings(model, loader, device):
             labels.append(yb.numpy())
     return np.vstack(embeddings), np.concatenate(labels)
 
+_MANDATORY_VERIFICATION_FAR = 0.001
+
 def _summarize_verification_pairs(
     labels_pair,
-    target_far=0.001,
+    target_far=_MANDATORY_VERIFICATION_FAR,
 ):
     """
     Summarize the comparison counts supporting verification metrics.
@@ -2299,11 +2301,26 @@ def _finite_float_or_none(
     return value
 
 
-def _normalize_target_fars(
+def _resolve_target_fars(
     target_fars,
 ):
     """
-    Validate and normalize requested verification FAR operating points.
+    Resolve, validate, and normalize requested verification FAR operating points.
+
+    The mandatory headline FAR (0.001) is always included.
+
+    Parameters
+    ----------
+    target_fars : iterable of float, or None
+        Additional requested FAR operating points.
+        - None: include default additional FARs
+        - Empty iterable: mandatory FAR only
+        - Non-empty iterable: explicit additional FARs
+
+    Returns
+    -------
+    list of float
+        Sorted, deduplicated FAR set, always containing 0.001.
     """
     if target_fars is None:
         target_fars = (
@@ -2320,12 +2337,9 @@ def _normalize_target_fars(
             "of numeric FAR values."
         ) from error
 
-    if not target_fars:
-        raise ValueError(
-            "target_fars cannot be empty."
-        )
-
-    normalized_fars = []
+    resolved_fars = {
+        _MANDATORY_VERIFICATION_FAR
+    }
 
     for target_far in target_fars:
         if isinstance(
@@ -2365,20 +2379,13 @@ def _normalize_target_fars(
                 "0 < FAR < 1."
             )
 
-        normalized_fars.append(
+        resolved_fars.add(
             target_far
         )
 
-    if len(
-        set(normalized_fars)
-    ) != len(
-        normalized_fars
-    ):
-        raise ValueError(
-            "FAR targets must be unique."
-        )
-
-    return normalized_fars
+    return sorted(
+        list(resolved_fars)
+    )
 
 
 def _validate_verification_curve_inputs(
@@ -2630,7 +2637,7 @@ def _build_verification_curve_artifacts(
     )
 
     target_fars = (
-        _normalize_target_fars(
+        _resolve_target_fars(
             target_fars
         )
     )
@@ -3105,7 +3112,7 @@ def _compute_metrics_verification(
             scores,
             labels_pair,
             target_fars=[
-                0.001,
+                _MANDATORY_VERIFICATION_FAR,
             ],
         )
     )

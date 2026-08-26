@@ -109,16 +109,16 @@ class CustomOperatingPointTests(unittest.TestCase):
                 point["name"]
                 for point in artifacts["operating_points"]
             ],
-            ["TAR@5%FAR", "TAR@0.5%FAR"],
+            ["TAR@0.1%FAR", "TAR@0.5%FAR", "TAR@5%FAR"],
         )
 
-    def test_requested_order_is_preserved(self):
+    def test_fars_are_numerically_sorted(self):
         scores, labels = build_separable_scores()
 
         artifacts = utils._build_verification_curve_artifacts(
             scores,
             labels,
-            target_fars=[0.001, 0.1],
+            target_fars=[0.1, 0.0001],
         )
 
         self.assertEqual(
@@ -126,7 +126,7 @@ class CustomOperatingPointTests(unittest.TestCase):
                 point["target_far"]
                 for point in artifacts["operating_points"]
             ],
-            [0.001, 0.1],
+            [0.0001, 0.001, 0.1],
         )
 
 
@@ -237,12 +237,12 @@ class CommandLineValidationTests(unittest.TestCase):
                 + extra_arguments
             )
 
-    def test_default_is_none(self):
+    def test_default_resolves_to_mandatory_and_default_additionals(self):
         args, _ = self._parse(["--task", "2"])
 
-        self.assertIsNone(args.target_fars)
+        self.assertEqual(args.target_fars, [0.0001, 0.001, 0.01, 0.1])
 
-    def test_valid_targets_are_accepted(self):
+    def test_valid_targets_are_accepted_and_sorted(self):
         # Task 4 enrolls and probes on the same unseen subjects, so it asks for
         # the gallery budget to be stated.
         args, _ = self._parse(
@@ -259,7 +259,15 @@ class CommandLineValidationTests(unittest.TestCase):
 
         self.assertEqual(
             args.target_fars,
-            [0.01, 0.001],
+            [0.001, 0.01],
+        )
+
+    def test_explicit_empty_resolves_to_mandatory_only(self):
+        args, _ = self._parse(["--task", "2", "--target_fars"])
+
+        self.assertEqual(
+            args.target_fars,
+            [0.001],
         )
 
     def test_far_of_one_is_rejected(self):
@@ -284,17 +292,17 @@ class CommandLineValidationTests(unittest.TestCase):
                 ]
             )
 
-    def test_duplicate_targets_are_rejected(self):
-        with self.assertRaises(SystemExit):
-            self._parse(
-                [
-                    "--task",
-                    "2",
-                    "--target_fars",
-                    "0.01",
-                    "0.01",
-                ]
-            )
+    def test_duplicate_targets_are_deduplicated(self):
+        args, _ = self._parse(
+            [
+                "--task",
+                "2",
+                "--target_fars",
+                "0.01",
+                "0.01",
+            ]
+        )
+        self.assertEqual(args.target_fars, [0.001, 0.01])
 
     def test_identification_task_rejects_target_fars(self):
         with self.assertRaises(SystemExit):

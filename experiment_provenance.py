@@ -59,6 +59,7 @@ EFFECTIVE_CONFIGURATION_ADMINISTRATIVE_FIELDS = frozenset(
         "config",
         "experiment_time",
         "explicitly_configured_arguments",
+        "far_resolution",
         "hostname",
         "intelligent_data_loading",
         "intelligent_weight_loading",

@@ -56,7 +56,7 @@ from scipy.interpolate import interp1d
 from scipy import stats
 
 from utils import (
-    _apply_score_fusion, _generate_fused_verification_pairs, _source_order_indices, _make_loader, _encode_labels,
+    _MANDATORY_VERIFICATION_FAR, _apply_score_fusion, _generate_fused_verification_pairs, _source_order_indices, _make_loader, _encode_labels,
     _select_multi_templates, _reduce_template_scores_to_identities, _generate_multi_template_verification_pairs,
     _apply_outlier_filter, _compute_sqi, _compute_score_matrix,
     _get_embeddings, _create_templates, _generate_pairs, _resolve_pair_sampling_arguments,
@@ -4327,7 +4327,7 @@ def _build_weight_artifact_context(
 
 def _get_verification_pair_statistics(
     labels_pair,
-    target_far=0.001,
+    target_far=_MANDATORY_VERIFICATION_FAR,
 ):
     """
     Build pair-count statistics and warn when the requested FAR is below
@@ -6761,7 +6761,7 @@ def run_closed_set_verification(x, y, model_class, epochs=150, batch_size=256, l
     data_stats.update(
         _get_verification_pair_statistics(
             labels_pair,
-            target_far=0.001,
+            target_far=_MANDATORY_VERIFICATION_FAR,
         )
     )
 
@@ -8361,7 +8361,7 @@ def run_subject_disjoint_verification(x, y, model_class, epochs=150, batch_size=
     data_stats.update(
         _get_verification_pair_statistics(
             labels_pair,
-            target_far=0.001,
+            target_far=_MANDATORY_VERIFICATION_FAR,
         )
     )
 
@@ -10001,7 +10001,7 @@ def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class
     data_stats.update(
         _get_verification_pair_statistics(
             labels_pair,
-            target_far=0.001,
+            target_far=_MANDATORY_VERIFICATION_FAR,
         )
     )
 
@@ -11546,7 +11546,7 @@ def run_subject_disjoint_cross_session_verification(
     data_stats.update(
         _get_verification_pair_statistics(
             labels_pair,
-            target_far=0.001,
+            target_far=_MANDATORY_VERIFICATION_FAR,
         )
     )
 

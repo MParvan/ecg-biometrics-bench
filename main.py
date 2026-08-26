@@ -1206,34 +1206,36 @@ def validate_experiment_arguments(args, parser):
     )
 
     if args.target_fars is not None:
-        if not args.target_fars:
-            parser.error(
-                "'target_fars' cannot be an empty list."
-            )
-
-        for target_far in args.target_fars:
-            if not np.isfinite(target_far):
-                parser.error(
-                    "Every 'target_fars' entry must be finite, "
-                    f"received {target_far!r}."
-                )
-
-            if not 0.0 < target_far < 1.0:
-                parser.error(
-                    "Every 'target_fars' entry must satisfy "
-                    f"0 < FAR < 1, received {target_far!r}."
-                )
-
-        if len(set(args.target_fars)) != len(args.target_fars):
-            parser.error(
-                "'target_fars' entries must be unique."
-            )
-
         if args.task not in [2, 4, 6, 8]:
             parser.error(
                 "'target_fars' applies only to the verification "
                 "tasks 2, 4, 6, and 8."
             )
+
+    if args.task in [2, 4, 6, 8]:
+        from utils import _resolve_target_fars, _MANDATORY_VERIFICATION_FAR
+        if args.target_fars is None:
+            source = "default"
+            requested = None
+        elif len(args.target_fars) == 0:
+            source = "explicit_empty"
+            requested = []
+        else:
+            source = "explicit"
+            requested = list(args.target_fars)
+
+        try:
+            resolved = _resolve_target_fars(args.target_fars)
+        except ValueError as e:
+            parser.error(str(e))
+
+        args.target_fars = resolved
+        args.far_resolution = {
+            "mandatory_far": _MANDATORY_VERIFICATION_FAR,
+            "requested_additional_fars": requested,
+            "additional_far_source": source,
+            "resolved_fars": resolved,
+        }
 
     if (
         args.dataset not in continuous_datasets
@@ -2562,16 +2564,16 @@ def get_parser():
     eval_group.add_argument(
         '--target_fars',
         type=float,
-        nargs='+',
+        nargs='*',
         default=None,
         metavar='FAR',
         help=(
-            "False-acceptance operating points reported for "
+            "Additional false-acceptance operating points reported for "
             "verification tasks, as fractions in (0, 1). "
-            "Defaults to 0.1 0.01 0.001 0.0001, which yields "
-            "TAR@10%%FAR, TAR@1%%FAR, TAR@0.1%%FAR, and "
-            "TAR@0.01%%FAR. The headline metric TAR@0.1%%FAR is "
-            "unaffected unless 0.001 is removed."
+            "If omitted, defaults to 0.1 0.01 0.0001. "
+            "If passed without values, no additional points are added. "
+            "The mandatory headline metric TAR@0.1%%FAR (0.001) is "
+            "always unconditionally included."
         ),
     )
 
