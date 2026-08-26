@@ -316,7 +316,13 @@ def _make_loader(x, y, batch_size, shuffle=True, device='cpu'):
         
     return DataLoader(ds, batch_size=batch_size, shuffle=shuffle)
 
-def _create_templates(embeddings, labels, method='mean', max_beats=None, provenance=None):
+def _create_templates(
+    embeddings,
+    labels,
+    method='mean',
+    max_enrollment_samples=None,
+    provenance=None,
+):
     """
     Aggregate enrollment embeddings into subject templates.
 
@@ -338,54 +344,74 @@ def _create_templates(embeddings, labels, method='mean', max_beats=None, provena
           softmax weighting.
         - ``geometric_median``: iterative geometric median.
         - ``none``: retain all enrollment embeddings without fusion.
-    max_beats : int or None
-        Enrollment budget: the first ``max_beats`` beats per subject are used,
-        selected in genuine source order when ``provenance`` is supplied and in
-        input order otherwise. ``None`` uses all available beats.
+    max_enrollment_samples : int or None
+        Enrollment budget: the first ``max_enrollment_samples`` observations
+        per subject are used, selected in genuine source order when
+        ``provenance`` is supplied and in input order otherwise. ``None`` uses
+        all available observations.
     provenance : BeatProvenance or None
         Optional per-beat source provenance, index-aligned with ``embeddings``.
-        When supplied for a fusing method it orders the finite first-N budget by
-        source. ``method='none'`` returns the enrollment embeddings before the
-        budget is applied; its finite-budget semantics are handled separately.
+        When a finite enrollment budget is supplied, it orders the first-N
+        selection by source before the selected observations are either
+        returned individually or fused.
 
     Returns
     -------
     tuple[np.ndarray, np.ndarray]
         Template embeddings and their corresponding subject labels.
     """
-    if method == 'none' or method is None:
-        return embeddings, labels
+    no_fusion = method == 'none' or method is None
 
-    if provenance is not None:
+    if max_enrollment_samples is not None:
+        try:
+            max_enrollment_samples = int(max_enrollment_samples)
+        except (TypeError, ValueError, OverflowError):
+            max_enrollment_samples = None
+
+    if provenance is not None and (
+        not no_fusion or max_enrollment_samples is not None
+    ):
         provenance.validate(len(labels))
-    
-    if max_beats is not None:
-        try: max_beats = int(max_beats)
-        except: max_beats = None
 
     unique_labels = np.unique(labels)
-    templates = []
-    new_labels = []
-    
-    feature_dim = embeddings.shape[1]
-    
+    enrollment_indices_by_label = []
+    enrollment_was_limited = False
+
     for label in unique_labels:
-        # 1. Get all available indices for this subject
         idxs = np.where(labels == label)[0]
-        
-        # 2. Apply the enrolment budget: the genuinely first N beats in source
-        # order when provenance is available, otherwise input order.
-        if max_beats is not None and len(idxs) > max_beats:
+
+        if (
+            max_enrollment_samples is not None
+            and len(idxs) > max_enrollment_samples
+        ):
             if provenance is not None:
                 order = _source_order_indices(provenance.subset(idxs))
-                idxs = idxs[order][:max_beats]
+                idxs = idxs[order][:max_enrollment_samples]
             else:
-                idxs = idxs[:max_beats]
-            
+                idxs = idxs[:max_enrollment_samples]
+            enrollment_was_limited = True
+
+        enrollment_indices_by_label.append((label, idxs))
+
+    if no_fusion:
+        if not enrollment_was_limited:
+            return embeddings, labels
+
+        selected_indices = np.concatenate(
+            [idxs for _, idxs in enrollment_indices_by_label]
+        )
+        return embeddings[selected_indices], labels[selected_indices]
+
+    templates = []
+    new_labels = []
+
+    feature_dim = embeddings.shape[1]
+
+    for label, idxs in enrollment_indices_by_label:
         subj_embs = embeddings[idxs]
         if len(subj_embs) == 0: continue
 
-        # 3. Apply Fusion Method on the selected subset
+        # Apply the fusion method to the selected enrollment subset.
         if method == 'representative':
             # Average the most centrally consistent half of the embeddings.
             

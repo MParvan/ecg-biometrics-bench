@@ -70,7 +70,7 @@ class Task2ClosedSetVerificationProvenance(unittest.TestCase):
         # The finite-template branch must receive provenance aligned to labels.
         template_calls = [
             call for call in spy.call_args_list
-            if call.kwargs.get("max_beats") == 2
+            if call.kwargs.get("max_enrollment_samples") == 2
         ]
         self.assertEqual(len(template_calls), 1)
         provenance_passed = template_calls[0].kwargs.get("provenance")
@@ -80,7 +80,7 @@ class Task2ClosedSetVerificationProvenance(unittest.TestCase):
         self.assertEqual(len(embeddings_passed), len(labels_passed))
 
     def test_template_size_none_is_unchanged_by_provenance(self):
-        # method='mean' with max_beats=None hits the fully-averaged branch,
+        # method='mean' with no enrollment limit uses the fully averaged branch,
         # which is unchanged regardless of enrollment ordering.
         with patch.object(
             run, "_create_templates", wraps=run._create_templates
@@ -96,7 +96,7 @@ class Task2ClosedSetVerificationProvenance(unittest.TestCase):
             )
         template_calls = [
             call for call in spy.call_args_list
-            if call.kwargs.get("max_beats") is None
+            if call.kwargs.get("max_enrollment_samples") is None
         ]
         self.assertEqual(len(template_calls), 1)
 
@@ -121,7 +121,7 @@ class Task2ClosedSetVerificationProvenance(unittest.TestCase):
             )
         template_calls = [
             call for call in spy.call_args_list
-            if call.kwargs.get("max_beats") == 2
+            if call.kwargs.get("max_enrollment_samples") == 2
         ]
         self.assertEqual(len(template_calls), 1)
         # The provenance object accompanying the template call must have the
@@ -250,7 +250,7 @@ class Task6CrossSessionVerificationProvenance(unittest.TestCase):
             )
         template_calls = [
             call for call in spy.call_args_list
-            if call.kwargs.get("max_beats") == 2
+            if call.kwargs.get("max_enrollment_samples") == 2
         ]
         self.assertEqual(len(template_calls), 1)
         provenance_passed = template_calls[0].kwargs.get("provenance")
@@ -287,7 +287,7 @@ class Task8SubjectDisjointCrossSessionVerificationProvenance(unittest.TestCase):
             )
         template_calls = [
             call for call in spy.call_args_list
-            if call.kwargs.get("max_beats") == 2
+            if call.kwargs.get("max_enrollment_samples") == 2
         ]
         self.assertEqual(len(template_calls), 1)
         provenance_passed = template_calls[0].kwargs.get("provenance")
@@ -352,7 +352,7 @@ class MultiRunPropagatesVerificationProvenance(unittest.TestCase):
         template_calls = [
             call
             for call in spy.call_args_list
-            if call.kwargs.get("max_beats") == 2
+            if call.kwargs.get("max_enrollment_samples") == 2
         ]
 
         self.assertEqual(len(template_calls), 2)

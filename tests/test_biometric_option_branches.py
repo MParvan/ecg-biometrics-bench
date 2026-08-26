@@ -108,7 +108,7 @@ class TemplateFusionTests(unittest.TestCase):
                         self.embeddings,
                         self.labels,
                         method=method,
-                        max_beats=None,
+                        max_enrollment_samples=None,
                     )
                 )
 
@@ -177,13 +177,13 @@ class TemplateFusionTests(unittest.TestCase):
             ),
         )
 
-    def test_max_beats_uses_first_requested_embeddings(self):
+    def test_enrollment_limit_uses_first_requested_embeddings(self):
         templates, template_labels = (
             _create_templates(
                 self.embeddings,
                 self.labels,
                 method="mean",
-                max_beats=2,
+                max_enrollment_samples=2,
             )
         )
 

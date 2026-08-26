@@ -206,10 +206,38 @@ class FirstNEnrollment(unittest.TestCase):
             ["A", "A", "A"], ["A#0", "A#0", "A#0"], [0.0, 0.0, 0.0], [2, 0, 1],
         )
         templates, tlabels = _create_templates(
-            embeddings, labels, method="mean", max_beats=2, provenance=p
+            embeddings, labels, method="mean",
+            max_enrollment_samples=2, provenance=p
         )
         # Source order is beats with beat_ordinal 0 and 1 -> [1,1] and [2,2].
         np.testing.assert_array_equal(templates[0], np.array([1.5, 1.5]))
+
+    def test_no_fusion_returns_source_first_observations_individually(self):
+        embeddings = np.array([[3.0, 3.0], [1.0, 1.0], [2.0, 2.0]])
+        labels = np.array(["s", "s", "s"])
+        p = prov(
+            ["A", "A", "A"],
+            ["A#0", "A#0", "A#0"],
+            [0.0, 0.0, 0.0],
+            [2, 0, 1],
+        )
+
+        templates, template_labels = _create_templates(
+            embeddings,
+            labels,
+            method="none",
+            max_enrollment_samples=2,
+            provenance=p,
+        )
+
+        np.testing.assert_array_equal(
+            templates,
+            np.array([[1.0, 1.0], [2.0, 2.0]]),
+        )
+        np.testing.assert_array_equal(
+            template_labels,
+            np.array(["s", "s"]),
+        )
 
     def test_misaligned_provenance_is_rejected_for_a_fusing_method(self):
         embeddings = np.zeros((3, 2))
@@ -217,7 +245,7 @@ class FirstNEnrollment(unittest.TestCase):
         mismatched = prov(["s", "s"], ["s#0", "s#0"], [0.0, 0.0], [0, 1])
         with self.assertRaises(ValueError):
             _create_templates(
-                embeddings, labels, method="mean", max_beats=1,
+                embeddings, labels, method="mean", max_enrollment_samples=1,
                 provenance=mismatched,
             )
 
@@ -225,7 +253,7 @@ class FirstNEnrollment(unittest.TestCase):
         embeddings = np.array([[1.0, 1.0], [2.0, 2.0], [9.0, 9.0]])
         labels = np.array(["s", "s", "s"])
         templates, _ = _create_templates(
-            embeddings, labels, method="mean", max_beats=2
+            embeddings, labels, method="mean", max_enrollment_samples=2
         )
         np.testing.assert_array_equal(templates[0], np.array([1.5, 1.5]))
 

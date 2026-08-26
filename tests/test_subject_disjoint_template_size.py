@@ -16,11 +16,16 @@ import unittest
 from contextlib import redirect_stderr
 from io import StringIO
 from pathlib import Path
+from unittest.mock import patch
+
+import numpy as np
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 import main
+import run
+from test_all_task_smoke import TinyECGModel, make_synthetic_ecg_dataset
 
 
 PAPER_CONFIGS = PROJECT_ROOT / "configs" / "paper_reproduction"
@@ -103,6 +108,88 @@ class PaperConfigurationsStateTheBudget(unittest.TestCase):
                 )
 
         self.assertGreater(checked, 0, "no task 3 or 4 configuration found")
+
+
+class SubjectDisjointBudgetIsAppliedOnlyByGallerySelection(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.samples, cls.labels = make_synthetic_ecg_dataset(
+            number_of_subjects=8,
+            samples_per_subject=12,
+        )
+
+    def _common_arguments(self):
+        return {
+            "model_class": TinyECGModel,
+            "epochs": 1,
+            "batch_size": 16,
+            "lr": 1e-3,
+            "val_split": 0.0,
+            "seed": 42,
+            "device": "cpu",
+            "visualize": False,
+            "save_results_and_settings": False,
+            "loader": None,
+            "n_runs": 1,
+            "_return_stats": True,
+            "intelligent_weight_loading": False,
+        }
+
+    def test_tasks_three_and_four_do_not_reapply_the_gallery_budget(self):
+        task_calls = (
+            (
+                run.run_subject_disjoint_identification,
+                {
+                    "test_split": 0.25,
+                    "use_template": True,
+                    "template_fusion_method": "none",
+                    "template_size": 2,
+                    "probe_fusion_size": 1,
+                },
+            ),
+            (
+                run.run_subject_disjoint_verification,
+                {
+                    "test_split": 0.25,
+                    "num_pairs": 40,
+                    "sampling_mode": "all",
+                    "use_template": True,
+                    "template_fusion_method": "none",
+                    "template_size": 2,
+                    "use_deployment_evaluation": False,
+                },
+            ),
+        )
+
+        for runner, arguments in task_calls:
+            with self.subTest(runner=runner.__name__):
+                with patch.object(
+                    run,
+                    "_create_templates",
+                    wraps=run._create_templates,
+                ) as template_spy:
+                    runner(
+                        self.samples,
+                        self.labels,
+                        **arguments,
+                        **self._common_arguments(),
+                    )
+
+                self.assertEqual(template_spy.call_count, 1)
+                template_call = template_spy.call_args
+                self.assertIsNone(
+                    template_call.kwargs["max_enrollment_samples"]
+                )
+
+                enrollment_labels = np.asarray(template_call.args[1])
+                counts = np.unique(
+                    enrollment_labels,
+                    return_counts=True,
+                )[1]
+                np.testing.assert_array_equal(
+                    counts,
+                    np.full_like(counts, 2),
+                )
 
 
 if __name__ == "__main__":

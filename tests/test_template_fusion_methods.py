@@ -1,3 +1,4 @@
+import inspect
 import sys
 import unittest
 from pathlib import Path
@@ -64,7 +65,7 @@ class TemplateFusionMethodTests(unittest.TestCase):
                     self.embeddings,
                     self.labels,
                     method=method,
-                    max_beats=None,
+                    max_enrollment_samples=None,
                 )
 
                 if method == "none":
@@ -88,6 +89,98 @@ class TemplateFusionMethodTests(unittest.TestCase):
                     self.assertTrue(
                         np.all(np.isfinite(templates))
                     )
+
+    def test_private_enrollment_limit_parameter_has_precise_name(self):
+        parameters = inspect.signature(_create_templates).parameters
+        self.assertIn("max_enrollment_samples", parameters)
+        self.assertNotIn("max_beats", parameters)
+
+    def test_no_fusion_without_limit_retains_every_observation(self):
+        templates, template_labels = _create_templates(
+            self.embeddings,
+            self.labels,
+            method="none",
+            max_enrollment_samples=None,
+        )
+
+        np.testing.assert_array_equal(templates, self.embeddings)
+        np.testing.assert_array_equal(template_labels, self.labels)
+
+    def test_no_fusion_limit_retains_first_observations_per_identity(self):
+        templates, template_labels = _create_templates(
+            self.embeddings,
+            self.labels,
+            method="none",
+            max_enrollment_samples=2,
+        )
+
+        expected_indices = np.array([0, 1, 4, 5])
+        np.testing.assert_array_equal(
+            templates,
+            self.embeddings[expected_indices],
+        )
+        np.testing.assert_array_equal(
+            template_labels,
+            self.labels[expected_indices],
+        )
+
+    def test_no_fusion_limit_is_repeatable(self):
+        first = _create_templates(
+            self.embeddings,
+            self.labels,
+            method="none",
+            max_enrollment_samples=2,
+        )
+        second = _create_templates(
+            self.embeddings,
+            self.labels,
+            method="none",
+            max_enrollment_samples=2,
+        )
+
+        np.testing.assert_array_equal(first[0], second[0])
+        np.testing.assert_array_equal(first[1], second[1])
+
+    def test_oversized_no_fusion_limit_retains_original_arrays(self):
+        templates, template_labels = _create_templates(
+            self.embeddings,
+            self.labels,
+            method="none",
+            max_enrollment_samples=100,
+        )
+
+        np.testing.assert_array_equal(templates, self.embeddings)
+        np.testing.assert_array_equal(template_labels, self.labels)
+
+    def test_fusing_methods_keep_selection_before_fusion(self):
+        selected_indices = np.array([0, 1, 4, 5])
+
+        for method in FUSION_METHODS:
+            if method == "none":
+                continue
+
+            with self.subTest(method=method):
+                limited = _create_templates(
+                    self.embeddings,
+                    self.labels,
+                    method=method,
+                    max_enrollment_samples=2,
+                )
+                manually_selected = _create_templates(
+                    self.embeddings[selected_indices],
+                    self.labels[selected_indices],
+                    method=method,
+                    max_enrollment_samples=None,
+                )
+
+                np.testing.assert_allclose(
+                    limited[0],
+                    manually_selected[0],
+                )
+                np.testing.assert_array_equal(
+                    limited[1],
+                    manually_selected[1],
+                )
 
     def test_parser_accepts_each_fusion_method(self):
         parser = main.get_parser()

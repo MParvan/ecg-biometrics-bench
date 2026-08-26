@@ -531,7 +531,7 @@ class ThreeRoleRunnerContractTests(
             in template_spy.call_args_list
             if (
                 recorded_call.kwargs.get(
-                    "max_beats"
+                    "max_enrollment_samples"
                 )
                 == 2
             )

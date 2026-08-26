@@ -5907,7 +5907,11 @@ def run_closed_set_identification(x, y, model_class, epochs=150, batch_size=256,
         
         # Create Templates
         templates, temp_labels = _create_templates(
-            train_emb, train_lab, method=template_fusion_method, max_beats=template_size, provenance=provenance_train
+            train_emb,
+            train_lab,
+            method=template_fusion_method,
+            max_enrollment_samples=template_size,
+            provenance=provenance_train,
         )
         
         # Extract Embeddings from TEST set (Probe)
@@ -6659,7 +6663,8 @@ def run_closed_set_verification(x, y, model_class, epochs=150, batch_size=256, l
         
         templates, temp_labels = _create_templates(
             train_emb, train_lab, method=template_fusion_method,
-            max_beats=template_size, provenance=provenance_train
+            max_enrollment_samples=template_size,
+            provenance=provenance_train,
         )
         
         if probe_fusion_size > 1:
@@ -7412,7 +7417,10 @@ def run_subject_disjoint_identification(x, y, model_class, epochs=150, batch_siz
     else:
         # 8. Apply Template Fusion Strategy to the Gallery
         gallery_emb, gallery_lab = _create_templates(
-            emb_enroll, lab_enroll, method=template_fusion_method, max_beats=None
+            emb_enroll,
+            lab_enroll,
+            method=template_fusion_method,
+            max_enrollment_samples=None,
         )
 
         # 9. Generate Score Matrix for Rank-N Evaluation
@@ -8252,7 +8260,10 @@ def run_subject_disjoint_verification(x, y, model_class, epochs=150, batch_size=
             )
         
         templates, temp_labels = _create_templates(
-            emb_enroll, lab_enroll, method=template_fusion_method, max_beats=None
+            emb_enroll,
+            lab_enroll,
+            method=template_fusion_method,
+            max_enrollment_samples=None,
         )
         
         if probe_fusion_size > 1:
@@ -9068,7 +9079,11 @@ def run_cross_session_identification(x_train, y_train, x_test, y_test, model_cla
         emb_enroll, lab_enroll = _get_embeddings(model, enroll_loader, device)
         
         gallery_emb, gallery_lab = _create_templates(
-            emb_enroll, lab_enroll, method=template_fusion_method, max_beats=template_size, provenance=template_provenance
+            emb_enroll,
+            lab_enroll,
+            method=template_fusion_method,
+            max_enrollment_samples=template_size,
+            provenance=template_provenance,
         )
         
         emb_probe, lab_probe = _get_embeddings(model, probe_loader, device)
@@ -9881,7 +9896,7 @@ def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class
             emb_enroll,
             lab_enroll,
             method=template_fusion_method,
-            max_beats=template_size,
+            max_enrollment_samples=template_size,
             provenance=template_provenance,
         )
         
@@ -10619,7 +10634,11 @@ def run_subject_disjoint_cross_session_identification(
         final_labels = fused_probe_labels
     else:
         gallery_emb, gallery_lab = _create_templates(
-            emb_enroll, lab_enroll, method=template_fusion_method, max_beats=template_size, provenance=template_provenance
+            emb_enroll,
+            lab_enroll,
+            method=template_fusion_method,
+            max_enrollment_samples=template_size,
+            provenance=template_provenance,
         )
 
         print("[INFO] Evaluating unseen subjects with probe data...")
@@ -11418,7 +11437,7 @@ def run_subject_disjoint_cross_session_verification(
             emb_enroll,
             lab_enroll,
             method=template_fusion_method,
-            max_beats=template_size,
+            max_enrollment_samples=template_size,
             provenance=template_provenance,
         )
         
