@@ -292,13 +292,26 @@ def test_direct_multi_run_cpu_sets_profile_before_outer_timing():
         ((0.7, 0.8), {}, {}),
     ]
 
+    def recursive_run_double(**kwargs):
+        run._record_trained_weight_reference(
+            {
+                "persisted": False,
+                "source": "trained_not_persisted",
+                "weight_uid": None,
+                "state_dict_hash_format": run.STATE_DICT_HASH_FORMAT,
+                "state_dict_sha256": "0" * 64,
+                "payload_sha256": None,
+            }
+        )
+        return recursive_results.pop(0)
+
     run._ENTRYPOINT_PROFILE_PENDING_RUNNER = False
     run._ACTIVE_PROFILING_DEVICE_TYPE = "auto"
 
     with _assert_no_cuda_calls(), patch.object(
         run,
         "run_closed_set_identification",
-        side_effect=recursive_results,
+        side_effect=recursive_run_double,
     ) as recursive_runner, patch.object(
         run,
         "_apply_identification_metric_reportability",

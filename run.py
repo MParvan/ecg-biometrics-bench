@@ -39,7 +39,11 @@ import subprocess
 import platform
 import sys
 from importlib import metadata
-from artifact_provenance import build_weight_compatibility_identity
+from artifact_provenance import (
+    STATE_DICT_HASH_FORMAT,
+    build_weight_compatibility_identity,
+    canonical_state_dict_sha256,
+)
 
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import roc_curve, auc
@@ -911,7 +915,15 @@ def _build_structured_experiment_record(
     """
     Build one self-contained machine-readable experiment record.
     """
-    return {
+    normalized_per_run_results = _to_json_compatible(
+        (
+            []
+            if per_run_results is None
+            else per_run_results
+        )
+    )
+
+    record = {
         "experiment_time": (
             experiment_time.isoformat(
                 timespec="seconds"
@@ -953,13 +965,7 @@ def _build_structured_experiment_record(
             )
         ),
         "per_run_results": (
-            _to_json_compatible(
-                (
-                    []
-                    if per_run_results is None
-                    else per_run_results
-                )
-            )
+            normalized_per_run_results
         ),
         "across_seed_uncertainty": (
             _to_json_compatible(
@@ -994,6 +1000,33 @@ def _build_structured_experiment_record(
             for key, value in metrics_dict.items()
         },
     }
+
+    if (
+        len(normalized_per_run_results) > 1
+        and all(
+            isinstance(run_record, Mapping)
+            and all(
+                field_name in run_record
+                for field_name in (
+                    "run_index",
+                    "seed",
+                    "split_seed",
+                    "data_statistics",
+                    "trained_weight",
+                )
+            )
+            for run_record in normalized_per_run_results
+        )
+    ):
+        final_run = normalized_per_run_results[-1]
+        record["data_statistics_scope"] = {
+            "scope": "last_run_snapshot",
+            "run_index": final_run["run_index"],
+            "seed": final_run["seed"],
+            "split_seed": final_run["split_seed"],
+        }
+
+    return record
 
 
 def _append_structured_experiment_record(
@@ -4429,6 +4462,9 @@ def _build_per_run_results(
     results,
     seeds,
     metric_names=None,
+    split_seeds=None,
+    data_statistics=None,
+    trained_weight_references=None,
 ):
     """
     Build structured seed-level metric records for a multi-run experiment.
@@ -4445,6 +4481,43 @@ def _build_per_run_results(
             "The number of multi-run results must match "
             "the number of run seeds."
         )
+
+    provenance_sequences = (
+        split_seeds,
+        data_statistics,
+        trained_weight_references,
+    )
+    provenance_supplied = [
+        sequence is not None
+        for sequence in provenance_sequences
+    ]
+
+    if any(provenance_supplied) and not all(provenance_supplied):
+        raise ValueError(
+            "Split seeds, data statistics, and trained-weight references "
+            "must be supplied together."
+        )
+
+    complete_provenance = all(provenance_supplied)
+
+    if complete_provenance:
+        split_seeds = list(split_seeds)
+        data_statistics = list(data_statistics)
+        trained_weight_references = list(trained_weight_references)
+
+        sequence_lengths = {
+            len(results),
+            len(seeds),
+            len(split_seeds),
+            len(data_statistics),
+            len(trained_weight_references),
+        }
+        if len(sequence_lengths) != 1:
+            raise ValueError(
+                "Multi-run results, seeds, resolved split seeds, data "
+                "statistics, and trained-weight references must have "
+                "matching lengths."
+            )
 
     if not results:
         return []
@@ -4543,26 +4616,53 @@ def _build_per_run_results(
                 "metric-name list."
             )
 
-        per_run_results.append(
-            {
-                "run_index": run_index,
-                "seed": int(seed),
-                "metrics": {
-                    metric_name: (
-                        _to_json_compatible(
-                            metric_value
-                        )
+        run_record = {
+            "run_index": run_index,
+            "seed": int(seed),
+            "metrics": {
+                metric_name: (
+                    _to_json_compatible(
+                        metric_value
                     )
-                    for (
-                        metric_name,
-                        metric_value,
-                    ) in zip(
-                        metric_names,
-                        metric_values,
-                    )
-                },
-            }
-        )
+                )
+                for (
+                    metric_name,
+                    metric_value,
+                ) in zip(
+                    metric_names,
+                    metric_values,
+                )
+            },
+        }
+
+        if complete_provenance:
+            statistics = data_statistics[run_index - 1]
+            weight_reference = trained_weight_references[run_index - 1]
+
+            if not isinstance(statistics, Mapping):
+                raise ValueError(
+                    "Every per-run data-statistics value must be a mapping."
+                )
+            if not isinstance(weight_reference, Mapping):
+                raise ValueError(
+                    "Every trained-weight reference must be a mapping."
+                )
+
+            run_record.update(
+                {
+                    "split_seed": int(
+                        split_seeds[run_index - 1]
+                    ),
+                    "data_statistics": copy.deepcopy(
+                        _to_json_compatible(statistics)
+                    ),
+                    "trained_weight": copy.deepcopy(
+                        _to_json_compatible(weight_reference)
+                    ),
+                }
+            )
+
+        per_run_results.append(run_record)
 
     return per_run_results
 
@@ -4873,6 +4973,11 @@ _EVALUATION_ARTIFACT_SINK = ContextVar(
     default=None,
 )
 
+_TRAINED_WEIGHT_REFERENCE_SINK = ContextVar(
+    "_TRAINED_WEIGHT_REFERENCE_SINK",
+    default=None,
+)
+
 
 def _record_evaluation_artifact(
     artifact,
@@ -4891,6 +4996,159 @@ def _record_evaluation_artifact(
         sink.append(
             artifact
         )
+
+
+def _is_lowercase_sha256(value):
+    """Return whether value is one lowercase hexadecimal SHA-256 digest."""
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and value == value.lower()
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _build_persisted_trained_weight_reference(
+    cache_metadata,
+    source,
+):
+    """Build a compact reference from validated immutable metadata."""
+    if source not in {
+        "cache_hit",
+        "trained_and_saved",
+    }:
+        raise ValueError(
+            f"Unsupported persisted trained-weight source: {source!r}."
+        )
+    if not isinstance(cache_metadata, Mapping):
+        raise RuntimeError(
+            "Validated trained-weight cache metadata is unavailable."
+        )
+
+    artifact_metadata = cache_metadata.get("weight_artifact")
+    identity = (
+        artifact_metadata.get("identity")
+        if isinstance(artifact_metadata, Mapping)
+        else None
+    )
+    if not isinstance(identity, Mapping):
+        raise RuntimeError(
+            "Validated trained-weight artifact identity is unavailable."
+        )
+
+    weight_uid = identity.get("weight_uid")
+    state_hash_format = identity.get("state_dict_hash_format")
+    state_hash = identity.get("state_dict_sha256")
+    payload_hash = identity.get("payload_sha256")
+
+    if not isinstance(weight_uid, str) or not weight_uid:
+        raise RuntimeError("Validated trained-weight UID is unavailable.")
+    if state_hash_format != STATE_DICT_HASH_FORMAT:
+        raise RuntimeError(
+            "Validated trained-weight state hash format is unsupported."
+        )
+    if not _is_lowercase_sha256(state_hash):
+        raise RuntimeError(
+            "Validated trained-weight state checksum is unavailable."
+        )
+    if not _is_lowercase_sha256(payload_hash):
+        raise RuntimeError(
+            "Validated trained-weight payload checksum is unavailable."
+        )
+
+    return {
+        "persisted": True,
+        "source": source,
+        "weight_uid": weight_uid,
+        "state_dict_hash_format": state_hash_format,
+        "state_dict_sha256": state_hash,
+        "payload_sha256": payload_hash,
+    }
+
+
+def _build_in_memory_trained_weight_reference(model):
+    """Identify the final model state without claiming persistence."""
+    return {
+        "persisted": False,
+        "source": "trained_not_persisted",
+        "weight_uid": None,
+        "state_dict_hash_format": STATE_DICT_HASH_FORMAT,
+        "state_dict_sha256": canonical_state_dict_sha256(
+            model.state_dict()
+        ),
+        "payload_sha256": None,
+    }
+
+
+def _record_trained_weight_reference(reference):
+    """Record one defensive run-local weight reference when a sink is active."""
+    sink = _TRAINED_WEIGHT_REFERENCE_SINK.get()
+    if sink is not None:
+        sink.append(copy.deepcopy(reference))
+
+
+def _record_persisted_trained_weight(cache_metadata, source):
+    """Record validated persisted weight metadata only when requested."""
+    if _TRAINED_WEIGHT_REFERENCE_SINK.get() is None:
+        return
+    _record_trained_weight_reference(
+        _build_persisted_trained_weight_reference(
+            cache_metadata,
+            source,
+        )
+    )
+
+
+def _record_newly_saved_trained_weight(cache, uid):
+    """Validate a new cache artifact and record its compact identity."""
+    if _TRAINED_WEIGHT_REFERENCE_SINK.get() is None:
+        return
+    cache_metadata = cache.get_weight_artifact_metadata(uid)
+    if cache_metadata is None:
+        raise RuntimeError(
+            "Newly saved trained-weight metadata could not be validated."
+        )
+    _record_persisted_trained_weight(
+        cache_metadata,
+        "trained_and_saved",
+    )
+
+
+def _record_in_memory_trained_weight(model):
+    """Record the final tensor identity without creating a cache artifact."""
+    if _TRAINED_WEIGHT_REFERENCE_SINK.get() is None:
+        return
+    _record_trained_weight_reference(
+        _build_in_memory_trained_weight_reference(model)
+    )
+
+
+def _run_recursive_with_provenance(
+    runner,
+    call_args,
+    evaluation_artifact_sink,
+):
+    """Execute one recursive run with isolated provenance sinks."""
+    trained_weight_sink = []
+    evaluation_token = _EVALUATION_ARTIFACT_SINK.set(
+        evaluation_artifact_sink
+    )
+    trained_weight_token = _TRAINED_WEIGHT_REFERENCE_SINK.set(
+        trained_weight_sink
+    )
+    try:
+        recursive_result = runner(**call_args)
+    finally:
+        _TRAINED_WEIGHT_REFERENCE_SINK.reset(trained_weight_token)
+        _EVALUATION_ARTIFACT_SINK.reset(evaluation_token)
+
+    if len(trained_weight_sink) != 1:
+        raise RuntimeError(
+            "Each successful recursive run must record exactly one "
+            "trained-weight reference."
+        )
+
+    return recursive_result, copy.deepcopy(trained_weight_sink[0])
 
 
 def _add_seed_metadata(
@@ -5062,6 +5320,8 @@ def run_closed_set_identification(x, y, model_class, epochs=150, batch_size=256,
         base_seed = call_args.get('seed', 42)
         results = []
         evaluation_artifact_runs = []
+        data_statistics_runs = []
+        trained_weight_references = []
         
         print(f"\n[INFO] Starting Multi-Seed Execution ({n_runs} runs) for Statistical Validation...")
         for i in range(n_runs):
@@ -5072,19 +5332,14 @@ def run_closed_set_identification(x, y, model_class, epochs=150, batch_size=256,
             
             # Recursive call to execute a single seed
             run_wall_clock_started = _start_runtime_stage()
-            artifact_sink_token = (
-                _EVALUATION_ARTIFACT_SINK.set(
-                    evaluation_artifact_runs
-                )
+            (
+                (res, d_stats, h_params),
+                trained_weight_reference,
+            ) = _run_recursive_with_provenance(
+                run_closed_set_identification,
+                call_args,
+                evaluation_artifact_runs,
             )
-            try:
-                res, d_stats, h_params = run_closed_set_identification(
-                    **call_args
-                )
-            finally:
-                _EVALUATION_ARTIFACT_SINK.reset(
-                    artifact_sink_token
-                )
             _record_multi_run_time(
                 run_index=i + 1,
                 seed=call_args["seed"],
@@ -5092,6 +5347,8 @@ def run_closed_set_identification(x, y, model_class, epochs=150, batch_size=256,
             )
             
             results.append(res)
+            data_statistics_runs.append(copy.deepcopy(d_stats))
+            trained_weight_references.append(trained_weight_reference)
             # Preserve metadata from the last successful run for the final log file
             data_stats = d_stats  
             hyperparams = h_params 
@@ -5116,6 +5373,11 @@ def run_closed_set_identification(x, y, model_class, epochs=150, batch_size=256,
                 seeds=hyperparams[
                     "run_seeds"
                 ],
+                split_seeds=hyperparams[
+                    "resolved_split_seeds"
+                ],
+                data_statistics=data_statistics_runs,
+                trained_weight_references=trained_weight_references,
             )
         )
 
@@ -5452,6 +5714,10 @@ def run_closed_set_identification(x, y, model_class, epochs=150, batch_size=256,
         if cached_model:
             print(f"\n[INFO] Loaded pre-trained weights (Hash: {uid}). Skipping training!")
             model = cached_model
+            _record_persisted_trained_weight(
+                model.weight_artifact_metadata,
+                "cache_hit",
+            )
         else:
             print(f"\n[INFO] Training new model (Hash: {uid})...")
             optimizer = torch.optim.Adam(model.parameters(), lr=lr); criterion = nn.CrossEntropyLoss()
@@ -5469,9 +5735,11 @@ def run_closed_set_identification(x, y, model_class, epochs=150, batch_size=256,
                     reproducibility_state,
                 ),
             )
+            _record_newly_saved_trained_weight(cache, uid)
     else:
         optimizer = torch.optim.Adam(model.parameters(), lr=lr); criterion = nn.CrossEntropyLoss()
         model = _run_training_loop(model, train_loader, val_loader, optimizer, criterion, device, epochs)
+        _record_in_memory_trained_weight(model)
 
     # 4. Evaluation Logic
     if enrollment_template_mode == "multi_template":
@@ -5836,6 +6104,8 @@ def run_closed_set_verification(x, y, model_class, epochs=150, batch_size=256, l
         base_seed = call_args.get('seed', 42)
         results = []
         evaluation_artifact_runs = []
+        data_statistics_runs = []
+        trained_weight_references = []
         
         print(f"\n[INFO] Starting Multi-Seed Execution ({n_runs} runs)...")
         for i in range(n_runs):
@@ -5843,25 +6113,22 @@ def run_closed_set_verification(x, y, model_class, epochs=150, batch_size=256, l
             call_args['visualize'] = False 
             print(f"\n{'='*40}\n RUN {i+1}/{n_runs} (Seed: {call_args['seed']})\n{'='*40}")
             run_wall_clock_started = _start_runtime_stage()
-            artifact_sink_token = (
-                _EVALUATION_ARTIFACT_SINK.set(
-                    evaluation_artifact_runs
-                )
+            (
+                (res, d_stats, h_params),
+                trained_weight_reference,
+            ) = _run_recursive_with_provenance(
+                run_closed_set_verification,
+                call_args,
+                evaluation_artifact_runs,
             )
-            try:
-                res, d_stats, h_params = run_closed_set_verification(
-                    **call_args
-                )
-            finally:
-                _EVALUATION_ARTIFACT_SINK.reset(
-                    artifact_sink_token
-                )
             _record_multi_run_time(
                 run_index=i + 1,
                 seed=call_args["seed"],
                 started_at=run_wall_clock_started,
             )
             results.append(res)
+            data_statistics_runs.append(copy.deepcopy(d_stats))
+            trained_weight_references.append(trained_weight_reference)
             data_stats = d_stats
             hyperparams = h_params
 
@@ -5878,6 +6145,11 @@ def run_closed_set_verification(x, y, model_class, epochs=150, batch_size=256, l
                 seeds=hyperparams[
                     "run_seeds"
                 ],
+                split_seeds=hyperparams[
+                    "resolved_split_seeds"
+                ],
+                data_statistics=data_statistics_runs,
+                trained_weight_references=trained_weight_references,
             )
         )
 
@@ -6191,6 +6463,10 @@ def run_closed_set_verification(x, y, model_class, epochs=150, batch_size=256, l
         if cached_model:
             print(f"\n[INFO] Loaded pre-trained weights (Hash: {uid}). Skipping training!")
             model = cached_model
+            _record_persisted_trained_weight(
+                model.weight_artifact_metadata,
+                "cache_hit",
+            )
         else:
             print(f"\n[INFO] Training new model (Hash: {uid})...")
             optimizer = torch.optim.Adam(model.parameters(), lr=lr); criterion = nn.CrossEntropyLoss()
@@ -6208,10 +6484,12 @@ def run_closed_set_verification(x, y, model_class, epochs=150, batch_size=256, l
                     reproducibility_state,
                 ),
             )
+            _record_newly_saved_trained_weight(cache, uid)
     else:
         optimizer = torch.optim.Adam(model.parameters(), lr=lr)
         criterion = nn.CrossEntropyLoss()
         model = _run_training_loop(model, train_loader, val_loader, optimizer, criterion, device, epochs)
+        _record_in_memory_trained_weight(model)
         
     # Switch model to feature extractor
     model.include_top = False
@@ -6534,6 +6812,8 @@ def run_subject_disjoint_identification(x, y, model_class, epochs=150, batch_siz
         base_seed = call_args.get('seed', 42)
         results = []
         evaluation_artifact_runs = []
+        data_statistics_runs = []
+        trained_weight_references = []
         
         print(f"\n[INFO] Starting Multi-Seed Execution ({n_runs} runs)...")
         for i in range(n_runs):
@@ -6541,25 +6821,24 @@ def run_subject_disjoint_identification(x, y, model_class, epochs=150, batch_siz
             call_args['visualize'] = False 
             print(f"\n{'='*40}\n RUN {i+1}/{n_runs} (Seed: {call_args['seed']})\n{'='*40}")
             run_wall_clock_started = _start_runtime_stage()
-            artifact_sink_token = (
-                _EVALUATION_ARTIFACT_SINK.set(
-                    evaluation_artifact_runs
-                )
+            (
+                (res, d_stats, h_params),
+                trained_weight_reference,
+            ) = _run_recursive_with_provenance(
+                run_subject_disjoint_identification,
+                call_args,
+                evaluation_artifact_runs,
             )
-            try:
-                res, d_stats, h_params = run_subject_disjoint_identification(
-                    **call_args
-                )
-            finally:
-                _EVALUATION_ARTIFACT_SINK.reset(
-                    artifact_sink_token
-                )
             _record_multi_run_time(
                 run_index=i + 1,
                 seed=call_args["seed"],
                 started_at=run_wall_clock_started,
             )
-            results.append(res); data_stats = d_stats; hyperparams = h_params
+            results.append(res)
+            data_statistics_runs.append(copy.deepcopy(d_stats))
+            trained_weight_references.append(trained_weight_reference)
+            data_stats = d_stats
+            hyperparams = h_params
 
         hyperparams = _add_seed_metadata(
             hyperparams,
@@ -6581,6 +6860,11 @@ def run_subject_disjoint_identification(x, y, model_class, epochs=150, batch_siz
                 seeds=hyperparams[
                     "run_seeds"
                 ],
+                split_seeds=hyperparams[
+                    "resolved_split_seeds"
+                ],
+                data_statistics=data_statistics_runs,
+                trained_weight_references=trained_weight_references,
             )
         )
 
@@ -6894,6 +7178,10 @@ def run_subject_disjoint_identification(x, y, model_class, epochs=150, batch_siz
         if cached_model:
             print(f"\n[INFO] Loaded pre-trained weights (Hash: {uid}). Skipping training!")
             model = cached_model
+            _record_persisted_trained_weight(
+                model.weight_artifact_metadata,
+                "cache_hit",
+            )
         else:
             print(f"\n[INFO] Training new Subject-Disjoint model (Hash: {uid})...")
             optimizer = torch.optim.Adam(model.parameters(), lr=lr); criterion = nn.CrossEntropyLoss()
@@ -6915,6 +7203,7 @@ def run_subject_disjoint_identification(x, y, model_class, epochs=150, batch_siz
                     reproducibility_state,
                 ),
             )
+            _record_newly_saved_trained_weight(cache, uid)
     
     else:
         optimizer = torch.optim.Adam(model.parameters(), lr=lr)
@@ -6925,6 +7214,7 @@ def run_subject_disjoint_identification(x, y, model_class, epochs=150, batch_siz
             model, train_loader, val_loader_seen, val_loader_unseen, optimizer, criterion, device, 
             epochs, matching_method=matching_method, patience=40, lr_patience=15
         )
+        _record_in_memory_trained_weight(model)
 
     # ====================================================
     # 7. FINAL INFERENCE ON UNSEEN TEST SUBJECTS
@@ -7315,6 +7605,8 @@ def run_subject_disjoint_verification(x, y, model_class, epochs=150, batch_size=
         base_seed = call_args.get('seed', 42)
         results = []
         evaluation_artifact_runs = []
+        data_statistics_runs = []
+        trained_weight_references = []
         
         print(f"\n[INFO] Starting Multi-Seed Execution ({n_runs} runs)...")
         for i in range(n_runs):
@@ -7322,25 +7614,24 @@ def run_subject_disjoint_verification(x, y, model_class, epochs=150, batch_size=
             call_args['visualize'] = False 
             print(f"\n{'='*40}\n RUN {i+1}/{n_runs} (Seed: {call_args['seed']})\n{'='*40}")
             run_wall_clock_started = _start_runtime_stage()
-            artifact_sink_token = (
-                _EVALUATION_ARTIFACT_SINK.set(
-                    evaluation_artifact_runs
-                )
+            (
+                (res, d_stats, h_params),
+                trained_weight_reference,
+            ) = _run_recursive_with_provenance(
+                run_subject_disjoint_verification,
+                call_args,
+                evaluation_artifact_runs,
             )
-            try:
-                res, d_stats, h_params = run_subject_disjoint_verification(
-                    **call_args
-                )
-            finally:
-                _EVALUATION_ARTIFACT_SINK.reset(
-                    artifact_sink_token
-                )
             _record_multi_run_time(
                 run_index=i + 1,
                 seed=call_args["seed"],
                 started_at=run_wall_clock_started,
             )
-            results.append(res); data_stats = d_stats; hyperparams = h_params
+            results.append(res)
+            data_statistics_runs.append(copy.deepcopy(d_stats))
+            trained_weight_references.append(trained_weight_reference)
+            data_stats = d_stats
+            hyperparams = h_params
 
         hyperparams = _add_seed_metadata(
             hyperparams,
@@ -7355,6 +7646,11 @@ def run_subject_disjoint_verification(x, y, model_class, epochs=150, batch_size=
                 seeds=hyperparams[
                     "run_seeds"
                 ],
+                split_seeds=hyperparams[
+                    "resolved_split_seeds"
+                ],
+                data_statistics=data_statistics_runs,
+                trained_weight_references=trained_weight_references,
             )
         )
 
@@ -7680,6 +7976,10 @@ def run_subject_disjoint_verification(x, y, model_class, epochs=150, batch_size=
         if cached_model:
             print(f"\n[INFO] Loaded pre-trained weights (Hash: {uid}). Skipping training!")
             model = cached_model
+            _record_persisted_trained_weight(
+                model.weight_artifact_metadata,
+                "cache_hit",
+            )
         else:
             print(f"\n[INFO] Training new Subject-Disjoint model (Hash: {uid})...")
             optimizer = torch.optim.Adam(model.parameters(), lr=lr); criterion = nn.CrossEntropyLoss()
@@ -7701,6 +8001,7 @@ def run_subject_disjoint_verification(x, y, model_class, epochs=150, batch_size=
                     reproducibility_state,
                 ),
             )
+            _record_newly_saved_trained_weight(cache, uid)
     
     else:
         optimizer = torch.optim.Adam(model.parameters(), lr=lr)
@@ -7720,6 +8021,7 @@ def run_subject_disjoint_verification(x, y, model_class, epochs=150, batch_size=
             patience=40,       # Max epochs to wait for composite score improvement
             lr_patience=15     # Epochs to wait before halving Learning Rate
         )
+        _record_in_memory_trained_weight(model)
 
     # ====================================================
     # 7. MODEL CALIBRATION (Optional)
@@ -8175,6 +8477,8 @@ def run_cross_session_identification(x_train, y_train, x_test, y_test, model_cla
         base_seed = call_args.get('seed', 42)
         results = []
         evaluation_artifact_runs = []
+        data_statistics_runs = []
+        trained_weight_references = []
         
         print(f"\n[INFO] Starting Multi-Seed Execution ({n_runs} runs)...")
         for i in range(n_runs):
@@ -8182,25 +8486,24 @@ def run_cross_session_identification(x_train, y_train, x_test, y_test, model_cla
             call_args['visualize'] = False 
             print(f"\n{'='*40}\n RUN {i+1}/{n_runs} (Seed: {call_args['seed']})\n{'='*40}")
             run_wall_clock_started = _start_runtime_stage()
-            artifact_sink_token = (
-                _EVALUATION_ARTIFACT_SINK.set(
-                    evaluation_artifact_runs
-                )
+            (
+                (res, d_stats, h_params),
+                trained_weight_reference,
+            ) = _run_recursive_with_provenance(
+                run_cross_session_identification,
+                call_args,
+                evaluation_artifact_runs,
             )
-            try:
-                res, d_stats, h_params = run_cross_session_identification(
-                    **call_args
-                )
-            finally:
-                _EVALUATION_ARTIFACT_SINK.reset(
-                    artifact_sink_token
-                )
             _record_multi_run_time(
                 run_index=i + 1,
                 seed=call_args["seed"],
                 started_at=run_wall_clock_started,
             )
-            results.append(res); data_stats = d_stats; hyperparams = h_params
+            results.append(res)
+            data_statistics_runs.append(copy.deepcopy(d_stats))
+            trained_weight_references.append(trained_weight_reference)
+            data_stats = d_stats
+            hyperparams = h_params
 
         hyperparams = _add_seed_metadata(
             hyperparams,
@@ -8222,6 +8525,11 @@ def run_cross_session_identification(x_train, y_train, x_test, y_test, model_cla
                 seeds=hyperparams[
                     "run_seeds"
                 ],
+                split_seeds=hyperparams[
+                    "resolved_split_seeds"
+                ],
+                data_statistics=data_statistics_runs,
+                trained_weight_references=trained_weight_references,
             )
         )
 
@@ -8555,6 +8863,10 @@ def run_cross_session_identification(x_train, y_train, x_test, y_test, model_cla
         if cached_model:
             print(f"\n[INFO] Loaded pre-trained weights (Hash: {uid}). Skipping training!")
             model = cached_model
+            _record_persisted_trained_weight(
+                model.weight_artifact_metadata,
+                "cache_hit",
+            )
         else:
             print(f"\n[INFO] Training new Cross-Session model (Hash: {uid})...")
             optimizer = torch.optim.Adam(model.parameters(), lr=lr); criterion = nn.CrossEntropyLoss()
@@ -8572,9 +8884,11 @@ def run_cross_session_identification(x_train, y_train, x_test, y_test, model_cla
                     reproducibility_state,
                 ),
             )
+            _record_newly_saved_trained_weight(cache, uid)
     else:
         optimizer = torch.optim.Adam(model.parameters(), lr=lr); criterion = nn.CrossEntropyLoss()
         model = _run_training_loop(model, train_loader, val_loader, optimizer, criterion, device, epochs)
+        _record_in_memory_trained_weight(model)
     
     # ====================================================
     # 6. EVALUATION STRATEGY
@@ -8953,6 +9267,8 @@ def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class
         base_seed = call_args.get('seed', 42)
         results = []
         evaluation_artifact_runs = []
+        data_statistics_runs = []
+        trained_weight_references = []
         
         print(f"\n[INFO] Starting Multi-Seed Execution ({n_runs} runs)...")
         for i in range(n_runs):
@@ -8960,25 +9276,24 @@ def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class
             call_args['visualize'] = False 
             print(f"\n{'='*40}\n RUN {i+1}/{n_runs} (Seed: {call_args['seed']})\n{'='*40}")
             run_wall_clock_started = _start_runtime_stage()
-            artifact_sink_token = (
-                _EVALUATION_ARTIFACT_SINK.set(
-                    evaluation_artifact_runs
-                )
+            (
+                (res, d_stats, h_params),
+                trained_weight_reference,
+            ) = _run_recursive_with_provenance(
+                run_cross_session_verification,
+                call_args,
+                evaluation_artifact_runs,
             )
-            try:
-                res, d_stats, h_params = run_cross_session_verification(
-                    **call_args
-                )
-            finally:
-                _EVALUATION_ARTIFACT_SINK.reset(
-                    artifact_sink_token
-                )
             _record_multi_run_time(
                 run_index=i + 1,
                 seed=call_args["seed"],
                 started_at=run_wall_clock_started,
             )
-            results.append(res); data_stats = d_stats; hyperparams = h_params
+            results.append(res)
+            data_statistics_runs.append(copy.deepcopy(d_stats))
+            trained_weight_references.append(trained_weight_reference)
+            data_stats = d_stats
+            hyperparams = h_params
 
         hyperparams = _add_seed_metadata(
             hyperparams,
@@ -8993,6 +9308,11 @@ def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class
                 seeds=hyperparams[
                     "run_seeds"
                 ],
+                split_seeds=hyperparams[
+                    "resolved_split_seeds"
+                ],
+                data_statistics=data_statistics_runs,
+                trained_weight_references=trained_weight_references,
             )
         )
 
@@ -9356,6 +9676,10 @@ def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class
         if cached_model:
             print(f"\n[INFO] Loaded pre-trained weights (Hash: {uid}). Skipping training!")
             model = cached_model
+            _record_persisted_trained_weight(
+                model.weight_artifact_metadata,
+                "cache_hit",
+            )
         else:
             print(f"\n[INFO] Training new Cross-Session model (Hash: {uid})...")
             optimizer = torch.optim.Adam(model.parameters(), lr=lr); criterion = nn.CrossEntropyLoss()
@@ -9373,9 +9697,11 @@ def run_cross_session_verification(x_train, y_train, x_test, y_test, model_class
                     reproducibility_state,
                 ),
             )
+            _record_newly_saved_trained_weight(cache, uid)
     else:
         optimizer = torch.optim.Adam(model.parameters(), lr=lr); criterion = nn.CrossEntropyLoss()    
         model = _run_training_loop(model, train_loader, val_loader, optimizer, criterion, device, epochs)
+        _record_in_memory_trained_weight(model)
     
     # Switch to Feature Extractor
     model.include_top = False
@@ -9695,6 +10021,8 @@ def run_subject_disjoint_cross_session_identification(
         base_seed = call_args.get('seed', 42)
         results = []
         evaluation_artifact_runs = []
+        data_statistics_runs = []
+        trained_weight_references = []
         
         print(f"\n[INFO] Starting Multi-Seed Execution ({n_runs} runs)...")
         for i in range(n_runs):
@@ -9702,25 +10030,24 @@ def run_subject_disjoint_cross_session_identification(
             call_args['visualize'] = False 
             print(f"\n{'='*40}\n RUN {i+1}/{n_runs} (Seed: {call_args['seed']})\n{'='*40}")
             run_wall_clock_started = _start_runtime_stage()
-            artifact_sink_token = (
-                _EVALUATION_ARTIFACT_SINK.set(
-                    evaluation_artifact_runs
-                )
+            (
+                (res, d_stats, h_params),
+                trained_weight_reference,
+            ) = _run_recursive_with_provenance(
+                run_subject_disjoint_cross_session_identification,
+                call_args,
+                evaluation_artifact_runs,
             )
-            try:
-                res, d_stats, h_params = run_subject_disjoint_cross_session_identification(
-                    **call_args
-                )
-            finally:
-                _EVALUATION_ARTIFACT_SINK.reset(
-                    artifact_sink_token
-                )
             _record_multi_run_time(
                 run_index=i + 1,
                 seed=call_args["seed"],
                 started_at=run_wall_clock_started,
             )
-            results.append(res); data_stats = d_stats; hyperparams = h_params
+            results.append(res)
+            data_statistics_runs.append(copy.deepcopy(d_stats))
+            trained_weight_references.append(trained_weight_reference)
+            data_stats = d_stats
+            hyperparams = h_params
 
         hyperparams = _add_seed_metadata(
             hyperparams,
@@ -9742,6 +10069,11 @@ def run_subject_disjoint_cross_session_identification(
                 seeds=hyperparams[
                     "run_seeds"
                 ],
+                split_seeds=hyperparams[
+                    "resolved_split_seeds"
+                ],
+                data_statistics=data_statistics_runs,
+                trained_weight_references=trained_weight_references,
             )
         )
 
@@ -10091,6 +10423,10 @@ def run_subject_disjoint_cross_session_identification(
         if cached_model:
             print(f"\n[INFO] Loaded pre-trained weights (Hash: {uid}). Skipping training!")
             model = cached_model
+            _record_persisted_trained_weight(
+                model.weight_artifact_metadata,
+                "cache_hit",
+            )
         else:
             print(f"\n[INFO] Training new Subject-Disjoint Cross-Session model (Hash: {uid})...")
             optimizer = torch.optim.Adam(model.parameters(), lr=lr); criterion = nn.CrossEntropyLoss()
@@ -10112,6 +10448,7 @@ def run_subject_disjoint_cross_session_identification(
                     reproducibility_state,
                 ),
             )
+            _record_newly_saved_trained_weight(cache, uid)
     else:
         optimizer = torch.optim.Adam(model.parameters(), lr=lr)
         criterion = nn.CrossEntropyLoss()
@@ -10130,6 +10467,7 @@ def run_subject_disjoint_cross_session_identification(
             patience=40,       # Max epochs to wait for composite score improvement
             lr_patience=15     # Epochs to wait before halving Learning Rate
         )
+        _record_in_memory_trained_weight(model)
 
     # ====================================================
     # 5. FINAL INFERENCE ON UNSEEN SUBJECTS
@@ -10472,6 +10810,8 @@ def run_subject_disjoint_cross_session_verification(
         base_seed = call_args.get('seed', 42)
         results = []
         evaluation_artifact_runs = []
+        data_statistics_runs = []
+        trained_weight_references = []
         
         print(f"\n[INFO] Starting Multi-Seed Execution ({n_runs} runs)...")
         for i in range(n_runs):
@@ -10479,25 +10819,24 @@ def run_subject_disjoint_cross_session_verification(
             call_args['visualize'] = False 
             print(f"\n{'='*40}\n RUN {i+1}/{n_runs} (Seed: {call_args['seed']})\n{'='*40}")
             run_wall_clock_started = _start_runtime_stage()
-            artifact_sink_token = (
-                _EVALUATION_ARTIFACT_SINK.set(
-                    evaluation_artifact_runs
-                )
+            (
+                (res, d_stats, h_params),
+                trained_weight_reference,
+            ) = _run_recursive_with_provenance(
+                run_subject_disjoint_cross_session_verification,
+                call_args,
+                evaluation_artifact_runs,
             )
-            try:
-                res, d_stats, h_params = run_subject_disjoint_cross_session_verification(
-                    **call_args
-                )
-            finally:
-                _EVALUATION_ARTIFACT_SINK.reset(
-                    artifact_sink_token
-                )
             _record_multi_run_time(
                 run_index=i + 1,
                 seed=call_args["seed"],
                 started_at=run_wall_clock_started,
             )
-            results.append(res); data_stats = d_stats; hyperparams = h_params
+            results.append(res)
+            data_statistics_runs.append(copy.deepcopy(d_stats))
+            trained_weight_references.append(trained_weight_reference)
+            data_stats = d_stats
+            hyperparams = h_params
 
         hyperparams = _add_seed_metadata(
             hyperparams,
@@ -10512,6 +10851,11 @@ def run_subject_disjoint_cross_session_verification(
                 seeds=hyperparams[
                     "run_seeds"
                 ],
+                split_seeds=hyperparams[
+                    "resolved_split_seeds"
+                ],
+                data_statistics=data_statistics_runs,
+                trained_weight_references=trained_weight_references,
             )
         )
 
@@ -10864,6 +11208,10 @@ def run_subject_disjoint_cross_session_verification(
         if cached_model:
             print(f"\n[INFO] Loaded pre-trained weights (Hash: {uid}). Skipping training!")
             model = cached_model
+            _record_persisted_trained_weight(
+                model.weight_artifact_metadata,
+                "cache_hit",
+            )
         else:
             print(f"\n[INFO] Training new Subject-Disjoint Cross-Session model (Hash: {uid})...")
             optimizer = torch.optim.Adam(model.parameters(), lr=lr); criterion = nn.CrossEntropyLoss()
@@ -10885,6 +11233,7 @@ def run_subject_disjoint_cross_session_verification(
                     reproducibility_state,
                 ),
             )
+            _record_newly_saved_trained_weight(cache, uid)
     else:
         optimizer = torch.optim.Adam(model.parameters(), lr=lr)
         criterion = nn.CrossEntropyLoss()
@@ -10903,6 +11252,7 @@ def run_subject_disjoint_cross_session_verification(
             patience=40,       # Max epochs to wait for composite score improvement
             lr_patience=15     # Epochs to wait before halving Learning Rate
         )
+        _record_in_memory_trained_weight(model)
 
     # ====================================================
     # 5. MODEL CALIBRATION (Optional)

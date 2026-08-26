@@ -468,17 +468,8 @@ class RunnerWiringTests(
                 self.assertEqual(
                     source.count(
                         (
-                            "_EVALUATION_ARTIFACT_"
-                            "SINK.set("
-                        )
-                    ),
-                    1,
-                )
-                self.assertEqual(
-                    source.count(
-                        (
-                            "_EVALUATION_ARTIFACT_"
-                            "SINK.reset("
+                            "_run_recursive_with_"
+                            "provenance("
                         )
                     ),
                     1,
@@ -493,15 +484,35 @@ class RunnerWiringTests(
                     1,
                 )
                 self.assertIn(
-                    (
-                        "res, d_stats, "
-                        "h_params ="
-                    ),
+                    "(res, d_stats, h_params),",
                     source,
                 )
                 self.assertNotIn(
                     "run_artifacts",
                     source,
+                )
+
+    def test_recursive_helper_isolates_both_provenance_sinks(self):
+        source = self.runner_source(
+            "_run_recursive_with_provenance"
+        )
+
+        for sink_name in (
+            "_EVALUATION_ARTIFACT_SINK",
+            "_TRAINED_WEIGHT_REFERENCE_SINK",
+        ):
+            with self.subTest(sink=sink_name):
+                self.assertEqual(
+                    source.count(
+                        f"{sink_name}.set("
+                    ),
+                    1,
+                )
+                self.assertEqual(
+                    source.count(
+                        f"{sink_name}.reset("
+                    ),
+                    1,
                 )
 
     def test_internal_returns_preserve_three_value_contract(self):

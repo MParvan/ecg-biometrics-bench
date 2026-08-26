@@ -452,7 +452,11 @@ class MultiRunSmokeTests(unittest.TestCase):
         ) as cache_manager_mock, patch.object(
             run,
             "_log_experiment_results",
-        ) as logger_mock:
+        ) as logger_mock, patch.object(
+            run,
+            "_build_per_run_results",
+            wraps=run._build_per_run_results,
+        ) as per_run_builder:
             result = experiment()
 
         self.assertEqual(
@@ -465,6 +469,40 @@ class MultiRunSmokeTests(unittest.TestCase):
 
         cache_manager_mock.assert_not_called()
         logger_mock.assert_not_called()
+
+        self.assertEqual(
+            per_run_builder.call_count,
+            1,
+        )
+        provenance_arguments = (
+            per_run_builder.call_args.kwargs
+        )
+        self.assertEqual(
+            provenance_arguments["split_seeds"],
+            [40, 41],
+        )
+        self.assertEqual(
+            len(provenance_arguments["data_statistics"]),
+            2,
+        )
+        self.assertEqual(
+            len(
+                provenance_arguments[
+                    "trained_weight_references"
+                ]
+            ),
+            2,
+        )
+        for reference in provenance_arguments[
+            "trained_weight_references"
+        ]:
+            self.assertFalse(reference["persisted"])
+            self.assertEqual(
+                reference["source"],
+                "trained_not_persisted",
+            )
+            self.assertIsNone(reference["weight_uid"])
+            self.assertIsNone(reference["payload_sha256"])
 
         if result_type == "identification":
             self.assert_identification_aggregate(
