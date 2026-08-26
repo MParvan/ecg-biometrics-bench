@@ -48,6 +48,23 @@ import yaml
 from scipy import stats
 
 from experiment_provenance import select_exact_result_record
+from scripts.statistical_utils import (
+    DEFAULT_ALPHA,
+    PAIRED_T_TEST,
+    WILCOXON_TEST,
+    difference_profile,
+)
+from scripts.statistical_utils import holm_adjust as _shared_holm_adjust
+from scripts.statistical_utils import (
+    holm_correct_family,
+    paired_t_test,
+    wilcoxon_signed_rank,
+)
+
+# Hypothesis family for a manifest analysis. A manifest names one reference,
+# the comparison arms tested against it, and the metrics to report, so the
+# set of hypotheses is fixed before any result is read.
+MANIFEST_FAMILY_SCOPE = "manifest"
 
 
 def _json_safe(value):
@@ -501,32 +518,6 @@ def align_metric_values(
     )
 
 
-def _wilcoxon_signed_rank(
-    comparison_values,
-    reference_values,
-):
-    """
-    Run SciPy Wilcoxon with compatibility across SciPy releases.
-    """
-    try:
-        return stats.wilcoxon(
-            comparison_values,
-            reference_values,
-            zero_method="wilcox",
-            correction=False,
-            alternative="two-sided",
-            method="auto",
-        )
-    except TypeError:
-        return stats.wilcoxon(
-            comparison_values,
-            reference_values,
-            zero_method="wilcox",
-            correction=False,
-            alternative="two-sided",
-        )
-
-
 def calculate_paired_statistics(
     reference_values,
     comparison_values,
@@ -600,18 +591,13 @@ def calculate_paired_statistics(
             "zero and one."
         )
 
-    differences = (
-        comparison_values
-        - reference_values
+    profile = difference_profile(
+        reference_values,
+        comparison_values,
     )
-    number_of_pairs = int(
-        differences.size
-    )
-    mean_difference = float(
-        np.mean(
-            differences
-        )
-    )
+
+    number_of_pairs = profile["n_pairs"]
+    mean_difference = profile["mean_difference"]
 
     result = {
         "status": (
@@ -652,43 +638,9 @@ def calculate_paired_statistics(
     if number_of_pairs < 2:
         return result
 
-    difference_scale = max(
-        1.0,
-        float(
-            np.max(
-                np.abs(
-                    differences
-                )
-            )
-        ),
-    )
-    constant_tolerance = (
-        np.finfo(float).eps
-        * difference_scale
-        * 32.0
-    )
-    maximum_difference_deviation = float(
-        np.max(
-            np.abs(
-                differences
-                - differences[0]
-            )
-        )
-    )
-    numerically_constant_differences = (
-        maximum_difference_deviation
-        <= constant_tolerance
-    )
-
-    if numerically_constant_differences:
-        difference_standard_deviation = 0.0
-    else:
-        difference_standard_deviation = float(
-            np.std(
-                differences,
-                ddof=1,
-            )
-        )
+    difference_standard_deviation = profile[
+        "standard_deviation"
+    ]
 
     result[
         (
@@ -697,7 +649,7 @@ def calculate_paired_statistics(
         )
     ] = difference_standard_deviation
 
-    if numerically_constant_differences:
+    if profile["constant_differences"]:
         ci_lower = mean_difference
         ci_upper = mean_difference
     else:
@@ -741,92 +693,40 @@ def calculate_paired_statistics(
         "mean_difference_ci_upper"
     ] = float(ci_upper)
 
-    all_zero_differences = bool(
-        np.max(
-            np.abs(
-                differences
-            )
-        )
-        <= constant_tolerance
+    paired_t_result = paired_t_test(
+        reference_values,
+        comparison_values,
+    )
+    wilcoxon_result = wilcoxon_signed_rank(
+        reference_values,
+        comparison_values,
     )
 
-    if all_zero_differences:
-        result[
-            "paired_t_statistic"
-        ] = 0.0
-        result[
-            "paired_t_p_value"
-        ] = 1.0
-        result[
-            "wilcoxon_statistic"
-        ] = 0.0
-        result[
-            "wilcoxon_p_value"
-        ] = 1.0
-        result[
-            "cohens_dz"
-        ] = 0.0
-
-        return result
-
-    if difference_standard_deviation == 0.0:
-        result[
-            "paired_t_statistic"
-        ] = math.copysign(
-            math.inf,
-            mean_difference,
-        )
-        result[
-            "paired_t_p_value"
-        ] = 0.0
-        result[
-            "cohens_dz"
-        ] = math.copysign(
-            math.inf,
-            mean_difference,
-        )
-    else:
-        paired_t_result = (
-            stats.ttest_rel(
-                comparison_values,
-                reference_values,
-            )
-        )
-
-        result[
-            "paired_t_statistic"
-        ] = float(
-            paired_t_result.statistic
-        )
-        result[
-            "paired_t_p_value"
-        ] = float(
-            paired_t_result.pvalue
-        )
-        result[
-            "cohens_dz"
-        ] = float(
-            mean_difference
-            / difference_standard_deviation
-        )
-
-    wilcoxon_result = (
-        _wilcoxon_signed_rank(
-            comparison_values,
-            reference_values,
-        )
-    )
-
+    result[
+        "paired_t_statistic"
+    ] = paired_t_result[
+        "statistic"
+    ]
+    result[
+        "paired_t_p_value"
+    ] = paired_t_result[
+        "raw_p"
+    ]
+    result[
+        "cohens_dz"
+    ] = paired_t_result[
+        "effect_size_dz"
+    ]
     result[
         "wilcoxon_statistic"
-    ] = float(
-        wilcoxon_result.statistic
-    )
+    ] = wilcoxon_result[
+        "statistic"
+    ]
     result[
         "wilcoxon_p_value"
-    ] = float(
-        wilcoxon_result.pvalue
-    )
+    ] = wilcoxon_result[
+        "raw_p"
+    ]
 
     return result
 
@@ -838,77 +738,11 @@ def holm_adjust(
     Apply the Holm step-down family-wise error correction.
 
     ``None`` entries are preserved and excluded from the correction family.
+    The implementation is shared with the other result-analysis scripts.
     """
-    adjusted_values = [
-        None
-        for _ in p_values
-    ]
-
-    valid_values = []
-
-    for index, p_value in enumerate(
+    return _shared_holm_adjust(
         p_values
-    ):
-        if p_value is None:
-            continue
-
-        p_value = float(
-            p_value
-        )
-
-        if (
-            not math.isfinite(
-                p_value
-            )
-            or p_value < 0.0
-            or p_value > 1.0
-        ):
-            raise ValueError(
-                f"Invalid p-value: {p_value!r}."
-            )
-
-        valid_values.append(
-            (
-                index,
-                p_value,
-            )
-        )
-
-    valid_values.sort(
-        key=lambda item: item[1]
     )
-
-    family_size = len(
-        valid_values
-    )
-    running_maximum = 0.0
-
-    for rank, (
-        original_index,
-        p_value,
-    ) in enumerate(
-        valid_values,
-        start=1,
-    ):
-        raw_adjusted = (
-            family_size
-            - rank
-            + 1
-        ) * p_value
-
-        running_maximum = max(
-            running_maximum,
-            raw_adjusted,
-        )
-
-        adjusted_values[
-            original_index
-        ] = min(
-            1.0,
-            running_maximum,
-        )
-
-    return adjusted_values
 
 
 def _record_descriptor(
@@ -1022,9 +856,23 @@ def compare_records(
 
 def _apply_holm_corrections(
     comparisons,
+    family_scope=MANIFEST_FAMILY_SCOPE,
+    alpha=DEFAULT_ALPHA,
 ):
     """
-    Apply separate Holm corrections to t-test and Wilcoxon families.
+    Apply separate Holm corrections to the t-test and Wilcoxon families.
+
+    The hypothesis family is the manifest itself. One manifest is a
+    prespecified analysis: it names one reference, the comparison arms tested
+    against it, and the metrics to report. Every ``(arm, metric)`` hypothesis
+    the manifest declares is corrected together, so the family is fixed by the
+    analysis definition rather than by whichever rows a particular run
+    happens to produce.
+
+    The parametric and non-parametric tests answer the same question with
+    different assumptions, so they are corrected as two separate families and
+    are never pooled. Each row records the ``family_id`` it was corrected in,
+    the ``test`` that produced its p-value, and the resulting decision.
     """
     metric_rows = [
         metric_result
@@ -1035,43 +883,47 @@ def _apply_holm_corrections(
     ]
 
     for (
+        test_name,
         source_key,
         adjusted_key,
+        family_key,
+        reject_key,
     ) in (
         (
+            PAIRED_T_TEST,
             "paired_t_p_value",
             (
                 "paired_t_p_value_"
                 "holm"
             ),
+            "paired_t_family_id",
+            "paired_t_reject",
         ),
         (
+            WILCOXON_TEST,
             "wilcoxon_p_value",
             (
                 "wilcoxon_p_value_"
                 "holm"
             ),
+            "wilcoxon_family_id",
+            "wilcoxon_reject",
         ),
     ):
-        adjusted_values = holm_adjust(
-            [
-                metric_result[
-                    source_key
-                ]
-                for metric_result in metric_rows
-            ]
+        family_id = f"{family_scope}::{test_name}"
+
+        holm_correct_family(
+            metric_rows,
+            raw_p_key=source_key,
+            adjusted_p_key=adjusted_key,
+            reject_key=reject_key,
+            alpha=alpha,
         )
 
-        for (
-            metric_result,
-            adjusted_value,
-        ) in zip(
-            metric_rows,
-            adjusted_values,
-        ):
+        for metric_result in metric_rows:
             metric_result[
-                adjusted_key
-            ] = adjusted_value
+                family_key
+            ] = family_id
 
 
 def _resolve_experiment_spec(
@@ -1534,6 +1386,16 @@ def _flatten_comparison_rows(
                             )
                         ]
                     ),
+                    "paired_t_reject": (
+                        metric_result[
+                            "paired_t_reject"
+                        ]
+                    ),
+                    "paired_t_family_id": (
+                        metric_result[
+                            "paired_t_family_id"
+                        ]
+                    ),
                     "wilcoxon_statistic": (
                         metric_result[
                             "wilcoxon_statistic"
@@ -1552,11 +1414,22 @@ def _flatten_comparison_rows(
                             )
                         ]
                     ),
+                    "wilcoxon_reject": (
+                        metric_result[
+                            "wilcoxon_reject"
+                        ]
+                    ),
+                    "wilcoxon_family_id": (
+                        metric_result[
+                            "wilcoxon_family_id"
+                        ]
+                    ),
                     "cohens_dz": (
                         metric_result[
                             "cohens_dz"
                         ]
                     ),
+                    "alpha": DEFAULT_ALPHA,
                 }
             )
 

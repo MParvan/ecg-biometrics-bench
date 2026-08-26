@@ -73,6 +73,16 @@ from experiment_provenance import (  # noqa: E402
     ResultCollectionError,
     build_experiment_implementation_identity,
 )
+from scripts.statistical_utils import (  # noqa: E402
+    DEFAULT_ALPHA,
+    PAIRED_T_TEST,
+    WILCOXON_TEST,
+    align_paired_seed_values,
+    holm_correct_family,
+    paired_t_test,
+    significance_marker,
+    wilcoxon_signed_rank,
+)
 
 # Categorical slots assigned by evaluation setting, in fixed order. Validated
 # with the palette checker: worst all-pairs CVD dE 9.2, normal-vision dE 24.0.
@@ -327,65 +337,13 @@ def _align_paired_seed_values(left_seed_values, right_seed_values):
     """
     Align two seed-indexed conditions into paired numpy arrays.
 
-    Both inputs must be seed-indexed mappings covering exactly the same seed
-    set, with unique integer seeds and finite numeric values. Positional
-    truncation and silent intersection are refused so that a paired comparison
-    always speaks about the same training seeds.
+    Thin alias for the shared implementation so that figures and the
+    statistics scripts pair runs by the same rule.
     """
-    if not isinstance(left_seed_values, dict) or not isinstance(
-        right_seed_values, dict
-    ):
-        raise ValueError(
-            "Paired conditions must be provided as seed-indexed mappings."
-        )
-
-    for side, mapping in (
-        ("left", left_seed_values),
-        ("right", right_seed_values),
-    ):
-        for key in mapping:
-            if not _is_integer_seed(key):
-                raise ValueError(
-                    f"Paired {side} condition contains a non-integer "
-                    f"seed identifier: {key!r}."
-                )
-
-    left_seeds = {int(seed) for seed in left_seed_values}
-    right_seeds = {int(seed) for seed in right_seed_values}
-
-    if left_seeds != right_seeds:
-        missing_from_right = sorted(left_seeds - right_seeds)
-        missing_from_left = sorted(right_seeds - left_seeds)
-        raise ValueError(
-            "Paired conditions must contain identical seed sets. "
-            f"Missing from right: {missing_from_right}; "
-            f"missing from left: {missing_from_left}."
-        )
-
-    if not left_seeds:
-        raise ValueError(
-            "Paired conditions must contain at least one seed."
-        )
-
-    seeds = sorted(left_seeds)
-    left_array = np.asarray(
-        [left_seed_values[seed] for seed in seeds],
-        dtype=float,
+    return align_paired_seed_values(
+        left_seed_values,
+        right_seed_values,
     )
-    right_array = np.asarray(
-        [right_seed_values[seed] for seed in seeds],
-        dtype=float,
-    )
-
-    if not (
-        np.all(np.isfinite(left_array))
-        and np.all(np.isfinite(right_array))
-    ):
-        raise ValueError(
-            "Paired observations must be finite."
-        )
-
-    return seeds, left_array, right_array
 
 
 def order_protocols(dataset, series):
@@ -440,96 +398,173 @@ def paired_significance(left_values, right_values):
     removes seed-to-seed variance from the comparison. The Wilcoxon
     signed-rank statistic accompanies it because five seeds are too few to
     verify the normality the t-test assumes.
+
+    The tests, the effect size, and their handling of degenerate differences
+    come from ``scripts.statistical_utils``, so a figure and a statistics
+    table computed from the same runs cannot disagree. ``p_value`` is the raw
+    paired-t p-value; the Holm-adjusted value is added later, once the family
+    of comparisons drawn in the figure is known.
+
+    Differences are taken as ``right - left``. Fewer than two pairs cannot
+    support a test and return ``None``.
     """
     left_values = np.asarray(left_values, dtype=float)
     right_values = np.asarray(right_values, dtype=float)
 
-    if left_values.ndim != 1 or right_values.ndim != 1:
-        raise ValueError(
-            "Paired values must be one-dimensional."
-        )
+    t_result = paired_t_test(left_values, right_values)
 
-    if left_values.shape != right_values.shape:
-        raise ValueError(
-            "Paired conditions must contain the same number of "
-            "observations aligned by seed. "
-            f"Received {left_values.size} and {right_values.size}."
-        )
-
-    if not (
-        np.all(np.isfinite(left_values))
-        and np.all(np.isfinite(right_values))
-    ):
-        raise ValueError(
-            "Paired observations must be finite."
-        )
-
-    paired_count = left_values.size
-
-    if paired_count < 2:
+    if t_result["n_pairs"] < 2:
         return None
 
-    differences = right_values - left_values
+    wilcoxon_result = wilcoxon_signed_rank(left_values, right_values)
 
-    result = {
-        "n_pairs": int(paired_count),
-        "mean_difference": float(np.mean(differences)),
-        "test": "paired t-test",
+    return {
+        "n_pairs": t_result["n_pairs"],
+        "mean_difference": float(np.mean(right_values - left_values)),
+        "test": PAIRED_T_TEST,
+        "t_statistic": t_result["statistic"],
+        "p_value": t_result["raw_p"],
+        "cohens_dz": t_result["effect_size_dz"],
+        "wilcoxon_test": WILCOXON_TEST,
+        "wilcoxon_statistic": wilcoxon_result["statistic"],
+        "wilcoxon_p_value": wilcoxon_result["raw_p"],
     }
 
-    if np.allclose(differences, 0.0):
-        # A constant difference of zero has no test statistic.
-        result.update(
-            {
-                "t_statistic": 0.0,
-                "p_value": 1.0,
-                "cohens_dz": 0.0,
-                "wilcoxon_p_value": 1.0,
-            }
-        )
 
-        return result
+def figure_family_id(dataset, metric, left_protocol, right_protocol, test):
+    """
+    Identify the hypothesis family a paired figure panel belongs to.
 
-    t_statistic, p_value = stats.ttest_rel(
-        right_values,
-        left_values,
+    One paired figure fixes the dataset, the metric, and the two protocols
+    being contrasted, and tests that contrast once per evaluation setting.
+    Those panels are the family. The identifier is built from the analysis
+    itself, so the same figure always produces the same family regardless of
+    how many panels happen to have results.
+
+    The parametric and non-parametric tests are corrected separately and
+    therefore carry different identifiers.
+    """
+    return (
+        f"figure:paired|dataset={dataset}|metric={metric}"
+        f"|left={left_protocol}|right={right_protocol}::{test}"
     )
 
-    result["t_statistic"] = float(t_statistic)
-    result["p_value"] = float(p_value)
-    result["cohens_dz"] = float(
-        np.mean(differences) / np.std(differences, ddof=1)
+
+def apply_figure_holm_correction(statistics, dataset, metric, left_protocol,
+                                 right_protocol, alpha=DEFAULT_ALPHA):
+    """
+    Add Holm-adjusted p-values to every panel of one paired figure.
+
+    The raw p-values are left untouched. ``p_value_holm`` and
+    ``wilcoxon_p_value_holm`` are added alongside them, together with the
+    family identifier and the rejection decision at ``alpha``.
+
+    The two tests form two families and are corrected independently, so a
+    Wilcoxon result can never change a t-test decision.
+    """
+    statistics = list(statistics)
+
+    if not statistics:
+        return statistics
+
+    for test_name, raw_key, adjusted_key, family_key, reject_key in (
+        (
+            PAIRED_T_TEST,
+            "p_value",
+            "p_value_holm",
+            "family_id",
+            "reject",
+        ),
+        (
+            WILCOXON_TEST,
+            "wilcoxon_p_value",
+            "wilcoxon_p_value_holm",
+            "wilcoxon_family_id",
+            "wilcoxon_reject",
+        ),
+    ):
+        holm_correct_family(
+            statistics,
+            raw_p_key=raw_key,
+            adjusted_p_key=adjusted_key,
+            reject_key=reject_key,
+            alpha=alpha,
+        )
+
+        family_id = figure_family_id(
+            dataset,
+            metric,
+            left_protocol,
+            right_protocol,
+            test_name,
+        )
+
+        for row in statistics:
+            row[family_key] = family_id
+            row["alpha"] = float(alpha)
+
+    return statistics
+
+
+def _annotate_paired_axis(axis, test_result, left_values, right_values):
+    """
+    Draw the significance bracket for one paired panel.
+
+    The marker and the quoted p-value are the Holm-adjusted paired-t values,
+    so the annotation reflects the same evidence as the reported decision.
+    The Wilcoxon result stays in the statistics output and is deliberately not
+    drawn, because two competing markers on one bracket cannot be read
+    unambiguously.
+    """
+    combined_values = np.concatenate((left_values, right_values))
+    span = max(
+        float(combined_values.max() - combined_values.min()),
+        1e-9,
+    )
+    bracket_y = (
+        float(max(left_values.max(), right_values.max()))
+        + span * 0.18
+    )
+    tick = span * 0.05
+
+    axis.plot(
+        [0, 0, 1, 1],
+        [
+            bracket_y - tick,
+            bracket_y,
+            bracket_y,
+            bracket_y - tick,
+        ],
+        color=INK_SECONDARY,
+        linewidth=1.4,
+        zorder=5,
     )
 
-    try:
-        _, wilcoxon_p = stats.wilcoxon(
-            right_values,
-            left_values,
-        )
-        result["wilcoxon_p_value"] = float(wilcoxon_p)
-    except ValueError:
-        result["wilcoxon_p_value"] = None
+    adjusted_p = test_result.get("p_value_holm")
+    adjusted_text = (
+        "n/a" if adjusted_p is None else f"{adjusted_p:.3g}"
+    )
+    effect_size = test_result.get("cohens_dz")
+    effect_text = (
+        "n/a"
+        if effect_size is None or not math.isfinite(effect_size)
+        else f"{effect_size:.2f}"
+    )
 
-    return result
-
-
-def significance_marker(p_value):
-    """
-    Render a p-value as a conventional significance marker.
-    """
-    if p_value is None:
-        return "n/a"
-
-    if p_value < 0.001:
-        return "***"
-
-    if p_value < 0.01:
-        return "**"
-
-    if p_value < 0.05:
-        return "*"
-
-    return "n.s."
+    axis.text(
+        0.5,
+        bracket_y + tick * 0.5,
+        f"{significance_marker(adjusted_p)}  "
+        f"$p_{{\\mathrm{{Holm}}}}$ = {adjusted_text}\n"
+        f"paired $t$-test, $n$ = {test_result['n_pairs']} seeds, "
+        f"$d_z$ = {effect_text}",
+        ha="center",
+        va="bottom",
+        fontsize=plt.rcParams["font.size"] - 2,
+        color=INK_SECONDARY,
+        zorder=5,
+    )
+    axis.margins(y=0.28)
 
 
 def _metric_label(metric):
@@ -832,6 +867,7 @@ def plot_paired(dataset, metric, series, left_protocol, right_protocol,
     )
 
     statistics = []
+    annotated_axes = []
 
     for axis, setting in zip(axes[0], settings):
         seeds, left_values, right_values = _align_paired_seed_values(
@@ -890,46 +926,7 @@ def plot_paired(dataset, metric, series, left_protocol, right_protocol,
                 }
             )
             statistics.append(test_result)
-
-            combined_values = np.concatenate(
-                (left_values, right_values)
-            )
-            span = max(
-                float(combined_values.max() - combined_values.min()),
-                1e-9,
-            )
-            bracket_y = (
-                float(max(left_values.max(), right_values.max()))
-                + span * 0.18
-            )
-            tick = span * 0.05
-
-            axis.plot(
-                [0, 0, 1, 1],
-                [
-                    bracket_y - tick,
-                    bracket_y,
-                    bracket_y,
-                    bracket_y - tick,
-                ],
-                color=INK_SECONDARY,
-                linewidth=1.4,
-                zorder=5,
-            )
-            axis.text(
-                0.5,
-                bracket_y + tick * 0.5,
-                f"{significance_marker(test_result['p_value'])}  "
-                f"$p$ = {test_result['p_value']:.3g}\n"
-                f"paired $t$-test, $n$ = {test_result['n_pairs']} seeds, "
-                f"$d_z$ = {test_result['cohens_dz']:.2f}",
-                ha="center",
-                va="bottom",
-                fontsize=plt.rcParams["font.size"] - 2,
-                color=INK_SECONDARY,
-                zorder=5,
-            )
-            axis.margins(y=0.28)
+            annotated_axes.append((axis, test_result, left_values, right_values))
 
         axis.set_xticks([0, 1])
         axis.set_xticklabels(
@@ -948,6 +945,26 @@ def plot_paired(dataset, metric, series, left_protocol, right_protocol,
         axis.set_title(SETTING_LABELS[setting])
         axis.spines["top"].set_visible(False)
         axis.spines["right"].set_visible(False)
+
+    # The panels of one figure are a prespecified family: the same metric and
+    # the same pair of protocols, tested once per evaluation setting. Holm is
+    # applied across that family before anything is annotated, so a marker is
+    # never drawn from an uncorrected p-value.
+    apply_figure_holm_correction(
+        statistics,
+        dataset=dataset,
+        metric=metric,
+        left_protocol=left_protocol,
+        right_protocol=right_protocol,
+    )
+
+    for axis, test_result, left_values, right_values in annotated_axes:
+        _annotate_paired_axis(
+            axis,
+            test_result,
+            left_values,
+            right_values,
+        )
 
     axes[0][0].set_ylabel(_metric_label(metric))
     axes[0][0].legend(loc="upper left")
@@ -1011,8 +1028,17 @@ def write_statistics_csv(statistics, output_path):
         "test",
         "t_statistic",
         "p_value",
+        "p_value_holm",
+        "reject",
+        "family_id",
         "cohens_dz",
+        "wilcoxon_test",
+        "wilcoxon_statistic",
         "wilcoxon_p_value",
+        "wilcoxon_p_value_holm",
+        "wilcoxon_reject",
+        "wilcoxon_family_id",
+        "alpha",
     ]
 
     with output_path.open(

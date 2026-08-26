@@ -1,3 +1,4 @@
+import math
 import shutil
 import sys
 import tempfile
@@ -93,8 +94,10 @@ class PairedSignificanceTests(unittest.TestCase):
     """
 
     def test_statistic_matches_scipy(self):
+        # Differences must actually vary, otherwise the comparison would pin
+        # floating-point residue rather than a test statistic.
         left = [0.05, 0.06, 0.055, 0.058, 0.052]
-        right = [0.09, 0.10, 0.095, 0.098, 0.092]
+        right = [0.09, 0.11, 0.094, 0.101, 0.088]
 
         result = figures.paired_significance(left, right)
         expected = stats.ttest_rel(right, left)
@@ -108,6 +111,30 @@ class PairedSignificanceTests(unittest.TestCase):
             float(expected.pvalue),
         )
         self.assertEqual(result["n_pairs"], 5)
+
+    def test_constant_difference_reports_an_unbounded_statistic(self):
+        """
+        A constant shift has no spread, so the standardized separation is
+        unbounded. Reporting a finite statistic here would quote floating-point
+        residue as though it were evidence.
+        """
+        left = [0.05, 0.06, 0.055, 0.058, 0.052]
+        right = [value + 0.04 for value in left]
+
+        result = figures.paired_significance(left, right)
+
+        self.assertEqual(result["t_statistic"], math.inf)
+        self.assertEqual(result["p_value"], 0.0)
+        self.assertEqual(result["cohens_dz"], math.inf)
+
+    def test_constant_negative_difference_keeps_the_sign(self):
+        left = [0.05, 0.06, 0.055, 0.058, 0.052]
+        right = [value - 0.04 for value in left]
+
+        result = figures.paired_significance(left, right)
+
+        self.assertEqual(result["t_statistic"], -math.inf)
+        self.assertEqual(result["cohens_dz"], -math.inf)
 
     def test_direction_is_right_minus_left(self):
         result = figures.paired_significance(
