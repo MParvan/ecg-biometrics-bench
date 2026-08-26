@@ -2869,6 +2869,88 @@ def _build_verification_curve_artifacts(
     }
 
 
+def _compute_pessimistic_identification_ranks(
+    score_matrix,
+    true_labels,
+):
+    """
+    Compute one-based identification ranks with pessimistic tie handling.
+
+    Identification ties are ranked pessimistically: the rank of the correct
+    identity equals the number of gallery identities whose score is greater
+    than or equal to the correct identity's score. The correct identity always
+    counts itself, so ranks are one-based and lie in
+    ``[1, gallery_identity_count]``.
+
+    Scores are compared exactly as represented. No tolerance is applied, so
+    two scores separated by a single representable step are ordered rather
+    than treated as equal. Because the rank counts identities instead of
+    reading a position out of a sorted ordering, it cannot depend on gallery
+    ordering, on the correct identity's column, or on sort stability.
+
+    ``score_matrix`` must already be reduced to one column per enrolled
+    identity, and ``true_labels`` must contain gallery-column indices.
+    """
+    score_matrix = np.asarray(
+        score_matrix,
+        dtype=float,
+    )
+    true_labels = np.asarray(
+        true_labels
+    )
+
+    if score_matrix.ndim != 2:
+        raise ValueError(
+            "Identification scores must be "
+            "a two-dimensional matrix."
+        )
+
+    if true_labels.ndim != 1:
+        raise ValueError(
+            "Identification labels must be "
+            "one-dimensional."
+        )
+
+    if len(score_matrix) != len(
+        true_labels
+    ):
+        raise ValueError(
+            "Identification scores and labels "
+            "must contain the same number "
+            "of probes."
+        )
+
+    gallery_size = int(
+        score_matrix.shape[1]
+    )
+
+    if np.any(
+        true_labels < 0
+    ) or np.any(
+        true_labels
+        >= gallery_size
+    ):
+        raise ValueError(
+            "Identification labels must refer "
+            "to valid gallery columns."
+        )
+
+    correct_identity_scores = score_matrix[
+        np.arange(
+            len(true_labels)
+        ),
+        true_labels,
+    ]
+
+    return np.count_nonzero(
+        score_matrix
+        >= correct_identity_scores[
+            :, None
+        ],
+        axis=1,
+    ).astype(int)
+
+
 def _build_identification_curve_artifacts(
     score_matrix,
     true_labels,
@@ -2877,7 +2959,9 @@ def _build_identification_curve_artifacts(
     Build the complete CMC curve for closed-set identification.
 
     ``true_labels`` must contain gallery-column indices, matching the
-    convention already used by ``_compute_metrics_identification``.
+    convention already used by ``_compute_metrics_identification``. Ranks come
+    from ``_compute_pessimistic_identification_ranks``, so every reported
+    Rank-k value and the CMC curve share one tie policy.
     """
     score_matrix = np.asarray(
         score_matrix,
@@ -2981,22 +3065,11 @@ def _build_identification_curve_artifacts(
             "to valid gallery columns."
         )
 
-    sorted_gallery_indices = np.argsort(
-        score_matrix,
-        axis=1,
-    )[:, ::-1]
-
-    correct_match_mask = (
-        sorted_gallery_indices
-        == true_labels[:, None]
-    )
-
     correct_match_ranks = (
-        np.argmax(
-            correct_match_mask,
-            axis=1,
+        _compute_pessimistic_identification_ranks(
+            score_matrix,
+            true_labels,
         )
-        + 1
     )
 
     ranks = np.arange(
@@ -3197,6 +3270,12 @@ def _compute_metrics_identification(
 ):
     """
     Calculate Rank-1 and Rank-5 identification accuracy from the CMC curve.
+
+    Identification ties are ranked pessimistically: the rank of the correct
+    identity equals the number of gallery identities with scores greater than
+    or equal to the correct identity's score. Rank-k is then the fraction of
+    probes whose rank is at most ``k``, so Rank-1, Rank-5, and the CMC curve
+    are all derived from one rank vector.
 
     Rank-5 is unavailable when the gallery contains fewer than five
     identities. A five-identity gallery has a mathematically defined terminal
