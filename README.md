@@ -108,11 +108,59 @@ Accordingly:
 - Verification evaluates genuine and impostor comparisons for the relevant
   evaluation cohort.
 
-Verification pair generation supports `all`, `all_genuine`, `balanced`, and
-`random`. The bundled paper-reproduction and model-comparison verification
-configs use `all_genuine`: every genuine comparison is retained, while at most
-1,000,000 impostor comparisons are sampled uniformly without replacement using
-a dedicated pair-sampling seed.
+### Verification pair generation
+
+Four policies are available. Requested budgets are exact decision counts, not
+approximate targets.
+
+| Mode | Decisions evaluated |
+|---|---|
+| `all` | Every genuine and every impostor comparison. |
+| `all_genuine` | Every genuine comparison, plus impostors exhaustively up to `max_impostor_pairs`; beyond that cap, impostors are sampled uniformly without replacement. |
+| `balanced` | Exactly `pair_sampling_budget` decisions, half genuine and half impostor, drawing with replacement within a class only when that class cannot supply its share. |
+| `random` | Exactly `pair_sampling_budget` decisions drawn from the complete decision universe, with replacement only when the budget exceeds the universe size. |
+
+The bundled paper-reproduction and model-comparison verification configs use
+the same settings:
+
+```yaml
+pair_sampling_mode: all_genuine
+max_impostor_pairs: 1000000
+pair_sampling_seed: 42
+```
+
+### Verification operating points
+
+TAR at 0.1% FAR is the mandatory headline operating point, so the framework
+always injects FAR `0.001` into the resolved FAR set. `target_fars` requests
+*additional* operating points; the shipped verification configurations request
+`0.1`, `0.01`, and `0.0001`, giving the resolved set:
+
+```
+0.0001   0.001   0.01   0.1
+```
+
+Operating points are read from observed empirical thresholds. A requested FAR
+is never produced by interpolation: when the number of impostor comparisons
+cannot resolve it — the smallest non-zero empirical FAR is larger than the
+target — the corresponding TAR is reported as unavailable rather than
+estimated. The mandatory point is therefore always requested, but it can still
+be unavailable on a small impostor sample.
+
+### Identification ties
+
+Identification ranks are pessimistic and exact. For probe `i` with genuine
+identity `c*`:
+
+```
+rank_i = count( score_ic >= score_ic* )
+```
+
+Every gallery identity whose score equals or exceeds the genuine score counts
+against the genuine identity, so a tie can never be resolved in the system's
+favour. Comparison is on exactly represented values — no tolerance, no
+`isclose`, no rounding — and Rank-1, Rank-5, and the CMC curve are all derived
+from this one rank vector.
 
 ---
 
@@ -165,6 +213,30 @@ Multi-template enrollment currently does not support
 `--use_deployment_evaluation`: identity-level aggregation over several
 templates changes the score distribution a deployment threshold would be
 calibrated on, so the two options are mutually exclusive for now.
+
+### Enrollment budget, probe fusion, and beat merging
+
+Three settings are easy to confuse because all three combine several
+observations. They act at different stages and are independent:
+
+| Setting | Stage | Effect |
+|---|---|---|
+| `template_size` | Enrollment | How many enrollment observations per identity are used to build the template. |
+| `probe_fusion_size` | Scoring | How many probe observations are fused into one decision. |
+| `num_beats_to_merge` | Preprocessing | How many raw beats form a single input sample. |
+
+`template_size` selects the enrollment observations *before* fusion, using a
+deterministic ordering rather than a random draw. The selection also applies
+when `template_fusion_method` is `none`, so a no-fusion gallery is limited to
+the requested depth instead of silently enrolling every available observation.
+
+`probe_fusion_size` controls score-side fusion; the shipped configurations use
+`probe_fusion_size: 1`, i.e. one probe observation per decision. Larger values
+form complete, non-overlapping groups from observations that share a subject,
+session, record, and source segment, taken in source order; a trailing group
+that cannot be filled is dropped rather than scored at a smaller depth.
+Identification fuses the score vectors before ranking, and verification
+averages the compatible group and template scores before the decision metric.
 
 ---
 
@@ -557,14 +629,38 @@ audit tool, so the audit reports the partitions that were actually evaluated
 rather than a restatement of the intended protocol.
 
 **Near-neighbour samples.** Merging `--num_beats_to_merge > 1` slides the merge
-window one beat at a time by default, so neighbouring samples share beats. That
-is harmless inside a single partition, but a downstream random split can place
-two nearly identical samples on opposite sides of the boundary. For strictly
-non-overlapping samples, set the stride equal to the merge width:
+window one beat at a time by default, so neighbouring samples share beats. For
+Tasks 1–4 the evaluation partitions are drawn from within one session, where
+two overlapping samples could land on opposite sides of the boundary and share
+raw beats across nominally independent roles. Those tasks therefore reject a
+stride narrower than the merge width, and ask for non-overlapping samples
+instead:
 
 ```bash
 python main.py --dataset ecgid --task 1 --num_beats_to_merge 3 --beat_merge_stride 3
 ```
+
+Tasks 5–8 separate their roles by session or recording rather than within a
+session, so overlapping merge windows cannot cross a role boundary there and
+the restriction does not apply. Independently of the task, a stride wider than
+the merge width is rejected for every task, because it would silently discard
+the beats between consecutive samples.
+
+**Data roles and signal-quality filtering.** TRAIN, ENROLLMENT, and PROBE are
+distinct configurable roles; the framework does not assume that training and
+enrollment use the same data. Signal-quality filtering follows those roles:
+
+- `outlier_filtering_on_train` acts on the representation-learning samples.
+- When enrollment reuses the training role, the gallery naturally inherits
+  those already-processed samples.
+- When enrollment is supplied as its own role, it is independent of the
+  train-side switch and reaches the gallery as provided.
+- `outlier_filtering_on_test` controls probe-side filtering separately, and
+  applies no per-subject ranking so that probe selection stays
+  identity-independent.
+
+There is deliberately no enrollment-side filtering switch: an explicitly
+supplied gallery is the one the protocol asked for.
 
 ---
 
@@ -591,6 +687,54 @@ python -m scripts.reproduce_tables --collect --output-dir reproduced_tables
 
 Rows that have not been run yet are reported explicitly rather than silently
 omitted.
+
+### Seeds
+
+Three seeds control independent sources of randomness.
+
+| Setting | Controls |
+|---|---|
+| `seed` | Run and training stochasticity: weight initialization, batch shuffling, augmentation, and other randomness not governed by the other two. |
+| `split_seed` | Randomized allocation of samples to data roles. |
+| `pair_sampling_seed` | Verification pair sampling, where the configured mode samples rather than enumerates. |
+
+With `n_runs > 1` the run seed advances by one per replicate, so the standard
+five-run schedule starting at 42 is:
+
+```
+42   43   44   45   46
+```
+
+`split_seed` selects between two partition policies:
+
+- **omitted or `null`** — the resolved split seed follows the run seed, so each
+  replicate re-draws its partition and the reported spread includes allocation
+  variability;
+- **an explicit integer** — the partition is held fixed across replicates, so
+  only training stochasticity varies.
+
+Both are legitimate; they answer different questions, and the shipped
+configurations leave `split_seed` unset deliberately.
+
+`pair_sampling_seed` is separate from both. It does not advance with the run
+index and does not affect partitioning, so verification comparisons can be
+reproduced independently of how a run was trained or split.
+
+### Result provenance
+
+Every structured result record carries enough provenance to audit or reproduce
+the numbers it contains, including the effective scientific configuration
+identity, the implementation and source identity, the run seeds and the
+resolved split seeds, data and run provenance, and references to trained
+weights where a run produced them.
+
+The publication-oriented consumers — the table, figure, manifest, and
+statistical-comparison scripts — read that provenance and refuse artifacts that
+do not meet the repository's publication-eligibility requirements, rather than
+quietly reporting a number whose origin cannot be established. Exploratory work
+can opt out: the table, figure, and manifest scripts accept
+`--allow-exploratory-results`, and the statistical-comparison script reads
+`allow_exploratory_results` from its manifest.
 
 ### Which artifacts exist
 
@@ -654,16 +798,46 @@ python -m scripts.make_figures --dataset heartprint --metric EER --figure paired
 Figures are written as PDF and PNG (add `--format svg` for SVG), use a palette
 validated for colour-vision deficiency with hatching as a secondary encoding,
 carry 95% confidence intervals rather than standard deviations, and annotate
-paired comparisons with a paired t-test, a Wilcoxon signed-rank p-value, and
-Cohen's *d_z*. Use `--font-size` to scale all type at once.
+paired comparisons with the statistics described below. Use `--font-size` to
+scale all type at once.
+
+### Paired comparisons
+
+The figure and statistical-comparison scripts share one implementation, so a
+figure and the table beside it cannot disagree.
+
+Repeated runs are paired **by run seed**, never by row order: the two
+conditions must cover exactly the same seeds, and a missing counterpart is an
+error rather than a silently dropped observation. For each comparison the
+scripts report a paired t-test (`scipy.stats.ttest_rel`), a Wilcoxon
+signed-rank test under a pinned deterministic policy, and Cohen's *d_z*
+computed from the paired differences with the sample standard deviation
+(`ddof=1`).
+
+Multiple comparisons are corrected with the Holm step-down procedure. The
+parametric and non-parametric tests are corrected as **separate families**, so
+a Wilcoxon result can never influence a t-test decision. A family is fixed by
+the analysis rather than by whichever rows a run happens to produce: one
+comparison manifest defines one family per test type across the hypotheses it
+declares, and one paired-figure invocation defines one family per test type
+across its evaluation-setting panels.
+
+Significance markers on figures use the **Holm-adjusted** paired-t p-value, not
+the raw one, so a marker reflects the same evidence as the reported decision.
+Raw and adjusted p-values both remain in the statistics outputs.
+
+With five runs the Wilcoxon test cannot reach p < 0.05 in a two-sided test
+regardless of effect size, so it is reported as a distribution-free companion
+to the t-test rather than as the deciding statistic.
 
 ---
 
 ## 🧪 Tests
 
-The framework ships **544 tests across 64 modules**, covering the parts where a
+The framework ships a comprehensive pytest suite covering the parts where a
 silent error would corrupt a result rather than raise: enrollment/probe
-separation, cache identity, metric arithmetic, and configuration validation.
+separation, protocol and configuration invariants, cache and provenance
+identity, metric arithmetic, and the analysis utilities.
 
 ```bash
 pip install -r requirements-dev.txt

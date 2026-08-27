@@ -821,6 +821,296 @@ class RunnerSQIIntegrationTests(
             result
         )
 
+    def drive_cross_session_with_spies(self, **runner_overrides):
+        """
+        Run the real cross-session identification runner under two spies.
+
+        Returns the arrays handed to the outlier filter, the arrays handed to
+        every data loader, and the runner result. Both spies wrap the real
+        production functions, so behaviour is unchanged.
+        """
+        filter_inputs = []
+        filter_outputs = []
+        loader_inputs = []
+
+        real_filter = run._apply_outlier_filter
+        real_loader = run._make_loader
+
+        def spy_filter(*args, **kwargs):
+            filter_inputs.append(
+                np.asarray(args[0])
+            )
+            outcome = real_filter(
+                *args,
+                **kwargs,
+            )
+            filter_outputs.append(
+                np.asarray(outcome[0])
+            )
+            return outcome
+
+        def spy_loader(x, y, *args, **kwargs):
+            loader_inputs.append(
+                (
+                    np.asarray(x),
+                    np.asarray(y),
+                )
+            )
+            return real_loader(
+                x,
+                y,
+                *args,
+                **kwargs,
+            )
+
+        # Varied scores make the per-subject ranking deterministic, so the
+        # training role loses a predictable half of its samples.
+        train_sqi = np.linspace(
+            0.1,
+            1.0,
+            len(self.session_1_x),
+        )
+        probe_sqi = np.linspace(
+            0.1,
+            1.0,
+            len(self.session_2_x),
+        )
+
+        arguments = dict(
+            self.common_arguments
+        )
+        arguments.update(
+            {
+                "sqi_threshold": 0.0,
+                "sqi_keep_pct": 0.5,
+            }
+        )
+        arguments.update(
+            runner_overrides
+        )
+
+        with patch.object(
+            run,
+            "_apply_outlier_filter",
+            side_effect=spy_filter,
+        ), patch.object(
+            run,
+            "_make_loader",
+            side_effect=spy_loader,
+        ):
+            result = (
+                run.run_cross_session_identification(
+                    self.session_1_x,
+                    self.session_1_y,
+                    self.session_2_x,
+                    self.session_2_y,
+                    use_template=True,
+                    template_fusion_method="mean",
+                    sqi_train=train_sqi,
+                    sqi_test=probe_sqi,
+                    probe_fusion_size=1,
+                    **arguments,
+                )
+            )
+
+        return (
+            filter_inputs,
+            filter_outputs,
+            loader_inputs,
+            result,
+        )
+
+    def test_distinct_enrollment_role_is_isolated_from_train_filtering(
+        self,
+    ):
+        """
+        A separately supplied enrollment role is not filtered by the
+        train-side switch, and it reaches the gallery intact.
+
+        ``outlier_filtering_on_train`` governs the representation-learning
+        samples. When enrollment is supplied as its own role it must survive
+        partitioning and arrive at the template-building stage with the same
+        samples, in the same order, carrying the same identities. The gallery
+        loader is the last production seam before those observations are
+        embedded, so it is where the surviving observations are checked;
+        after embedding, raw equality is no longer meaningful.
+        """
+        enroll_x, enroll_y = (
+            make_synthetic_ecg_dataset(
+                number_of_subjects=8,
+                samples_per_subject=6,
+                signal_length=64,
+                session_shift=0.05,
+                seed=400,
+            )
+        )
+
+        (
+            filter_inputs,
+            filter_outputs,
+            loader_inputs,
+            result,
+        ) = self.drive_cross_session_with_spies(
+            x_enroll=enroll_x,
+            y_enroll=enroll_y,
+        )
+
+        # (A) and (C): exactly one training filter call and one probe filter
+        # call, and neither of them ever sees the enrollment role.
+        self.assertEqual(
+            len(filter_inputs),
+            2,
+            (
+                "Expected one training filter call and one probe "
+                "filter call, and no enrollment filter call."
+            ),
+        )
+
+        for filtered_array in filter_inputs:
+            self.assertFalse(
+                (
+                    filtered_array.shape
+                    == enroll_x.shape
+                )
+                and np.array_equal(
+                    filtered_array,
+                    enroll_x,
+                ),
+                (
+                    "The distinct enrollment role must never be "
+                    "passed to the outlier filter."
+                ),
+            )
+
+        # (A) again: the training filter really removed samples, so the
+        # isolation assertions above are not vacuous.
+        self.assertLess(
+            len(filter_outputs[0]),
+            len(self.session_1_x),
+            (
+                "Train-side filtering did not remove any sample, so "
+                "this test could not detect enrollment leakage."
+            ),
+        )
+
+        # (D) and (E): the enrollment observations reach the gallery-building
+        # stage complete, in order, and unmodified. Observing the loader input
+        # rather than the partition input is deliberate: a sample lost inside
+        # or after partitioning would otherwise go unnoticed.
+        gallery_inputs = [
+            (samples, labels)
+            for samples, labels in loader_inputs
+            if samples.shape == enroll_x.shape
+            and np.array_equal(
+                samples,
+                enroll_x,
+            )
+        ]
+
+        self.assertEqual(
+            len(gallery_inputs),
+            1,
+            (
+                "Exactly one loader must receive the distinct enrollment "
+                "samples unchanged. Losing, reordering or altering even one "
+                "enrollment observation between the runner and the gallery "
+                "breaks this assertion."
+            ),
+        )
+
+        gallery_samples, gallery_labels = gallery_inputs[0]
+
+        self.assertEqual(
+            len(gallery_labels),
+            len(enroll_y),
+        )
+
+        # Identities are encoded to training-class indices before the loader,
+        # so the invariant is that the encoding preserves which observations
+        # belong together, and in which order.
+        np.testing.assert_array_equal(
+            gallery_labels[:, None] == gallery_labels[None, :],
+            enroll_y[:, None] == enroll_y[None, :],
+        )
+
+        # (F)
+        self.assert_finite_runner_result(
+            result
+        )
+
+    def test_reused_enrollment_inherits_the_filtered_training_role(
+        self,
+    ):
+        """
+        Omitting the enrollment arrays reuses the processed training role.
+
+        The gallery then inherits the samples the train-side filter kept, and
+        never the unfiltered training data.
+        """
+        (
+            filter_inputs,
+            filter_outputs,
+            loader_inputs,
+            result,
+        ) = self.drive_cross_session_with_spies()
+
+        filtered_training = filter_outputs[0]
+
+        self.assertLess(
+            len(filtered_training),
+            len(self.session_1_x),
+            (
+                "Train-side filtering did not remove any sample, so reuse "
+                "of the processed role could not be distinguished."
+            ),
+        )
+
+        # (B): probe filtering is still its own call, independent of the
+        # training role.
+        self.assertEqual(
+            len(filter_inputs),
+            2,
+        )
+
+        reused = [
+            samples
+            for samples, _ in loader_inputs
+            if samples.shape == filtered_training.shape
+            and np.array_equal(
+                samples,
+                filtered_training,
+            )
+        ]
+
+        self.assertGreaterEqual(
+            len(reused),
+            2,
+            (
+                "With enrollment omitted the gallery loader must receive the "
+                "same filtered training samples the training loader received."
+            ),
+        )
+
+        for samples, _ in loader_inputs:
+            self.assertFalse(
+                (
+                    samples.shape
+                    == self.session_1_x.shape
+                )
+                and np.array_equal(
+                    samples,
+                    self.session_1_x,
+                ),
+                (
+                    "No loader may receive the unfiltered training samples "
+                    "once train-side filtering is enabled."
+                ),
+            )
+
+        self.assert_finite_runner_result(
+            result
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
