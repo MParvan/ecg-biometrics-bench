@@ -18,6 +18,7 @@ from artifact_provenance import (
 import run
 from utils import (
     CacheManager,
+    _build_loader_cache_identity,
     _build_weight_artifact_metadata,
     _file_sha256,
     _generate_config_hash,
@@ -719,3 +720,143 @@ def test_commit_one_compatibility_identity_remains_authoritative(tmp_path):
     payload_loader.assert_not_called()
     assert weight_path.exists()
     assert metadata_path.exists()
+
+
+def test_pathlike_loader_identity_is_json_safe_for_weight_cache(tmp_path):
+    class PathLoader:
+        def __init__(self):
+            self.cfg = {
+                "root_dir": "synthetic",
+                "preprocessing": {},
+            }
+            self.prep_params = {}
+            self.data_split_mode = "single-session"
+            self.signal_type = "raw"
+            self.data_root = tmp_path / "datasets"
+            self.dataset_root = self.data_root / "synthetic"
+
+    loader = PathLoader()
+
+    loader_identity = _build_loader_cache_identity(
+        loader
+    )
+
+    settings = loader_identity["settings"]
+
+    assert settings["data_root"] == str(
+        loader.data_root
+    )
+    assert settings["dataset_root"] == str(
+        loader.dataset_root
+    )
+    assert isinstance(
+        settings["data_root"],
+        str,
+    )
+    assert isinstance(
+        settings["dataset_root"],
+        str,
+    )
+
+    # The normalized representation remains strict-JSON serializable.
+    json.dumps(
+        loader_identity,
+        sort_keys=True,
+        ensure_ascii=False,
+        allow_nan=False,
+    )
+
+    # Explicit Path -> string normalization must not change the historical
+    # cache UID because _generate_config_hash already represented Path values
+    # through their string form.
+    legacy_identity = copy.deepcopy(
+        loader_identity
+    )
+    legacy_identity["settings"][
+        "data_root"
+    ] = loader.data_root
+    legacy_identity["settings"][
+        "dataset_root"
+    ] = loader.dataset_root
+
+    normalized_config = _training_config()
+    normalized_config[
+        "loader_identity"
+    ] = loader_identity
+
+    legacy_config = copy.deepcopy(
+        normalized_config
+    )
+    legacy_config[
+        "loader_identity"
+    ] = legacy_identity
+
+    assert _generate_config_hash(
+        normalized_config
+    ) == _generate_config_hash(
+        legacy_config
+    )
+
+    cache = CacheManager(
+        base_dir=tmp_path / "cache"
+    )
+
+    model = TinyStateModel()
+    model.actual_epochs = 1
+
+    _, uid = cache.get_weight_cache(
+        normalized_config,
+        TinyStateModel(),
+        device="cpu",
+    )
+
+    cache.save_weight_cache(
+        model,
+        normalized_config,
+        uid,
+        creation_provenance={
+            "git": {
+                "status": "available",
+                "commit": "test-commit",
+                "branch": "test",
+                "dirty": False,
+            }
+        },
+        artifact_context=_artifact_context(),
+    )
+
+    metadata_path = (
+        tmp_path
+        / "cache"
+        / "weights"
+        / f"{uid}.json"
+    )
+
+    metadata = json.loads(
+        metadata_path.read_text(
+            encoding="utf-8"
+        )
+    )
+
+    stored_settings = metadata[
+        "cache_identity"
+    ]["loader_identity"]["settings"]
+
+    assert stored_settings[
+        "data_root"
+    ] == str(loader.data_root)
+
+    assert stored_settings[
+        "dataset_root"
+    ] == str(loader.dataset_root)
+
+    loaded_model, loaded_uid = (
+        cache.get_weight_cache(
+            normalized_config,
+            TinyStateModel(),
+            device="cpu",
+        )
+    )
+
+    assert loaded_uid == uid
+    assert loaded_model is not None

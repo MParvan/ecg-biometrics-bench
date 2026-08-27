@@ -5412,6 +5412,32 @@ def _is_neutral_default(value, neutral_default):
         return False
 
 
+def _normalize_cache_identity_pathlikes(value):
+    """Convert filesystem paths to their stable cache-identity form."""
+    if isinstance(value, os.PathLike):
+        return os.fspath(value)
+
+    if isinstance(value, dict):
+        return {
+            key: _normalize_cache_identity_pathlikes(item)
+            for key, item in value.items()
+        }
+
+    if isinstance(value, list):
+        return [
+            _normalize_cache_identity_pathlikes(item)
+            for item in value
+        ]
+
+    if isinstance(value, tuple):
+        return tuple(
+            _normalize_cache_identity_pathlikes(item)
+            for item in value
+        )
+
+    return value
+
+
 def _build_loader_cache_identity(loader):
     """
     Build the effective dataset-loader identity used by data and weight caches.
@@ -5433,8 +5459,10 @@ def _build_loader_cache_identity(loader):
     effective_preprocessing = {}
 
     if isinstance(loader_cfg, dict):
-        dataset_config = copy.deepcopy(
-            loader_cfg
+        dataset_config = _normalize_cache_identity_pathlikes(
+            copy.deepcopy(
+                loader_cfg
+            )
         )
 
         configured_preprocessing = dataset_config.pop(
@@ -5447,10 +5475,12 @@ def _build_loader_cache_identity(loader):
                 configured_preprocessing
             )
 
-    preprocessing_overrides = getattr(
-        loader,
-        "prep_params",
-        {},
+    preprocessing_overrides = _normalize_cache_identity_pathlikes(
+        getattr(
+            loader,
+            "prep_params",
+            {},
+        )
     )
 
     if isinstance(preprocessing_overrides, dict):
@@ -5462,10 +5492,14 @@ def _build_loader_cache_identity(loader):
 
     for attribute_name in _CACHE_RELEVANT_LOADER_ATTRIBUTES:
         if hasattr(loader, attribute_name):
-            loader_settings[attribute_name] = copy.deepcopy(
-                getattr(
-                    loader,
-                    attribute_name,
+            loader_settings[attribute_name] = (
+                _normalize_cache_identity_pathlikes(
+                    copy.deepcopy(
+                        getattr(
+                            loader,
+                            attribute_name,
+                        )
+                    )
                 )
             )
 
