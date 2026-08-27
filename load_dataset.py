@@ -2484,7 +2484,13 @@ class load_heartprint_dataset():
         self._normalize_sessions(self.enroll_sessions)
         self._normalize_sessions(self.probe_sessions)
         
-        self.required_cross_sessions = list(set(self.train_sessions + self.enroll_sessions + self.probe_sessions))
+        self.required_cross_sessions = list(
+            dict.fromkeys(
+                self.train_sessions
+                + self.enroll_sessions
+                + self.probe_sessions
+            )
+        )
 
         self._reject_same_visit_pairing()
         
@@ -3320,7 +3326,13 @@ class load_cybhi_dataset():
         )
         self.probe_sessions = to_list(probe_sessions)
         
-        self.required_cross_sessions = list(set(self.train_sessions + self.enroll_sessions + self.probe_sessions))
+        self.required_cross_sessions = list(
+            dict.fromkeys(
+                self.train_sessions
+                + self.enroll_sessions
+                + self.probe_sessions
+            )
+        )
 
         if self.data_split_mode == "single-session" and not self.session_for_single_session_evaluation:
             raise ValueError("You must provide `session_for_single_session_evaluation`.")
