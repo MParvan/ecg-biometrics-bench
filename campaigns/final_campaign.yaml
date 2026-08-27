@@ -1,0 +1,246 @@
+# =============================================================================
+# Final experiment campaign
+# =============================================================================
+#
+# This file is the authoritative description of the complete experiment
+# collection. It enumerates the shipped configurations under configs/ and adds
+# study conditions through explicit overrides, so no experiment definition is
+# duplicated and the whole matrix can be reviewed here without reading Python.
+#
+# Terminology
+#   condition      one scientific configuration, evaluated with n_runs runs
+#   run execution  one run of one condition (conditions x n_runs)
+#   study          one group of conditions that varies a single conceptual axis
+#                  against a named base configuration
+#   reused         a study arm whose configuration is already a base condition;
+#                  it is reported for context and never scheduled again
+#
+# Tiers
+#   core      the studies that make up the complete experiment collection
+#   optional  additional studies that must be selected explicitly and are never
+#             executed or counted as part of the core tier
+#
+# Every study inherits all scientific settings from its base configuration and
+# changes only the fields listed under its axis. Anything not listed here is
+# whatever the referenced configuration already specifies.
+
+schema_version: 1
+
+campaign:
+  name: final_campaign
+  description: >-
+    Complete benchmark collection: the shipped configuration corpus plus two
+    single-factor studies derived from it.
+  # Run schedule shared by every condition, including the shipped corpus.
+  n_runs: 5
+  run_seeds: [42, 43, 44, 45, 46]
+  # Data-role allocation follows each run seed, as in every shipped
+  # configuration. No study fixes it.
+  split_seed_policy: inherit
+
+# -----------------------------------------------------------------------------
+# Base corpus
+# -----------------------------------------------------------------------------
+# The shipped configurations are already complete scientific definitions. They
+# are enumerated from disk rather than restated here, so this campaign can never
+# disagree with the corpus.
+base_corpus:
+  tier: core
+  root: configs
+  groups:
+    - name: paper_reproduction
+      directory: configs/paper_reproduction
+      expected_conditions: 150
+    - name: model_comparison
+      directory: configs/model_comparison
+      expected_conditions: 84
+
+# -----------------------------------------------------------------------------
+# Core studies
+# -----------------------------------------------------------------------------
+studies:
+
+  # ---------------------------------------------------------------------------
+  # Controlled hyperparameter ablation
+  # ---------------------------------------------------------------------------
+  # One factor at a time against a fixed default, on closed-set verification in
+  # the single-session and single-segment regimes. The default state is exactly
+  # the shipped configuration, so each axis baseline is an existing base
+  # condition and is reused rather than recomputed.
+  controlled_ablation:
+    tier: core
+    description: >-
+      Single-factor sensitivity of closed-set verification to the enrollment,
+      probe-fusion and matching choices.
+    output_namespace: ablation
+    base_configs:
+      - configs/paper_reproduction/cybhi/cybhi_baseline_ci_closed_set_task02_verification.yaml
+      - configs/paper_reproduction/cybhi/cybhi_baseline_s1_closed_set_task02_verification.yaml
+      - configs/paper_reproduction/ecgid/ecgid_single_session_closed_set_task02_verification.yaml
+      - configs/paper_reproduction/heartprint/heartprint_single_session_closed_set_task02_verification.yaml
+      - configs/paper_reproduction/mitbih/mitbih_single_segment_closed_set_task02_verification.yaml
+      - configs/paper_reproduction/nsrdb/nsrdb_single_segment_closed_set_task02_verification.yaml
+      - configs/paper_reproduction/ptb/ptb_single_session_closed_set_task02_verification.yaml
+      - configs/paper_reproduction/ptbxl/ptbxl_single_session_closed_set_task02_verification.yaml
+    axes:
+      - name: template_fusion
+        field: template_fusion_method
+        baseline: mean
+        levels:
+          - label: representative
+            value: representative
+      - name: template_size
+        field: template_size
+        baseline: null
+        levels:
+          - label: n1
+            value: 1
+          - label: n3
+            value: 3
+          - label: n5
+            value: 5
+      - name: probe_fusion
+        field: probe_fusion_size
+        baseline: 1
+        levels:
+          - label: k3
+            value: 3
+          - label: k5
+            value: 5
+          - label: k7
+            value: 7
+      - name: matching
+        field: matching_method
+        baseline: cosine
+        levels:
+          - label: euclidean
+            value: euclidean
+          - label: correlation
+            value: correlation
+
+  # ---------------------------------------------------------------------------
+  # Training-time augmentation
+  # ---------------------------------------------------------------------------
+  # Augmentation is applied to the training partition only, so an arm changes
+  # the learned representation and leaves the gallery and probe data untouched.
+  # The no-augmentation baseline is the shipped configuration and is reused.
+  augmentation:
+    tier: core
+    description: >-
+      Effect of training-time augmentation on cross-session verification.
+    output_namespace: augmentation
+    base_configs:
+      - configs/paper_reproduction/cybhi/cybhi_long_term_closed_set_task06_verification.yaml
+      - configs/paper_reproduction/ecgid/ecgid_single_cross_session_closed_set_task06_verification.yaml
+    axes:
+      - name: augmentation_method
+        bundle:
+          - use_augmentation
+          - augmentation_method
+          - augmentation_parameters
+          - augmentation_copies
+        baseline:
+          use_augmentation: false
+        levels:
+          # Sensor noise. The minimal control for whether augmentation has any
+          # measurable effect at all.
+          - label: gaussian
+            values:
+              use_augmentation: true
+              augmentation_method: gaussian
+              augmentation_parameters:
+                std: 0.02
+                relative: true
+              augmentation_copies: 1
+          # Electrode contact and gain variation.
+          - label: amplitude
+            values:
+              use_augmentation: true
+              augmentation_method: amplitude
+              augmentation_parameters:
+                scale_range: [0.9, 1.1]
+              augmentation_copies: 1
+          # Respiration and movement drift.
+          - label: baseline_wander
+            values:
+              use_augmentation: true
+              augmentation_method: baseline_wander
+              augmentation_parameters:
+                freq: 0.3
+                amp: 0.05
+              augmentation_copies: 1
+
+# -----------------------------------------------------------------------------
+# Optional studies
+# -----------------------------------------------------------------------------
+# These are never executed or counted unless they are selected explicitly.
+optional_studies:
+
+  # A third level for the template-fusion axis of the controlled ablation.
+  median_template_fusion:
+    tier: optional
+    description: >-
+      Additional template-fusion level for the controlled ablation.
+    output_namespace: ablation
+    base_configs:
+      - configs/paper_reproduction/cybhi/cybhi_baseline_ci_closed_set_task02_verification.yaml
+      - configs/paper_reproduction/cybhi/cybhi_baseline_s1_closed_set_task02_verification.yaml
+      - configs/paper_reproduction/ecgid/ecgid_single_session_closed_set_task02_verification.yaml
+      - configs/paper_reproduction/heartprint/heartprint_single_session_closed_set_task02_verification.yaml
+      - configs/paper_reproduction/mitbih/mitbih_single_segment_closed_set_task02_verification.yaml
+      - configs/paper_reproduction/nsrdb/nsrdb_single_segment_closed_set_task02_verification.yaml
+      - configs/paper_reproduction/ptb/ptb_single_session_closed_set_task02_verification.yaml
+      - configs/paper_reproduction/ptbxl/ptbxl_single_session_closed_set_task02_verification.yaml
+    axes:
+      - name: template_fusion
+        field: template_fusion_method
+        baseline: mean
+        levels:
+          - label: median
+            value: median
+
+  # The same augmentation arms on subject-disjoint cross-session verification,
+  # which additionally requires the representation to transfer to identities
+  # that were never trained on.
+  augmentation_subject_disjoint:
+    tier: optional
+    description: >-
+      Training-time augmentation on subject-disjoint cross-session
+      verification.
+    output_namespace: augmentation_subject_disjoint
+    base_configs:
+      - configs/paper_reproduction/cybhi/cybhi_long_term_subject_disjoint_task08_verification.yaml
+      - configs/paper_reproduction/ecgid/ecgid_single_cross_session_subject_disjoint_task08_verification.yaml
+    axes:
+      - name: augmentation_method
+        bundle:
+          - use_augmentation
+          - augmentation_method
+          - augmentation_parameters
+          - augmentation_copies
+        baseline:
+          use_augmentation: false
+        levels:
+          - label: gaussian
+            values:
+              use_augmentation: true
+              augmentation_method: gaussian
+              augmentation_parameters:
+                std: 0.02
+                relative: true
+              augmentation_copies: 1
+          - label: amplitude
+            values:
+              use_augmentation: true
+              augmentation_method: amplitude
+              augmentation_parameters:
+                scale_range: [0.9, 1.1]
+              augmentation_copies: 1
+          - label: baseline_wander
+            values:
+              use_augmentation: true
+              augmentation_method: baseline_wander
+              augmentation_parameters:
+                freq: 0.3
+                amp: 0.05
+              augmentation_copies: 1

@@ -688,6 +688,41 @@ python -m scripts.reproduce_tables --collect --output-dir reproduced_tables
 Rows that have not been run yet are reported explicitly rather than silently
 omitted.
 
+### The experiment campaign
+
+`campaigns/final_campaign.yaml` describes the complete experiment collection in
+one file. The core campaign contains the complete shipped configuration corpus
+and the additional single-factor study conditions derived from it. Study arms
+reuse a shipped configuration's result as their baseline rather than
+recomputing it.
+
+```bash
+# Check the manifest without running anything
+python -m scripts.run_campaign validate --manifest campaigns/final_campaign.yaml
+
+# Conditions and run executions, derived from the manifest
+python -m scripts.run_campaign count --manifest campaigns/final_campaign.yaml
+
+# The complete core campaign, including the shipped corpus and study additions
+python -m scripts.run_campaign list --manifest campaigns/final_campaign.yaml --tier core
+
+# Execute the complete core campaign
+python -m scripts.run_campaign run --manifest campaigns/final_campaign.yaml \
+    --tier core --artifact-root ../ecg-biometrics-artifacts
+
+# Execute an optional study (optional studies must be named directly)
+python -m scripts.run_campaign run --manifest campaigns/final_campaign.yaml \
+    --study median_template_fusion --artifact-root ../ecg-biometrics-artifacts
+```
+
+`validate`, `count` and `list` never train, never read a dataset and never write
+results. Execution requires an explicit `--tier` or `--study`; `run --tier
+optional` is refused because every optional study must be named directly.
+Listing the optional tier remains supported. With `--resume`, a condition is
+skipped only when exactly one complete, publication-eligible result matches both
+its scientific configuration and the current implementation provenance. An
+output file on its own is never treated as completion.
+
 ### Seeds
 
 Three seeds control independent sources of randomness.
@@ -941,6 +976,5 @@ If you use ECG-Biometrics-Bench in your research, please cite:
   year    = {2026}
 }
 ```
-
 
 
